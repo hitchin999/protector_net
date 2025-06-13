@@ -53,7 +53,7 @@ Supports:
 ## Configuration Steps
 
 1. **Base URL**  
-   Enter your panel’s URL, e.g. `https://mhdoors.example.com:8007`.
+   Enter your panel’s URL, e.g. `https://doors.example.com:11001`.
 
 2. **Username & Password**  
    Must be a Protector.Net user with **Use API** / **Manage_Doors** privileges.
