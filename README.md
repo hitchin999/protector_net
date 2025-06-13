@@ -10,8 +10,8 @@ Supports:
 - Button entities for each door:
   - Pulse Unlock
   - Resume Schedule
-  - Override Until Resume
-  - Override Until Next Schedule
+  - Override Unlock Until Resume
+  - Override Unlock Until Next Schedule
   - Override Until Resume (CardOrPin)
   - Timed Override Unlock (with configurable default duration)
 
