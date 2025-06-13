@@ -1,6 +1,7 @@
 # custom_components/protector_net/config_flow.py
 
 import voluptuous as vol
+from urllib.parse import urlparse
 from homeassistant import config_entries
 from .const import DOMAIN, DEFAULT_OVERRIDE_MINUTES
 from . import api
@@ -62,15 +63,26 @@ class ProtectorNetConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     async def async_step_partition(self, user_input=None):
         """Let the user pick which partition (of the ones they have rights to)."""
         if user_input is not None:
+            partition_id   = user_input["partition"]
+            partition_name = self._partitions[partition_id]
+            # Extract host:port from base_url
+            host = urlparse(self._base_url).netloc
+            title = f"{host} – {partition_name}"
+
             data = {
                 "base_url":       self._base_url,
                 "username":       self._username,
                 "password":       self._password,
                 "session_cookie": self._session_cookie,
-                "partition_id":   user_input["partition"],
+                "partition_id":   partition_id,
             }
             options = {"override_minutes": self._override_mins}
-            return self.async_create_entry(title="Protector.Net", data=data, options=options)
+
+            return self.async_create_entry(
+                title=title,
+                data=data,
+                options=options
+            )
 
         return self.async_show_form(
             step_id="partition",
