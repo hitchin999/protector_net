@@ -2,7 +2,7 @@
 
 **Version 0.1.1**
 
-Custom Home Assistant integration to control Hartmann Protector.Net door panels via their HTTP API.  
+Custom Home Assistant integration to control Hartmann-controlls Protector.Net door access control systems via their HTTP API.  
 Supports:
 
 - Cookie-based login with automatic session-ID refresh  
