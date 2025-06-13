@@ -29,6 +29,7 @@ async def async_setup_entry(
         entities.append(DoorOverrideUntilResumeButton(hass, door))
         entities.append(DoorOverrideUntilNextScheduleButton(hass, door))
         entities.append(DoorTimedOverrideUnlockButton(hass, door))
+        entities.append(DoorOverrideUntilResumeCardOrPinButton(hass, door))
 
     async_add_entities(entities)
 
@@ -78,6 +79,15 @@ class DoorOverrideUntilNextScheduleButton(BaseDoorButton):
 
     async def async_press(self):
         await api.set_override(self.hass, [self.door_id], "Schedule")
+
+class DoorOverrideUntilResumeCardOrPinButton(BaseDoorButton):
+    def __init__(self, hass: HomeAssistant, door: dict):
+        super().__init__(hass, door)
+        self._attr_name = f"{self.door_name} Override Until Resume (CardOrPin)"
+        self._attr_unique_id = f"protector_net_{self.door_id}_until_resume_card_or_pin"
+
+    async def async_press(self):
+        await api.override_until_resume_card_or_pin(self.hass, [self.door_id])
 
 
 class DoorTimedOverrideUnlockButton(BaseDoorButton):
