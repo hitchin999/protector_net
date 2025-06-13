@@ -4,6 +4,7 @@ from homeassistant.components.button import ButtonEntity
 from homeassistant.core import HomeAssistant
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from .device import ProtectorNetDevice
 
 from . import api
 from .const import DOMAIN
@@ -34,7 +35,7 @@ async def async_setup_entry(
     async_add_entities(entities)
 
 
-class BaseDoorButton(ButtonEntity):
+class BaseDoorButton(ProtectorNetDevice, ButtonEntity):
     def __init__(self, hass: HomeAssistant, door: dict):
         self.hass = hass
         self.door_id = door["Id"]
