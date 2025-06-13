@@ -72,6 +72,37 @@ async def set_override(hass, door_ids: list[int], override_type: str, minutes: i
         _LOGGER.exception(f"Error in set_override: {e}")
         return False
 
+async def override_until_resume_card_or_pin(hass, door_ids: list[int]) -> bool:
+    base_url = hass.data["protector_net"]["base_url"]
+    session = hass.data["protector_net"]["session_cookie"]
+
+    headers = {
+        "Content-Type": "application/json",
+        "Cookie": f"ss-id={session}"
+    }
+
+    payload = {
+        "DoorIds": door_ids,
+        "OverrideType": "Resume",
+        "TimeZoneMode": "CardOrPin"
+    }
+
+    try:
+        async with httpx.AsyncClient(verify=False) as client:
+            response = await client.post(
+                url=f"{base_url}/api/PanelCommands/OverrideDoor",
+                headers=headers,
+                json=payload
+            )
+            if response.status_code == 200:
+                _LOGGER.info(f"Override Until Resume (CardOrPin) sent to doors {door_ids}")
+                return True
+            else:
+                _LOGGER.error(f"Override (CardOrPin) failed: {response.status_code} - {response.text}")
+                return False
+    except Exception as e:
+        _LOGGER.exception(f"Error in override_until_resume_card_or_pin: {e}")
+        return False
 
 
 async def resume_schedule(hass, door_ids: list[int]) -> bool:
