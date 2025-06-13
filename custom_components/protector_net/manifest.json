@@ -1,0 +1,13 @@
+{
+  "domain": "protector_net",
+  "name": "Protector.Net Access Control",
+  "version": "0.1.0",
+  "config_flow": true,
+  "documentation": "https://github.com/hitchin999/protector_net",
+  "requirements": [],
+  "dependencies": [],
+  "codeowners": ["@hitchin999"],
+  "iot_class": "local_polling",
+  "integration_type": "hub",
+  "supported_platforms": ["button"]
+}
