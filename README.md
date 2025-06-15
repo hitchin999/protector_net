@@ -75,12 +75,12 @@ For each door in your chosen partition, you’ll get:
 
 | Entity Name                                  | Entity ID                             | Action                                                         |
 | -------------------------------------------- | ------------------------------------- | -------------------------------------------------------------- |
-| `<Door Name> Pulse Unlock`                   | `button.protector_net_<door>_pulse`   | Briefly pulses the door unlock relay                          |
-| `<Door Name> Resume Schedule`                | `button.protector_net_<door>_resume`  | Cancels any override and returns to the normal schedule       |
-| `<Door Name> Override Until Resume`          | `button.protector_net_<door>_until_resume` | Overrides schedule until manually resumed                 |
-| `<Door Name> Override Until Next Schedule`   | `button.protector_net_<door>_until_next_schedule` | Overrides until the panel’s next scheduled event      |
-| `<Door Name> Override Until Resume (CardOrPin)` | `button.protector_net_<door>_until_resume_card_or_pin` | Override until someone uses card or PIN  |
-| `<Door Name> Timed Override Unlock`          | `button.protector_net_<door>_timed_override` | Override for the default minutes, then resume schedule    |
+| `<Door Name> Pulse Unlock`                   | `button.protector_net_<door>_pulse_unlock`   | Briefly pulses the door unlock relay                          |
+| `<Door Name> Resume Schedule`                | `button.protector_net_<door>_resume_schedule`  | Cancels any override and returns to the normal schedule       |
+| `<Door Name> Unlock Until Resume`          | `button.protector_net_<door>_unlock_until_resume` | Overrides schedule to Unlock until manually resumed                 |
+| `<Door Name> Unlock Until Next Schedule`   | `button.protector_net_<door_unlock_until_next_schedule` | Overrides to Unlock until the door's next scheduled event      |
+| `<Door Name> CardOrPin Until Resume` | `button.protector_net_<door>_cardorpin_until_resume` | Override until someone uses card or PIN  |
+| `<Door Name> Timed Override Unlock`          | `button.protector_net_<door>_timed_override_unlock` | Override for the default minutes, then resume schedule    |
 
 ---
 
