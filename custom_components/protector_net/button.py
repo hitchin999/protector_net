@@ -65,7 +65,7 @@ class DoorResumeScheduleButton(BaseDoorButton):
 class DoorOverrideUntilResumeButton(BaseDoorButton):
     def __init__(self, hass: HomeAssistant, door: dict):
         super().__init__(hass, door)
-        self._attr_name = f"{self.door_name} Override Until Resume"
+        self._attr_name = f"{self.door_name} Unlock Until Resume"
         self._attr_unique_id = f"protector_net_{self.door_id}_until_resume"
 
     async def async_press(self):
@@ -75,7 +75,7 @@ class DoorOverrideUntilResumeButton(BaseDoorButton):
 class DoorOverrideUntilNextScheduleButton(BaseDoorButton):
     def __init__(self, hass: HomeAssistant, door: dict):
         super().__init__(hass, door)
-        self._attr_name = f"{self.door_name} Override Until Next Schedule"
+        self._attr_name = f"{self.door_name} Unlock Until Next Schedule"
         self._attr_unique_id = f"protector_net_{self.door_id}_until_next_schedule"
 
     async def async_press(self):
@@ -84,7 +84,7 @@ class DoorOverrideUntilNextScheduleButton(BaseDoorButton):
 class DoorOverrideUntilResumeCardOrPinButton(BaseDoorButton):
     def __init__(self, hass: HomeAssistant, door: dict):
         super().__init__(hass, door)
-        self._attr_name = f"{self.door_name} Override Until Resume (CardOrPin)"
+        self._attr_name = f"{self.door_name} CardOrPin Until Resume"
         self._attr_unique_id = f"protector_net_{self.door_id}_until_resume_card_or_pin"
 
     async def async_press(self):
