@@ -9,5 +9,5 @@
   "codeowners": ["@hitchin999"],
   "iot_class": "local_polling",
   "integration_type": "hub",
-  "supported_platforms": ["button"]
+  "platforms": ["button"]
 }
