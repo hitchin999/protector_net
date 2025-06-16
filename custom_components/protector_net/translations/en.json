@@ -1,0 +1,45 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Protector.Net Access Control",
+        "data": {
+          "base_url":         "Protector.Net URL",
+          "username":         "Protector.Net Username",
+          "password":         "Protector.Net Password",
+          "override_minutes": "Default Override Minutes"
+        }
+      },
+      "partition": {
+        "title": "Protector.Net Partitions",
+        "data": {
+          "partition": "Select a Partition"
+        }
+      },
+      "plans": {
+        "title": "Protector.Net Action Plans",
+        "data": {
+          "plans": "Select Action Plans to Import (If There Is Any)"
+        }
+      },
+      "entity_selection": {
+        "title": "Door Entities",
+        "data": {
+          "entities": "Select What Door Entities to Enable"
+        }
+      }
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Protector.Net Options",
+        "data": {
+          "override_minutes": "Default Override Minutes",
+          "entities":         "Select Door Entities to Enable",
+          "plan_ids":         "Select Action Plans to Enable (If There Is Any)"
+        }
+      }
+    }
+  }
+}
