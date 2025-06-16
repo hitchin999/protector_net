@@ -9,7 +9,7 @@ from .const import DOMAIN, DEFAULT_OVERRIDE_MINUTES
 PLATFORMS = [Platform.BUTTON]
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
-    """Store config and forward to the button platform."""
+    """Store config and forward to the button & action_plans platforms."""
     hass.data.setdefault(DOMAIN, {})
 
     # core settings
@@ -24,11 +24,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         "override_minutes", DEFAULT_OVERRIDE_MINUTES
     )
 
+    # forward setup to both platforms
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     return True
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
-    """Remove config and unload button platform."""
+    """Remove config and unload platforms."""
     unload_ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
     if unload_ok:
         hass.data.pop(DOMAIN, None)
