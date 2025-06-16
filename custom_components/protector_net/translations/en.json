@@ -5,7 +5,7 @@
         "title": "Protector.Net Access Control",
         "data": {
           "base_url":         "Protector.Net URL",
-          "username":         "Protector.Net Username (System Admin rights)",
+          "username":         "Protector.Net Username (With System Admin Rights)",
           "password":         "Protector.Net Password",
           "override_minutes": "Default Override Minutes"
         }
