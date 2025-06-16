@@ -1,23 +1,26 @@
 # custom_components/protector_net/config_flow.py
 import voluptuous as vol
 from urllib.parse import urlparse
+
 from homeassistant import config_entries
 from homeassistant.helpers import config_validation as cv
-from .const import DOMAIN, DEFAULT_OVERRIDE_MINUTES
+
+from .const import DOMAIN, DEFAULT_OVERRIDE_MINUTES, KEY_PLAN_IDS
 from . import api
 
-# Define all available entity types with user-friendly labels
 ENTITY_CHOICES = {
-    "_pulse_unlock": "Pulse Unlock",
-    "_resume_schedule": "Resume Schedule",
-    "_unlock_until_resume": "Unlock Until Resume",
-    "_override_card_or_pin": "CardOrPin Until Resume",
+    "_pulse_unlock":               "Pulse Unlock",
+    "_resume_schedule":            "Resume Schedule",
+    "_unlock_until_resume":        "Unlock Until Resume",
+    "_override_card_or_pin":       "CardOrPin Until Resume",
     "_unlock_until_next_schedule": "Unlock Until Next Schedule",
-    "_timed_override_unlock": "Timed Override Unlock",
+    "_timed_override_unlock":      "Timed Override Unlock",
 }
 
+
 class ProtectorNetConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
-    """Handle Protector.Net config flow: login, partition & entity selection."""
+    """Handle Protector.Net config flow: login, partition, plans & entity selection."""
+
     VERSION = 1
 
     def __init__(self):
@@ -27,21 +30,19 @@ class ProtectorNetConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         self._override_mins = None
         self._session_cookie = None
         self._partitions = {}
+        self._plans = {}
 
     async def async_step_user(self, user_input=None):
         errors = {}
         if user_input:
-            self._base_url = user_input["base_url"]
-            self._username = user_input["username"]
-            self._password = user_input["password"]
+            self._base_url      = user_input["base_url"]
+            self._username      = user_input["username"]
+            self._password      = user_input["password"]
             self._override_mins = user_input["override_minutes"]
 
             try:
                 self._session_cookie = await api.login(
-                    self.hass,
-                    self._base_url,
-                    self._username,
-                    self._password
+                    self.hass, self._base_url, self._username, self._password
                 )
             except Exception:
                 errors["base"] = "cannot_connect"
@@ -59,12 +60,9 @@ class ProtectorNetConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 )
 
             parts = await api.get_partitions(
-                self.hass,
-                self._base_url,
-                self._session_cookie
+                self.hass, self._base_url, self._session_cookie
             )
             self._partitions = {p["Id"]: p["Name"] for p in parts}
-
             return await self.async_step_partition()
 
         return self.async_show_form(
@@ -80,21 +78,23 @@ class ProtectorNetConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
     async def async_step_partition(self, user_input=None):
         if user_input:
-            partition_id = user_input["partition"]
+            partition_id   = user_input["partition"]
             partition_name = self._partitions[partition_id]
             host = urlparse(self._base_url).netloc
             title = f"{host} – {partition_name}"
 
             self.context["entry_data"] = {
-                "base_url": self._base_url,
-                "username": self._username,
-                "password": self._password,
+                "base_url":       self._base_url,
+                "username":       self._username,
+                "password":       self._password,
                 "session_cookie": self._session_cookie,
-                "partition_id": partition_id,
+                "partition_id":   partition_id,
             }
-            self.context["entry_options"] = {"override_minutes": self._override_mins}
+            self.context["entry_options"] = {
+                "override_minutes": self._override_mins
+            }
 
-            return await self.async_step_entity_selection()
+            return await self.async_step_plans()
 
         return self.async_show_form(
             step_id="partition",
@@ -103,28 +103,58 @@ class ProtectorNetConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             }),
         )
 
+    async def async_step_plans(self, user_input=None):
+        """Let the user pick which Hartmann action plans to enable."""
+        if not self._plans:
+            raw = await api.get_action_plans(
+                self.hass,
+                self.context["entry_data"]["base_url"],
+                self.context["entry_data"]["session_cookie"],
+                self.context["entry_data"]["partition_id"],
+            )
+            # Use string keys for multi_select
+            self._plans = {str(p["Id"]): p["Name"] for p in raw}
+
+        if user_input is not None:
+            # Convert back to ints
+            self.context["entry_data"][KEY_PLAN_IDS] = [int(pid) for pid in user_input["plans"]]
+            return await self.async_step_entity_selection()
+
+        return self.async_show_form(
+            step_id="plans",
+            data_schema=vol.Schema({
+                vol.Required("plans", default=list(self._plans.keys())):
+                    cv.multi_select(self._plans),
+            }),
+            description_placeholders={
+                "info": "Select which action plans to turn into buttons."
+            },
+        )
+
     async def async_step_entity_selection(self, user_input=None):
-        """Let the user pick which Protector.Net entities to enable."""
-        if user_input:
-            data = self.context["entry_data"]
+        """Let the user pick which Protector.Net door entities to enable."""
+        if user_input is not None:
+            data    = self.context["entry_data"]
             options = self.context["entry_options"]
             options["entities"] = user_input["entities"]
+            # Persist door-entity selection into entry.data as well:
+            data["entities"] = user_input["entities"]
 
             return self.async_create_entry(
-                title=data["base_url"],
+                title=self._base_url,
                 data=data,
-                options=options
+                options=options,
             )
 
         return self.async_show_form(
             step_id="entity_selection",
             data_schema=vol.Schema({
-                vol.Required(
-                    "entities",
-                    default=list(ENTITY_CHOICES.keys())
-                ): cv.multi_select(ENTITY_CHOICES)
+                vol.Required("entities", default=list(ENTITY_CHOICES.keys())):
+                    cv.multi_select(ENTITY_CHOICES),
             }),
-            description_placeholders={"info": "Select which Protector.Net entities to create."},
+            description_placeholders={
+                "info": "Select which Protector.Net door entities to create."
+            },
         )
 
     @staticmethod
@@ -134,28 +164,52 @@ class ProtectorNetConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
 
 class ProtectorNetOptionsFlow(config_entries.OptionsFlow):
-    """Handle updating override_minutes and entity selection after setup."""
+    """Allow editing override_minutes, door-entities, and action-plan selection."""
+
     def __init__(self, entry):
         self.entry = entry
+        self._plan_choices = {}
 
     async def async_step_init(self, user_input=None):
-        if user_input:
+        # Always refresh plan choices so new ones appear immediately
+        raw = await api.get_action_plans(
+            self.hass,
+            self.entry.data["base_url"],
+            self.entry.data["session_cookie"],
+            self.entry.data["partition_id"],
+        )
+        self._plan_choices = {str(p["Id"]): p["Name"] for p in raw}
+
+        if user_input is not None:
             return self.async_create_entry(title="", data=user_input)
 
-        current_entities = self.entry.options.get("entities", [])
-        current_override = self.entry.options.get("override_minutes", DEFAULT_OVERRIDE_MINUTES)
+        # Build defaults for each field
+        default_override = self.entry.options.get(
+            "override_minutes", DEFAULT_OVERRIDE_MINUTES
+        )
+        default_entities = self.entry.options.get(
+            "entities", self.entry.data.get("entities", [])
+        )
+        default_plans = [
+            str(x)
+            for x in self.entry.options.get(
+                KEY_PLAN_IDS,
+                self.entry.data.get(KEY_PLAN_IDS, []),
+            )
+        ]
 
         return self.async_show_form(
             step_id="init",
             data_schema=vol.Schema({
-                vol.Optional(
-                    "override_minutes",
-                    default=current_override
-                ): int,
-                vol.Required(
-                    "entities",
-                    default=current_entities
-                ): cv.multi_select(ENTITY_CHOICES)
+                vol.Optional("override_minutes", default=default_override): int,
+
+                vol.Required("entities", default=default_entities):
+                    cv.multi_select(ENTITY_CHOICES),
+
+                vol.Required(KEY_PLAN_IDS, default=default_plans):
+                    cv.multi_select(self._plan_choices),
             }),
-            description_placeholders={"info": "Adjust which Protector.Net entities to import and override duration."},
+            description_placeholders={
+                "info": "Adjust which door entities, action plans, and override duration to use."
+            },
         )
