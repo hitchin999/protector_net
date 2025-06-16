@@ -32,8 +32,21 @@ class ProtectorNetConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         self._partitions = {}
         self._plans = {}
 
+
     async def async_step_user(self, user_input=None):
         errors = {}
+
+        # define your data schema once, with a placeholder on base_url
+        user_schema = vol.Schema({
+            vol.Required(
+                "base_url",
+                description={"suggested_value": "https://doors.example.com:11001"}
+            ): str,
+            vol.Required("username"): str,
+            vol.Required("password"): str,
+            vol.Optional("override_minutes", default=DEFAULT_OVERRIDE_MINUTES): int,
+        })
+
         if user_input:
             self._base_url      = user_input["base_url"]
             self._username      = user_input["username"]
@@ -50,12 +63,7 @@ class ProtectorNetConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             if errors:
                 return self.async_show_form(
                     step_id="user",
-                    data_schema=vol.Schema({
-                        vol.Required("base_url"): str,
-                        vol.Required("username"): str,
-                        vol.Required("password"): str,
-                        vol.Optional("override_minutes", default=DEFAULT_OVERRIDE_MINUTES): int,
-                    }),
+                    data_schema=user_schema,
                     errors=errors,
                 )
 
@@ -65,16 +73,13 @@ class ProtectorNetConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             self._partitions = {p["Id"]: p["Name"] for p in parts}
             return await self.async_step_partition()
 
+        # first time through, no user_input yet
         return self.async_show_form(
             step_id="user",
-            data_schema=vol.Schema({
-                vol.Required("base_url"): str,
-                vol.Required("username"): str,
-                vol.Required("password"): str,
-                vol.Optional("override_minutes", default=DEFAULT_OVERRIDE_MINUTES): int,
-            }),
+            data_schema=user_schema,
             errors=errors,
         )
+
 
     async def async_step_partition(self, user_input=None):
         if user_input:
@@ -121,7 +126,7 @@ class ProtectorNetConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             return await self.async_step_entity_selection()
 
         return self.async_show_form(
-            step_id="plans",
+            step_id="plans",        # the internal ID stays "plans"
             data_schema=vol.Schema({
                 vol.Required("plans", default=list(self._plans.keys())):
                     cv.multi_select(self._plans),
