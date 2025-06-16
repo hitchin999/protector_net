@@ -190,3 +190,45 @@ async def resume_schedule(hass, door_ids: list[int]) -> bool:
     except Exception as e:
         _LOGGER.error("Error in resume_schedule: %s", e)
         return False
+async def get_action_plans(hass, base_url: str, session_cookie: str, partition_id: int) -> list[dict]:
+    """
+    Fetch all action plans for the given partition (no reauth, uses provided cookie).
+    """
+    #import httpx
+
+    url = f"{base_url}/api/ActionPlans"
+    headers = {
+        "Content-Type": "application/json",
+        "Cookie": f"ss-id={session_cookie}",
+    }
+    params = {"PartitionId": partition_id, "PageNumber": 1, "PerPage": 500}
+
+    try:
+        async with httpx.AsyncClient(verify=False) as client:
+            resp = await client.get(url, headers=headers, params=params, timeout=10)
+            resp.raise_for_status()
+            return resp.json().get("Results", [])
+    except Exception as e:
+        _LOGGER.error("Error fetching action plans: %s", e)
+        return []
+
+
+async def execute_action_plan(hass, base_url: str, session_cookie: str, plan_id: int, log_level: str | None = None, variables: dict | None = None) -> bool:
+    """
+    Execute a single action plan by ID.
+    """
+    path = f"/api/ActionPlans/{plan_id}/Exec"
+    if log_level:
+        path += f"/{log_level}"
+    url = f"{base_url}{path}"
+    payload = variables or {}
+
+    try:
+        await _request_with_reauth(
+            hass, "POST", url, json=payload, timeout=10
+        )
+        _LOGGER.info("Executed action plan %s", plan_id)
+        return True
+    except Exception as e:
+        _LOGGER.error("Error executing action plan %s: %s", plan_id, e)
+        return False
