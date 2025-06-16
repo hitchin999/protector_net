@@ -147,8 +147,7 @@ class DoorTimedOverrideUnlockButton(BaseDoorButton):
             minutes=self._override_minutes
         )
 
-
-class ActionPlanButton(ButtonEntity):
+class ActionPlanButton(ProtectorNetDevice, ButtonEntity):
     """A button to execute a Protector.Net action plan."""
 
     def __init__(self, hass: HomeAssistant, host: str, plan: dict):
