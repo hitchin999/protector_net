@@ -1,18 +1,19 @@
 # Protector.Net Access Control
 
-**Version 0.1.1**
+**Version 0.1.2 – Add Configurable Entity Selection and Options Flow**
 
 Custom Home Assistant integration to control Hartmann-controll Protector.Net door access control systems via their HTTP API.  
 Supports:
 
 - Cookie-based login with automatic session-ID refresh  
 - Partition selection to only import the doors you care about  
+- **Configurable entities**: pick exactly which button types to import (pulse, overrides, resume, timed unlock, card/PIN)  
 - Button entities for each door:
   - Pulse Unlock
   - Resume Schedule
-  - Override Unlock Until Resume
-  - Override Unlock Until Next Schedule
-  - Override Until Resume (CardOrPin)
+  - Unlock Until Resume
+  - Unlock Until Next Schedule
+  - CardOrPin Until Resume
   - Timed Override Unlock (with configurable default duration)
 
 ---
@@ -20,7 +21,7 @@ Supports:
 ## Features
 
 - **Config Flow**  
-  Set up entirely through the Home Assistant UI—no YAML required.
+  Entirely through the Home Assistant UI—no YAML required.
 
 - **Secure Login**  
   Prompts for your Protector.Net URL, username & password, and obtains the `ss-id` cookie used by the official web UI.
@@ -31,8 +32,11 @@ Supports:
 - **Partition Filtering**  
   If your site has multiple partitions, pick one during setup and only doors from that partition will be created.
 
+- **Entity Selection**  
+  Choose exactly which button types to import during setup—and revisit **Options** any time to add or remove types.
+
 - **Button Entities**  
-  Each door appears as six independent buttons. You can wire these into automations, scripts, dashboards, etc.
+  Each door appears as independent buttons that you can wire into automations, scripts, dashboards, etc.
 
 ---
 
@@ -64,34 +68,40 @@ Supports:
 4. **Partition Selection**  
    After successful login, choose one partition—only doors in this partition will be imported.
 
-5. **Finish**  
-   The integration will log in, fetch your doors, and create button entities for each.
+5. **Entity Selection**  
+   Pick which button types you want (pulse, resume, timed, card/PIN, etc.). You can always revisit **Options** later to change these.
+
+6. **Finish**  
+   The integration will log in, fetch your doors, and create only the buttons you selected.
 
 ---
 
 ## Entities Created
 
-For each door in your chosen partition, you’ll get:
+For each door in your chosen partition and selected types, you’ll get:
 
-| Entity Name                                  | Entity ID                             | Action                                                         |
-| -------------------------------------------- | ------------------------------------- | -------------------------------------------------------------- |
-| `<Door Name> Pulse Unlock`                   | `button.protector_net_<door>_pulse_unlock`   | Briefly pulses the door unlock relay                          |
-| `<Door Name> Resume Schedule`                | `button.protector_net_<door>_resume_schedule`  | Cancels any override and returns to the normal schedule       |
-| `<Door Name> Unlock Until Resume`          | `button.protector_net_<door>_unlock_until_resume` | Overrides schedule to Unlock until manually resumed                 |
-| `<Door Name> Unlock Until Next Schedule`   | `button.protector_net_<door_unlock_until_next_schedule` | Overrides to Unlock until the door's next scheduled event      |
-| `<Door Name> CardOrPin Until Resume` | `button.protector_net_<door>_cardorpin_until_resume` | Override until someone uses card or PIN  |
-| `<Door Name> Timed Override Unlock`          | `button.protector_net_<door>_timed_override_unlock` | Override for the default minutes, then resume schedule    |
+| Entity Name                                  | Entity ID                                             | Action                                                         |
+| -------------------------------------------- | ----------------------------------------------------- | -------------------------------------------------------------- |
+| `<Door Name> Pulse Unlock`                   | `button.protector_net_<door>_pulse_unlock`            | Briefly pulses the door unlock relay                          |
+| `<Door Name> Resume Schedule`                | `button.protector_net_<door>_resume_schedule`         | Cancels any override and returns to the normal schedule       |
+| `<Door Name> Unlock Until Resume`            | `button.protector_net_<door>_unlock_until_resume`     | Overrides schedule to Unlock until manually resumed           |
+| `<Door Name> Unlock Until Next Schedule`     | `button.protector_net_<door>_unlock_until_next_schedule` | Overrides to Unlock until the door’s next scheduled event      |
+| `<Door Name> CardOrPin Until Resume`         | `button.protector_net_<door>_cardorpin_until_resume`  | Override until someone uses card or PIN                       |
+| `<Door Name> Timed Override Unlock`          | `button.protector_net_<door>_timed_override_unlock`   | Override for the default minutes, then resume schedule        |
 
 ---
 
 ## Options
 
-After setup, you can update **Default Override Minutes** at any time:
+After setup, you can update:
+
+- **Default Override Minutes**  
+- **Entity Types to Import**
 
 1. **Settings → Devices & Services**  
 2. Click the **Protector.Net** integration  
 3. Hit **Options**  
-4. Change **override_minutes** and **Re-submit**
+4. Change `override_minutes` or your selected `entities` and **Re-submit**
 
 ---
 
@@ -104,6 +114,7 @@ After setup, you can update **Default Override Minutes** at any time:
     - `POST /api/PanelCommands/PulseDoor`
     - `POST /api/PanelCommands/OverrideDoor`
     - `POST /api/PanelCommands/ResumeDoor`
+
 - **Automatic Re-authentication**  
   Wrapped in a helper that retries any request once after a 401.
 
@@ -111,14 +122,20 @@ After setup, you can update **Default Override Minutes** at any time:
 
 ## Changelog
 
+### 0.1.2
+- 🎉 **New:** Configurable entity selection during setup  
+- 🔄 **New:** Options flow to add/remove entity types at any time  
+- 🐛 Fixed: MRO init issue in button base class  
+- ⚙️ Updated docs and readme
+
 ### 0.1.1
 - Add partition selection  
 - Automatic session-ID login & refresh  
-- Dynamic integration title shows `host – partition name`  
+- Dynamic integration title shows `host – partition name`
 
 ### 0.1.0
-- Initial release: cookie-based login, door imports, basic button commands  
+- Initial release: cookie-based login, door imports, basic button commands
 
 ---
 
-> _By Yoel Goldstein / Vaayer LLC_
+> _By Yoel Goldstein / Vaayer LLC_  
