@@ -61,8 +61,8 @@ Supports:
    Enter your panel’s URL, e.g. `https://doors.example.com:11001`.
 
 2. **Username & Password**  
-   Must be a Protector.Net user with **Master** privileges (full API rights and the ability to execute action plans).  
-   _Note: If your account lacks Master-level rights, some buttons (especially action plans) may fail._
+   Must be a Protector.Net admin with **System Admin** privileges (full API rights and the ability to execute action plans).  
+   _Note: If your account lacks System Admin-level rights, some buttons (especially action plans) may fail._
 
 3. **Default Override Minutes**  
    The duration used by the “Timed Override Unlock” button (default: 5).
