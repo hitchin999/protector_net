@@ -1,5 +1,6 @@
 # custom_components/protector_net/config_flow.py
 import voluptuous as vol
+
 from urllib.parse import urlparse
 
 from homeassistant import config_entries
@@ -17,7 +18,6 @@ ENTITY_CHOICES = {
     "_timed_override_unlock":      "Timed Override Unlock",
 }
 
-
 class ProtectorNetConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     """Handle Protector.Net config flow: login, partition, plans & entity selection."""
 
@@ -32,11 +32,9 @@ class ProtectorNetConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         self._partitions = {}
         self._plans = {}
 
-
     async def async_step_user(self, user_input=None):
         errors = {}
 
-        # define your data schema once, with a placeholder on base_url
         user_schema = vol.Schema({
             vol.Required(
                 "base_url",
@@ -70,23 +68,27 @@ class ProtectorNetConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             parts = await api.get_partitions(
                 self.hass, self._base_url, self._session_cookie
             )
-            self._partitions = {p["Id"]: p["Name"] for p in parts}
+            # UI always sends selected keys as strings, so use string keys here
+            self._partitions = {str(p["Id"]): p["Name"] for p in parts}
             return await self.async_step_partition()
 
-        # first time through, no user_input yet
         return self.async_show_form(
             step_id="user",
             data_schema=user_schema,
             errors=errors,
         )
 
-
     async def async_step_partition(self, user_input=None):
         if user_input:
-            partition_id   = user_input["partition"]
-            partition_name = self._partitions[partition_id]
+            # user_input["partition"] is a string, so look up that string
+            partition_key  = user_input["partition"]
+            partition_name = self._partitions[partition_key]
+            # then turn it back into an integer for storage
+            partition_id   = int(partition_key)
+
             host = urlparse(self._base_url).netloc
-            title = f"{host} – {partition_name}"
+            # Save the title for create_entry
+            self.context["entry_title"] = f"{host} – {partition_name}"
 
             self.context["entry_data"] = {
                 "base_url":       self._base_url,
@@ -109,7 +111,6 @@ class ProtectorNetConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         )
 
     async def async_step_plans(self, user_input=None):
-        """Let the user pick which Hartmann action plans to enable."""
         if not self._plans:
             raw = await api.get_action_plans(
                 self.hass,
@@ -117,16 +118,14 @@ class ProtectorNetConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 self.context["entry_data"]["session_cookie"],
                 self.context["entry_data"]["partition_id"],
             )
-            # Use string keys for multi_select
             self._plans = {str(p["Id"]): p["Name"] for p in raw}
 
         if user_input is not None:
-            # Convert back to ints
             self.context["entry_data"][KEY_PLAN_IDS] = [int(pid) for pid in user_input["plans"]]
             return await self.async_step_entity_selection()
 
         return self.async_show_form(
-            step_id="plans",        # the internal ID stays "plans"
+            step_id="plans",
             data_schema=vol.Schema({
                 vol.Required("plans", default=list(self._plans.keys())):
                     cv.multi_select(self._plans),
@@ -137,16 +136,15 @@ class ProtectorNetConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         )
 
     async def async_step_entity_selection(self, user_input=None):
-        """Let the user pick which Protector.Net door entities to enable."""
         if user_input is not None:
             data    = self.context["entry_data"]
             options = self.context["entry_options"]
             options["entities"] = user_input["entities"]
-            # Persist door-entity selection into entry.data as well:
             data["entities"] = user_input["entities"]
 
+            # Use saved title here
             return self.async_create_entry(
-                title=self._base_url,
+                title=self.context.get("entry_title", self._base_url),
                 data=data,
                 options=options,
             )
@@ -176,7 +174,6 @@ class ProtectorNetOptionsFlow(config_entries.OptionsFlow):
         self._plan_choices = {}
 
     async def async_step_init(self, user_input=None):
-        # Always refresh plan choices so new ones appear immediately
         raw = await api.get_action_plans(
             self.hass,
             self.entry.data["base_url"],
@@ -188,7 +185,6 @@ class ProtectorNetOptionsFlow(config_entries.OptionsFlow):
         if user_input is not None:
             return self.async_create_entry(title="", data=user_input)
 
-        # Build defaults for each field
         default_override = self.entry.options.get(
             "override_minutes", DEFAULT_OVERRIDE_MINUTES
         )
@@ -207,10 +203,8 @@ class ProtectorNetOptionsFlow(config_entries.OptionsFlow):
             step_id="init",
             data_schema=vol.Schema({
                 vol.Optional("override_minutes", default=default_override): int,
-
                 vol.Required("entities", default=default_entities):
                     cv.multi_select(ENTITY_CHOICES),
-
                 vol.Required(KEY_PLAN_IDS, default=default_plans):
                     cv.multi_select(self._plan_choices),
             }),
