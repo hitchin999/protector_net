@@ -2,7 +2,7 @@
 
 **Version 0.1.3 – Add Action Plan Button Entities**
 
-Custom Home Assistant integration to control Hartmann-controll Protector.Net door access control systems via their HTTP API.  
+Custom Home Assistant integration to control hartmann-controls Protector.Net door access control systems via their HTTP API.  
 Supports:
 
 - Cookie-based login with automatic session-ID refresh  
