@@ -49,7 +49,7 @@ async def _request_with_reauth(
             return resp
 
         # Session expired → re-auth
-        _LOGGER.warning("%s: session expired, re-authenticating", entry_id)
+        _LOGGER.debug("%s: session expired, re-authenticating", entry_id)
         new_cookie = await login(
             hass,
             cfg["base_url"],
