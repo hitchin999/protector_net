@@ -242,7 +242,17 @@ async def find_or_clone_system_plan(
     cfg = hass.data[DOMAIN][entry_id]
     orig = await get_action_plan_detail(hass, entry_id, trigger_id)
     plan = orig.get("Result", {})
-    clone_name = f"{plan.get('Name')} (Home Assistant)"
+    # -- START patch: avoid double‐appending the marker --
+    marker = " (Home Assistant)"
+    orig_name = plan.get("Name", "")
+    # If this plan already is our HA clone, return it immediately
+    if orig_name.endswith(marker) and plan.get("PlanType") == "System":
+        return plan.get("Id")
+    # Strip any stray markers just in case
+    if marker in orig_name:
+        orig_name = orig_name.replace(marker, "")
+    clone_name = f"{orig_name}{marker}"
+    # -- END patch --
     existing = await get_action_plans(hass, entry_id)
     for p in existing:
         if p.get('PlanType') == 'System' and p.get('Name') == clone_name and p.get('PartitionId') == plan.get('PartitionId'):
