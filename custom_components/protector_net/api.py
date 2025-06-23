@@ -2,6 +2,7 @@
 
 import httpx
 import logging
+import json
 
 _LOGGER = logging.getLogger(__name__)
 DOMAIN = "protector_net"
@@ -48,7 +49,7 @@ async def _request_with_reauth(
             resp.raise_for_status()
             return resp
 
-        # Session expired → re-auth
+        # Session expired → re-authenticate
         _LOGGER.debug("%s: session expired, re-authenticating", entry_id)
         new_cookie = await login(
             hass,
@@ -58,7 +59,6 @@ async def _request_with_reauth(
         )
         cfg["session_cookie"] = new_cookie
         headers["Cookie"] = f"ss-id={new_cookie}"
-
         resp = await client.request(method, url, headers=headers, **kwargs)
         resp.raise_for_status()
         return resp
@@ -72,13 +72,9 @@ async def get_partitions(
     """
     Used in config_flow: fetch partitions via cookie-auth.
     """
-    headers = {
-        "Content-Type": "application/json",
-        "Cookie":       f"ss-id={session_cookie}",
-    }
+    headers = {"Content-Type": "application/json", "Cookie": f"ss-id={session_cookie}"}
     params = {"PageNumber": 1, "PerPage": 500}
     url = f"{base_url}/api/Partitions/ByPrivilege/Manage_Doors"
-
     async with httpx.AsyncClient(verify=False) as client:
         resp = await client.get(url, headers=headers, params=params, timeout=10)
         resp.raise_for_status()
@@ -94,27 +90,12 @@ async def get_all_doors(
     """
     cfg = hass.data[DOMAIN][entry_id]
     url = f"{cfg['base_url']}/api/doors"
-    params = {
-        "PartitionId": cfg["partition_id"],
-        "PageNumber":  1,
-        "PerPage":     500,
-    }
-
+    params = {"PartitionId": cfg['partition_id'], "PageNumber": 1, "PerPage": 500}
     try:
-        resp = await _request_with_reauth(
-            hass,
-            entry_id,
-            "GET",
-            url,
-            params=params,
-            timeout=10
-        )
+        resp = await _request_with_reauth(hass, entry_id, "GET", url, params=params, timeout=10)
         return resp.json().get("Results", [])
     except Exception as e:
-        _LOGGER.exception(
-            "%s: Error fetching doors for partition %s: %s",
-            entry_id, cfg["partition_id"], e
-        )
+        _LOGGER.exception("%s: Error fetching doors: %s", entry_id, e)
         return []
 
 
@@ -124,21 +105,13 @@ async def pulse_unlock(
     door_ids: list[int]
 ) -> bool:
     """
-    Pulse doors via PanelCommands/PulseDoor, re-auth on 401.
+    Pulse doors via PanelCommands/PulseDoor.
     """
     cfg = hass.data[DOMAIN][entry_id]
     url = f"{cfg['base_url']}/api/PanelCommands/PulseDoor"
     payload = {"DoorIds": door_ids}
-
     try:
-        await _request_with_reauth(
-            hass,
-            entry_id,
-            "POST",
-            url,
-            json=payload,
-            timeout=10
-        )
+        await _request_with_reauth(hass, entry_id, "POST", url, json=payload, timeout=10)
         _LOGGER.info("%s: Pulse unlock sent for doors %s", entry_id, door_ids)
         return True
     except Exception as e:
@@ -158,25 +131,12 @@ async def set_override(
     """
     cfg = hass.data[DOMAIN][entry_id]
     url = f"{cfg['base_url']}/api/PanelCommands/OverrideDoor"
-    override_mins = minutes or cfg["override_minutes"]
-
-    payload = {
-        "OverrideType": override_type,
-        "DoorIds":      door_ids,
-        "TimeZoneMode": "Unlock",
-    }
+    override_mins = minutes or cfg.get("override_minutes")
+    payload = {"OverrideType": override_type, "DoorIds": door_ids, "TimeZoneMode": "Unlock"}
     if override_type == "Time":
         payload["Minutes"] = override_mins
-
     try:
-        await _request_with_reauth(
-            hass,
-            entry_id,
-            "POST",
-            url,
-            json=payload,
-            timeout=10
-        )
+        await _request_with_reauth(hass, entry_id, "POST", url, json=payload, timeout=10)
         _LOGGER.info("%s: Override %s sent to doors %s", entry_id, override_type, door_ids)
         return True
     except Exception as e:
@@ -194,28 +154,13 @@ async def override_until_resume_card_or_pin(
     """
     cfg = hass.data[DOMAIN][entry_id]
     url = f"{cfg['base_url']}/api/PanelCommands/OverrideDoor"
-    payload = {
-        "DoorIds":      door_ids,
-        "OverrideType": "Resume",
-        "TimeZoneMode": "CardOrPin",
-    }
-
+    payload = {"DoorIds": door_ids, "OverrideType": "Resume", "TimeZoneMode": "CardOrPin"}
     try:
-        await _request_with_reauth(
-            hass,
-            entry_id,
-            "POST",
-            url,
-            json=payload,
-            timeout=10
-        )
+        await _request_with_reauth(hass, entry_id, "POST", url, json=payload, timeout=10)
         _LOGGER.info("%s: Override CardOrPin sent to doors %s", entry_id, door_ids)
         return True
     except Exception as e:
-        _LOGGER.error(
-            "%s: Error in override_until_resume_card_or_pin: %s",
-            entry_id, e
-        )
+        _LOGGER.error("%s: Error in override_until_resume_card_or_pin: %s", entry_id, e)
         return False
 
 
@@ -230,17 +175,9 @@ async def resume_schedule(
     cfg = hass.data[DOMAIN][entry_id]
     url = f"{cfg['base_url']}/api/PanelCommands/ResumeDoor"
     payload = {"DoorIds": door_ids}
-
     try:
-        await _request_with_reauth(
-            hass,
-            entry_id,
-            "POST",
-            url,
-            json=payload,
-            timeout=10
-        )
-        _LOGGER.info("%s: Resumed schedule for doors: %s", entry_id, door_ids)
+        await _request_with_reauth(hass, entry_id, "POST", url, json=payload, timeout=10)
+        _LOGGER.info("%s: Resumed schedule for doors %s", entry_id, door_ids)
         return True
     except Exception as e:
         _LOGGER.error("%s: Error in resume_schedule: %s", entry_id, e)
@@ -252,52 +189,85 @@ async def get_action_plans(
     *args
 ) -> list[dict]:
     """
-    Overloaded helper:
-     - Called from config_flow as get_action_plans(hass, base_url, session_cookie, partition_id)
-     - Called at runtime as get_action_plans(hass, entry_id)
+    Overloaded: config_flow vs runtime.
     """
     import httpx
-
-    # config_flow call → args = (base_url, session_cookie, partition_id)
     if len(args) == 3:
-        base_url, session_cookie, partition_id = args
-        url = f"{base_url}/api/ActionPlans"
-        headers = {
-            "Content-Type": "application/json",
-            "Cookie":       f"ss-id={session_cookie}",
-        }
-        params = {"PartitionId": partition_id, "PageNumber": 1, "PerPage": 500}
+        base, cookie, part = args
+        url = f"{base}/api/ActionPlans"
+        headers = {"Content-Type": "application/json", "Cookie": f"ss-id={cookie}"}
+        params = {"PartitionId": part, "PageNumber": 1, "PerPage": 500}
         try:
             async with httpx.AsyncClient(verify=False) as client:
-                resp = await client.get(url, headers=headers, params=params, timeout=10)
-                resp.raise_for_status()
-                return resp.json().get("Results", [])
+                r = await client.get(url, headers=headers, params=params, timeout=10)
+                r.raise_for_status()
+                return r.json().get("Results", [])
         except Exception as e:
             _LOGGER.error("Error fetching action plans (config_flow): %s", e)
             return []
-
-    # runtime call → args = (entry_id,)
     entry_id = args[0]
     cfg = hass.data[DOMAIN][entry_id]
     url = f"{cfg['base_url']}/api/ActionPlans"
-    params = {
-        "PartitionId": cfg["partition_id"],
-        "PageNumber":  1,
-        "PerPage":     500,
-    }
+    params = {"PartitionId": cfg['partition_id'], "PageNumber": 1, "PerPage": 500}
     try:
-        resp = await _request_with_reauth(
-            hass,
-            entry_id,
-            "GET",
-            url,
-            params=params,
-            timeout=10
-        )
+        resp = await _request_with_reauth(hass, entry_id, "GET", url, params=params, timeout=10)
         return resp.json().get("Results", [])
     except Exception as e:
         _LOGGER.error("%s: Error fetching action plans: %s", entry_id, e)
         return []
+
+
+async def get_action_plan_detail(
+    hass,
+    entry_id: str,
+    plan_id: int
+) -> dict:
+    """
+    Retrieve full plan (including Contents).
+    """
+    cfg = hass.data[DOMAIN][entry_id]
+    url = f"{cfg['base_url']}/api/ActionPlans/{plan_id}"
+    resp = await _request_with_reauth(hass, entry_id, "GET", url, timeout=10)
+    return resp.json()
+
+
+async def find_or_clone_system_plan(
+    hass,
+    entry_id: str,
+    trigger_id: int
+) -> int:
+    """
+    Return existing System clone ID or clone+populate it.
+    """
+    cfg = hass.data[DOMAIN][entry_id]
+    orig = await get_action_plan_detail(hass, entry_id, trigger_id)
+    plan = orig.get("Result", {})
+    clone_name = f"{plan.get('Name')} (Home Assistant)"
+    existing = await get_action_plans(hass, entry_id)
+    for p in existing:
+        if p.get('PlanType') == 'System' and p.get('Name') == clone_name and p.get('PartitionId') == plan.get('PartitionId'):
+            return p.get('Id')
+    # 1) create skeleton
+    payload = {
+        "PlanType":     "System",
+        "Name":         clone_name,
+        "Description":  plan.get('Description'),
+        "HighSecurity": plan.get('HighSecurity', False),
+        "PartitionId":  plan.get('PartitionId'),
+    }
+    resp = await _request_with_reauth(
+        hass, entry_id, "POST", f"{cfg['base_url']}/api/ActionPlans", json=payload, timeout=10
+    )
+    new_id = resp.json().get('Id')
+    # 2) populate Contents via PUT
+    put_body = {
+        "Id": new_id,
+        "Properties": [ {"Name": "Contents", "Value": plan.get('Contents', '')} ]
+    }
+    await _request_with_reauth(
+        hass, entry_id, "PUT", f"{cfg['base_url']}/api/ActionPlans/{new_id}", json=put_body, timeout=10
+    )
+    return new_id
 
 
 async def execute_action_plan(
@@ -308,24 +278,16 @@ async def execute_action_plan(
     variables: dict | None = None
 ) -> bool:
     """
-    Execute a single action plan by ID.
+    Execute a single action plan by ID with optional SessionVars.
     """
     cfg = hass.data[DOMAIN][entry_id]
     path = f"/api/ActionPlans/{plan_id}/Exec"
     if log_level:
         path += f"/{log_level}"
-    url = f"{cfg['base_url']}{path}"
-    payload = variables or {}
-
+    url = f"{cfg['base_url']}{path}?PartitionId={cfg['partition_id']}"
+    body = {"SessionVars": variables or {}}
     try:
-        await _request_with_reauth(
-            hass,
-            entry_id,
-            "POST",
-            url,
-            json=payload,
-            timeout=10
-        )
+        await _request_with_reauth(hass, entry_id, "POST", url, json=body, timeout=10)
         _LOGGER.info("%s: Executed action plan %s", entry_id, plan_id)
         return True
     except Exception as e:
