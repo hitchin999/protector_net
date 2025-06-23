@@ -1,3 +1,4 @@
+# custom_components/protector_net/button.py
 import logging
 from urllib.parse import urlparse
 
@@ -36,10 +37,19 @@ async def async_setup_entry(
         entry.data.get("override_minutes", DEFAULT_OVERRIDE_MINUTES)
     )
 
+    # Original trigger plan IDs selected by user
     raw_plan_ids = entry.options.get(KEY_PLAN_IDS, entry.data.get(KEY_PLAN_IDS, []))
     plan_ids = [int(pid) for pid in raw_plan_ids]
 
-    _LOGGER.debug("PROTECTOR_NET: selected door entities=%s plan_ids=%s", selected, plan_ids)
+    # Ensure each trigger has exactly one System-type clone
+    system_ids = []
+    for trig_id in plan_ids:
+        try:
+            sys_id = await api.find_or_clone_system_plan(hass, entry.entry_id, trig_id)
+            system_ids.append(sys_id)
+        except Exception as e:
+            _LOGGER.error("Error cloning trigger plan %s: %s", trig_id, e)
+    _LOGGER.debug("Protector Net: system plan ids=%s", system_ids)
 
     entities = []
 
@@ -58,8 +68,8 @@ async def async_setup_entry(
         if "_timed_override_unlock" in selected:
             entities.append(DoorTimedOverrideUnlockButton(hass, entry, door, override_mins))
 
-    # Action Plan buttons
-    if plan_ids:
+    # Action Plan buttons (System clones)
+    if system_ids:
         try:
             plans = await api.get_action_plans(hass, entry.entry_id)
         except Exception as e:
@@ -67,7 +77,7 @@ async def async_setup_entry(
             plans = []
 
         for plan in plans:
-            if plan["Id"] in plan_ids:
+            if plan["Id"] in system_ids:
                 entities.append(ActionPlanButton(hass, entry, plan))
 
     async_add_entities(entities)
