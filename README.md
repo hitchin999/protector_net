@@ -30,6 +30,13 @@ Custom Home Assistant integration to control Hartmann-Controls Protector.Net doo
   Trigger-type Action Plans are cloned into “System” plans named `"<Original Name> (Home Assistant)"`.  
   A two-step POST→PUT process ensures the full plan contents survive cloning.
 
+- **Home Assistant Door-Log**  
+  Every time you press a door-button in HA, the integration logs  
+  ```
+  Home Assistant unlocked <Door Name>
+  ```
+  in your Protector.Net panel’s system log.
+
 - **Fully UI-Driven**  
   No YAML needed—complete setup and options flow in the Home Assistant UI.
 
@@ -127,7 +134,15 @@ After setup, you can adjust:
      2. **PUT** the original plan’s `Contents` JSON back into it  
    - Returns the System plan’s ID.
 
-2. **execute_action_plan()**  
+2. **find_or_create_ha_log_plan()**  
+   - Ensures a single System plan named **HA Door Log** exists.  
+   - Populates its Contents once, so that **every** door-button press logs  
+     ```
+     Home Assistant unlocked <Door Name>
+     ```  
+     Plus a follow-up line `<Door Name> logged`.
+
+3. **execute_action_plan()**  
    Issues a `POST /Exec/Info` with optional `{ "SessionVars": {...} }` body.
 
 ---
@@ -138,6 +153,7 @@ After setup, you can adjust:
 - 🐛 **Fixed:** Action Plan Buttons now clone & populate plan contents via two-step POST→PUT  
 - 🔄 **Improved:** `find_or_clone_system_plan` reuses existing clones; no duplicates on reconfigure  
 - 🐛 **Fixed:** Empty Action Plan clones  
+- 🆕 **New:** “Home Assistant unlocked…” log entries in Protector.Net panel for every door-button press
 
 ### 0.1.3
 - 🎉 **New:** Import & execute Protector.Net Action Plans as buttons  
@@ -158,6 +174,4 @@ After setup, you can adjust:
 ### 0.1.0
 - Initial release: door imports & basic button commands  
 
----
-
-> _By Yoel Goldstein / Vaayer LLC_  
+> _By Yoel Goldstein / Vaayer LLC_
