@@ -149,6 +149,9 @@ After setup, you can adjust:
 
 ## Changelog
 
+### 0.1.5
+- 🆕 **New:** “Home Assistant unlocked…” log entries in Protector.Net panel for every door-button press
+
 ### 0.1.4
 - 🐛 **Fixed:** Action Plan Buttons now clone & populate plan contents via two-step POST→PUT  
 - 🔄 **Improved:** `find_or_clone_system_plan` reuses existing clones; no duplicates on reconfigure  
