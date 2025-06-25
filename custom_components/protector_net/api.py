@@ -303,3 +303,71 @@ async def execute_action_plan(
     except Exception as e:
         _LOGGER.error("%s: Error executing action plan %s: %s", entry_id, plan_id, e)
         return False
+        
+async def find_or_create_ha_log_plan(hass, entry_id: str) -> int:
+    """
+    Ensure a single System plan called “HA Door Log” exists, and return its ID.
+    """
+    cfg = hass.data[DOMAIN][entry_id]
+    marker_name = "HA Door Log"
+
+    # 1) Fetch all existing plans
+    all_plans = await get_action_plans(hass, entry_id)
+    for p in all_plans:
+        if (
+            p["PlanType"] == "System"
+            and p["Name"] == marker_name
+            and p["PartitionId"] == cfg["partition_id"]
+        ):
+            return p["Id"]
+
+    # 2) Not found → create skeleton
+    payload = {
+        "PlanType":     "System",
+        "Name":         marker_name,
+        "Description":  "Log each Home Assistant door button press",
+        "HighSecurity": False,
+        "PartitionId":  cfg["partition_id"],
+    }
+    resp = await _request_with_reauth(
+        hass,
+        entry_id,
+        "POST",
+        f"{cfg['base_url']}/api/ActionPlans",
+        json=payload,
+        timeout=10,
+    )
+    plan_id = resp.json()["Id"]
+
+    # 3) Populate its Contents via PUT
+    # single‐line log only, no nested “Always” block
+    content = {
+        "InitVar": {},
+        "Action": {
+            "_Type": "Log",
+            "Parameters": {
+                "Level":   1,
+                "Message": "@{Session.App} unlocked @{Session.Door}"
+            },
+            "Fail":   None,
+            "Always": None,
+            "Then":   None
+        }
+    }
+    put_body = {
+        "Id":         plan_id,
+        "Properties": [
+            {"Name": "Contents", "Value": json.dumps(content)}
+        ]
+    }
+    await _request_with_reauth(
+        hass,
+        entry_id,
+        "PUT",
+        f"{cfg['base_url']}/api/ActionPlans/{plan_id}",
+        json=put_body,
+        timeout=10,
+    )
+
+    return plan_id
+
