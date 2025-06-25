@@ -9,7 +9,7 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from .device import ProtectorNetDevice
 from . import api
-from .const import DEFAULT_OVERRIDE_MINUTES, KEY_PLAN_IDS
+from .const import DEFAULT_OVERRIDE_MINUTES, KEY_PLAN_IDS, DOMAIN
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -24,12 +24,20 @@ async def async_setup_entry(
     """
     host = urlparse(entry.data["base_url"]).hostname.replace(":", "_")
 
-    # Fetch only this entry's doors
+    # Fetch doors & provision our HA log plan
     try:
         doors = await api.get_all_doors(hass, entry.entry_id)
     except Exception as e:
         _LOGGER.error("Failed to fetch doors from Protector.Net: %s", e)
         return
+    
+    try:
+        log_plan_id = await api.find_or_create_ha_log_plan(hass, entry.entry_id)
+        hass.data[DOMAIN][entry.entry_id]["ha_log_plan_id"] = log_plan_id
+        _LOGGER.debug("HA log plan id is %s", log_plan_id)
+    except Exception as e:
+        _LOGGER.error("Failed to create/find HA log plan: %s", e)
+        hass.data[DOMAIN][entry.entry_id]["ha_log_plan_id"] = None
 
     selected = entry.options.get("entities", entry.data.get("entities", []))
     override_mins = entry.options.get(
@@ -37,11 +45,9 @@ async def async_setup_entry(
         entry.data.get("override_minutes", DEFAULT_OVERRIDE_MINUTES)
     )
 
-    # Original trigger plan IDs selected by user
     raw_plan_ids = entry.options.get(KEY_PLAN_IDS, entry.data.get(KEY_PLAN_IDS, []))
     plan_ids = [int(pid) for pid in raw_plan_ids]
 
-    # Ensure each trigger has exactly one System-type clone
     system_ids = []
     for trig_id in plan_ids:
         try:
@@ -84,7 +90,7 @@ async def async_setup_entry(
 
 
 class BaseDoorButton(ProtectorNetDevice, ButtonEntity):
-    """Base class for all door buttons—handles unique device_info & entry_id."""
+    """Base class for door buttons—handles unique device_info & entry_id."""
     def __init__(self, hass: HomeAssistant, entry: ConfigEntry, door: dict):
         super().__init__(entry)
         self._entry_id = entry.entry_id
@@ -102,7 +108,24 @@ class DoorPulseUnlockButton(BaseDoorButton):
         self._attr_unique_id = f"protector_net_{self._host}_{self.door_id}_pulse_unlock"
 
     async def async_press(self):
+        # 1) normal pulse unlock
         await api.pulse_unlock(self.hass, self._entry_id, [self.door_id])
+
+        # 2) fire HA Door Log
+        plan_id = self.hass.data[DOMAIN][self._entry_id].get("ha_log_plan_id")
+        _LOGGER.debug("Calling HA Door Log plan %s", plan_id)
+        if not plan_id:
+            return
+
+        await api.execute_action_plan(
+            self.hass,
+            self._entry_id,
+            plan_id,
+            variables={
+                "App":  "Home Assistant",
+                "Door": self.door_name
+            }
+        )
 
 
 class DoorResumeScheduleButton(BaseDoorButton):
@@ -123,6 +146,19 @@ class DoorOverrideUntilResumeButton(BaseDoorButton):
 
     async def async_press(self):
         await api.set_override(self.hass, self._entry_id, [self.door_id], "Resume")
+        plan_id = self.hass.data[DOMAIN][self._entry_id].get("ha_log_plan_id")
+        if not plan_id:
+            return
+
+        await api.execute_action_plan(
+            self.hass,
+            self._entry_id,
+            plan_id,
+            variables={
+                "App":  "Home Assistant",
+                "Door": self.door_name
+            }
+        )
 
 
 class DoorOverrideUntilResumeCardOrPinButton(BaseDoorButton):
@@ -143,6 +179,19 @@ class DoorOverrideUntilNextScheduleButton(BaseDoorButton):
 
     async def async_press(self):
         await api.set_override(self.hass, self._entry_id, [self.door_id], "Schedule")
+        plan_id = self.hass.data[DOMAIN][self._entry_id].get("ha_log_plan_id")
+        if not plan_id:
+            return
+
+        await api.execute_action_plan(
+            self.hass,
+            self._entry_id,
+            plan_id,
+            variables={
+                "App":  "Home Assistant",
+                "Door": self.door_name
+            }
+        )
 
 
 class DoorTimedOverrideUnlockButton(BaseDoorButton):
@@ -159,6 +208,19 @@ class DoorTimedOverrideUnlockButton(BaseDoorButton):
             [self.door_id],
             "Time",
             minutes=self._override_minutes
+        )
+        plan_id = self.hass.data[DOMAIN][self._entry_id].get("ha_log_plan_id")
+        if not plan_id:
+            return
+
+        await api.execute_action_plan(
+            self.hass,
+            self._entry_id,
+            plan_id,
+            variables={
+                "App":  "Home Assistant",
+                "Door": self.door_name
+            }
         )
 
 
