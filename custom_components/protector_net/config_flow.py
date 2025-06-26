@@ -118,7 +118,9 @@ class ProtectorNetConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 self.context["entry_data"]["session_cookie"],
                 self.context["entry_data"]["partition_id"],
             )
-            self._plans = {str(p["Id"]): p["Name"] for p in raw}
+            # Only show the genuine Trigger-type plans
+            triggers = [p for p in raw if p.get("PlanType") == "Trigger"]
+            self._plans = {str(p["Id"]): p["Name"] for p in triggers}
 
         if user_input is not None:
             self.context["entry_data"][KEY_PLAN_IDS] = [int(pid) for pid in user_input["plans"]]
@@ -180,7 +182,9 @@ class ProtectorNetOptionsFlow(config_entries.OptionsFlow):
             self.entry.data["session_cookie"],
             self.entry.data["partition_id"],
         )
-        self._plan_choices = {str(p["Id"]): p["Name"] for p in raw}
+        # Only include Trigger-type plans for selection
+        triggers = [p for p in raw if p.get("PlanType") == "Trigger"]
+        self._plan_choices = {str(p["Id"]): p["Name"] for p in triggers}
 
         if user_input is not None:
             return self.async_create_entry(title="", data=user_input)
