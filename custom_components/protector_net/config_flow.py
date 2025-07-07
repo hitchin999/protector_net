@@ -18,6 +18,7 @@ ENTITY_CHOICES = {
     "_timed_override_unlock":      "Timed Override Unlock",
 }
 
+
 class ProtectorNetConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     """Handle Protector.Net config flow: login, partition, plans & entity selection."""
 
@@ -118,12 +119,19 @@ class ProtectorNetConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 self.context["entry_data"]["session_cookie"],
                 self.context["entry_data"]["partition_id"],
             )
-            # Only show the genuine Trigger-type plans
-            triggers = [p for p in raw if p.get("PlanType") == "Trigger"]
+            # Only show genuine Trigger-type plans, never the HA Door Log plan
+            triggers = [
+                p for p in raw
+                if p.get("PlanType") == "Trigger"
+                   and p.get("Name") != "HA Door Log"
+            ]
             self._plans = {str(p["Id"]): p["Name"] for p in triggers}
 
         if user_input is not None:
-            self.context["entry_data"][KEY_PLAN_IDS] = [int(pid) for pid in user_input["plans"]]
+            plan_ids = [int(pid) for pid in user_input["plans"]]
+            # store in both data (for runtime) and options (for reconfigure defaults)
+            self.context["entry_data"][KEY_PLAN_IDS]   = plan_ids
+            self.context["entry_options"][KEY_PLAN_IDS] = plan_ids
             return await self.async_step_entity_selection()
 
         return self.async_show_form(
@@ -142,7 +150,7 @@ class ProtectorNetConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             data    = self.context["entry_data"]
             options = self.context["entry_options"]
             options["entities"] = user_input["entities"]
-            data["entities"] = user_input["entities"]
+            data["entities"]    = user_input["entities"]
 
             # Use saved title here
             return self.async_create_entry(
@@ -182,8 +190,12 @@ class ProtectorNetOptionsFlow(config_entries.OptionsFlow):
             self.entry.data["session_cookie"],
             self.entry.data["partition_id"],
         )
-        # Only include Trigger-type plans for selection
-        triggers = [p for p in raw if p.get("PlanType") == "Trigger"]
+        # Only include Trigger-type plans, never the HA Door Log plan
+        triggers = [
+            p for p in raw
+            if p.get("PlanType") == "Trigger"
+               and p.get("Name") != "HA Door Log"
+        ]
         self._plan_choices = {str(p["Id"]): p["Name"] for p in triggers}
 
         if user_input is not None:
