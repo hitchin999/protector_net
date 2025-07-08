@@ -1,23 +1,25 @@
 name: Build & Publish Protector.Net Release
 
+# fire on new tags (and you can still manually dispatch if you add workflow_dispatch)
 on:
   push:
-    # Triggers on tags like v1.2.3
     tags:
       - 'v*.*.*'
+  workflow_dispatch:  
+
+permissions:
+  contents: write
+
 jobs:
   publish:
     runs-on: ubuntu-latest
 
     steps:
-      # 1) Check out your code
       - uses: actions/checkout@v3
 
-      # 2) Extract the version from the tag (e.g. "v1.2.3" → "1.2.3")
       - name: Set VERSION
         run: echo "VERSION=${GITHUB_REF#refs/tags/}" >> $GITHUB_ENV
 
-      # 3) Zip the integration (exclude .git and your workflows)
       - name: Package Protector.Net
         run: |
           zip -r protector_net.zip . \
@@ -25,8 +27,7 @@ jobs:
             -x .github/\*
           echo "ASSET=protector_net.zip" >> $GITHUB_ENV
 
-      # 4) Create or update the GitHub Release for this tag
-      - name: Create GitHub Release
+      - name: Create or update GitHub Release
         uses: softprops/action-gh-release@v1
         with:
           tag_name: ${{ env.VERSION }}
@@ -34,7 +35,6 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      # 5) Upload the ZIP as a Release asset
       - name: Upload ZIP Asset
         uses: softprops/action-gh-release@v1
         with:
