@@ -16,15 +16,14 @@ jobs:
 
       - name: Package Protector.Net
         run: |
-          zip -r protector_net.zip . \
-            -x .git/** \
-            -x .github/**
+          cd custom_components
+          zip -r ../protector_net.zip protector_net
+          echo "ASSET=protector_net.zip" >> $GITHUB_ENV
 
-      - name: Upload ZIP asset
+      - name: Upload ZIP Asset
         uses: softprops/action-gh-release@v1
         with:
           tag_name: ${{ github.event.release.tag_name }}
-          files: protector_net.zip
+          files: ${{ env.ASSET }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          
