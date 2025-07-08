@@ -1,4 +1,4 @@
-name: Attach ZIP Asset on Release
+name: Attach Protector.Net ZIP on Release
 
 on:
   release:
@@ -10,14 +10,19 @@ permissions:
 jobs:
   attach-asset:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v3
 
       - name: Package Protector.Net
+        # move into the folder that *contains* your integration files:
         run: |
-          cd custom_components
-          zip -r ../protector_net.zip protector_net
+          cd custom_components/protector_net
+          # zip up everything *in* this folder into a ZIP whose root is those files:
+          zip -r __artifact__.zip . 
+          # move it back to workspace root and register:
+          mv __artifact__.zip $GITHUB_WORKSPACE/protector_net.zip
           echo "ASSET=protector_net.zip" >> $GITHUB_ENV
 
       - name: Upload ZIP Asset
@@ -27,3 +32,4 @@ jobs:
           files: ${{ env.ASSET }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          
