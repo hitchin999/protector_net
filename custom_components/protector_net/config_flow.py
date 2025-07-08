@@ -1,4 +1,5 @@
 # custom_components/protector_net/config_flow.py
+import logging
 import voluptuous as vol
 
 from urllib.parse import urlparse
@@ -8,6 +9,8 @@ from homeassistant.helpers import config_validation as cv
 
 from .const import DOMAIN, DEFAULT_OVERRIDE_MINUTES, KEY_PLAN_IDS
 from . import api
+
+_LOGGER = logging.getLogger(__name__)
 
 ENTITY_CHOICES = {
     "_pulse_unlock":               "Pulse Unlock",
@@ -69,7 +72,7 @@ class ProtectorNetConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             parts = await api.get_partitions(
                 self.hass, self._base_url, self._session_cookie
             )
-            # UI always sends selected keys as strings, so use string keys here
+            # UI always sends selected keys as strings
             self._partitions = {str(p["Id"]): p["Name"] for p in parts}
             return await self.async_step_partition()
 
@@ -81,16 +84,14 @@ class ProtectorNetConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
     async def async_step_partition(self, user_input=None):
         if user_input:
-            # user_input["partition"] is a string, so look up that string
             partition_key  = user_input["partition"]
             partition_name = self._partitions[partition_key]
-            # then turn it back into an integer for storage
             partition_id   = int(partition_key)
 
             host = urlparse(self._base_url).netloc
-            # Save the title for create_entry
             self.context["entry_title"] = f"{host} – {partition_name}"
 
+            # Persist data & options so far
             self.context["entry_data"] = {
                 "base_url":       self._base_url,
                 "username":       self._username,
@@ -107,19 +108,53 @@ class ProtectorNetConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         return self.async_show_form(
             step_id="partition",
             data_schema=vol.Schema({
-                vol.Required("partition", default=list(self._partitions)[0]): vol.In(self._partitions),
+                vol.Required("partition", default=list(self._partitions)[0]):
+                    vol.In(self._partitions),
             }),
         )
 
     async def async_step_plans(self, user_input=None):
+        errors = {}
         if not self._plans:
-            raw = await api.get_action_plans(
-                self.hass,
-                self.context["entry_data"]["base_url"],
-                self.context["entry_data"]["session_cookie"],
-                self.context["entry_data"]["partition_id"],
-            )
-            # Only show genuine Trigger-type plans, never the HA Door Log plan
+            # Attempt to fetch trigger plans, re-login on 401 if needed
+            try:
+                raw = await api.get_action_plans(
+                    self.hass,
+                    self.context["entry_data"]["base_url"],
+                    self.context["entry_data"]["session_cookie"],
+                    self.context["entry_data"]["partition_id"],
+                )
+            except Exception as err:
+                _LOGGER.debug("Fetching plans failed, retrying login: %s", err)
+                # try one re-login
+                try:
+                    self._session_cookie = await api.login(
+                        self.hass,
+                        self._base_url,
+                        self._username,
+                        self._password
+                    )
+                    # update saved cookie for subsequent calls
+                    self.context["entry_data"]["session_cookie"] = self._session_cookie
+                    raw = await api.get_action_plans(
+                        self.hass,
+                        self._base_url,
+                        self._session_cookie,
+                        self.context["entry_data"]["partition_id"],
+                    )
+                except Exception as err2:
+                    _LOGGER.error("Could not fetch action plans: %s", err2)
+                    errors["base"] = "cannot_connect"
+                    # return to same form with error
+                    return self.async_show_form(
+                        step_id="plans",
+                        data_schema=vol.Schema({
+                            vol.Required("plans", default=[]): cv.multi_select({})
+                        }),
+                        errors=errors
+                    )
+
+            # Filter out any System‐type “HA Door Log” and only keep Trigger plans
             triggers = [
                 p for p in raw
                 if p.get("PlanType") == "Trigger"
@@ -129,7 +164,7 @@ class ProtectorNetConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
         if user_input is not None:
             plan_ids = [int(pid) for pid in user_input["plans"]]
-            # store in both data (for runtime) and options (for reconfigure defaults)
+            # store for runtime & for reconfigure defaults
             self.context["entry_data"][KEY_PLAN_IDS]   = plan_ids
             self.context["entry_options"][KEY_PLAN_IDS] = plan_ids
             return await self.async_step_entity_selection()
@@ -143,6 +178,7 @@ class ProtectorNetConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             description_placeholders={
                 "info": "Select which action plans to turn into buttons."
             },
+            errors=errors,
         )
 
     async def async_step_entity_selection(self, user_input=None):
@@ -152,7 +188,6 @@ class ProtectorNetConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             options["entities"] = user_input["entities"]
             data["entities"]    = user_input["entities"]
 
-            # Use saved title here
             return self.async_create_entry(
                 title=self.context.get("entry_title", self._base_url),
                 data=data,
@@ -182,15 +217,10 @@ class ProtectorNetOptionsFlow(config_entries.OptionsFlow):
     def __init__(self, entry):
         self.entry = entry
         self._plan_choices = {}
-
     async def async_step_init(self, user_input=None):
-        raw = await api.get_action_plans(
-            self.hass,
-            self.entry.data["base_url"],
-            self.entry.data["session_cookie"],
-            self.entry.data["partition_id"],
-        )
-        # Only include Trigger-type plans, never the HA Door Log plan
+        # Use the runtime (reauth-aware) fetch, not the config-flow GET
+        raw = await api.get_action_plans(self.hass, self.entry.entry_id)
+
         triggers = [
             p for p in raw
             if p.get("PlanType") == "Trigger"
@@ -228,3 +258,4 @@ class ProtectorNetOptionsFlow(config_entries.OptionsFlow):
                 "info": "Adjust which door entities, action plans, and override duration to use."
             },
         )
+        
