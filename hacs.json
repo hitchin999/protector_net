@@ -1,4 +1,6 @@
 {
   "name": "Protector.Net Access Control",
-  "homeassistant": "2023.7.0"
+  "homeassistant": "2023.7.0",
+  "zip_release": true,
+  "filename": "protector_net.zip"
 }
