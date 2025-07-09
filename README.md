@@ -1,3 +1,5 @@
+[![Protector.Net total downloads](https://img.shields.io/github/downloads/hitchin999/protector_net/total.svg?style=for-the-badge)](https://github.com/hitchin999/protector_net/releases)
+
 # Protector.Net Access Control
 
 [![Open your Home Assistant instance and open a repository inside the Home Assistant Community Store.](https://my.home-assistant.io/badges/hacs_repository.svg)](https://my.home-assistant.io/redirect/hacs_repository/?owner=hitchin999&repository=protector_net&category=Integration)
