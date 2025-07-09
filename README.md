@@ -59,7 +59,7 @@ Custom Home Assistant integration to control Hartmann-Controls Protector.Net doo
 ## Configuration Steps
 
 1. **Base URL**  
-   `https://your-panel-host:port`
+   `https://your-server-host:port`
 
 2. **Credentials**  
    - Username & Password must have **System Admin** privileges in Protector.Net.
