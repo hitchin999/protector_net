@@ -1,8 +1,14 @@
-[![Protector.Net total downloads](https://img.shields.io/github/downloads/hitchin999/protector_net/total.svg?style=for-the-badge)](https://github.com/hitchin999/protector_net/releases)
+[![Total Downloads](https://img.shields.io/github/downloads/hitchin999/protector_net/total.svg?label=Total%20Downloads&style=for-the-badge&color=blue)](https://github.com/hitchin999/protector_net/releases)
 
-# Protector.Net Access Control
+[![Active Protector.Net Installs][prot-badge]][prot-analytics]
+
+[prot-badge]: https://img.shields.io/badge/dynamic/json?label=Active%20Installs&url=https%3A%2F%2Fanalytics.home-assistant.io%2Fcustom_integrations.json&query=%24.protector_net.total&style=for-the-badge&color=blue
+[prot-analytics]: https://analytics.home-assistant.io/integration/protector_net
+
+# Protector.Net Access Control Integration for Home Assistant
 
 [![Open your Home Assistant instance and open a repository inside the Home Assistant Community Store.](https://my.home-assistant.io/badges/hacs_repository.svg)](https://my.home-assistant.io/redirect/hacs_repository/?owner=hitchin999&repository=protector_net&category=Integration)
+
 
 **Version 0.1.5 – “Home Assistant unlocked…” log entries in Protector.Net for every door-button press**
 
