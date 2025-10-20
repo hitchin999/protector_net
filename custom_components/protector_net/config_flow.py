@@ -1,8 +1,7 @@
-# custom_components/protector_net/config_flow.py
 import logging
 import voluptuous as vol
 
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlsplit
 
 from homeassistant import config_entries
 from homeassistant.helpers import config_validation as cv
@@ -50,7 +49,8 @@ class ProtectorNetConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         })
 
         if user_input:
-            self._base_url      = user_input["base_url"]
+            # normalize base_url once
+            self._base_url      = user_input["base_url"].rstrip("/")
             self._username      = user_input["username"]
             self._password      = user_input["password"]
             self._override_mins = user_input["override_minutes"]
@@ -89,6 +89,14 @@ class ProtectorNetConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             partition_id   = int(partition_key)
 
             host = urlparse(self._base_url).netloc
+
+            # set per-entry unique_id to avoid dupes across same host+partition
+            split = urlsplit(self._base_url)
+            host_for_uid = split.netloc or split.path
+            unique_id = f"{host_for_uid}|partition:{partition_id}"
+            await self.async_set_unique_id(unique_id, raise_on_progress=False)
+            self._abort_if_unique_id_configured()
+
             self.context["entry_title"] = f"{host} – {partition_name}"
 
             # Persist data & options so far
@@ -165,7 +173,7 @@ class ProtectorNetConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         if user_input is not None:
             plan_ids = [int(pid) for pid in user_input["plans"]]
             # store for runtime & for reconfigure defaults
-            self.context["entry_data"][KEY_PLAN_IDS]   = plan_ids
+            self.context["entry_data"][KEY_PLAN_IDS]    = plan_ids
             self.context["entry_options"][KEY_PLAN_IDS] = plan_ids
             return await self.async_step_entity_selection()
 
@@ -217,6 +225,7 @@ class ProtectorNetOptionsFlow(config_entries.OptionsFlow):
     def __init__(self, entry):
         self.entry = entry
         self._plan_choices = {}
+
     async def async_step_init(self, user_input=None):
         # Use the runtime (reauth-aware) fetch, not the config-flow GET
         raw = await api.get_action_plans(self.hass, self.entry.entry_id)
@@ -258,4 +267,3 @@ class ProtectorNetOptionsFlow(config_entries.OptionsFlow):
                 "info": "Adjust which door entities, action plans, and override duration to use."
             },
         )
-        
