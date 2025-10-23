@@ -11,8 +11,8 @@ from . import api
 
 _LOGGER = logging.getLogger(__name__)
 
-ENTITY_CHOICES = {
-    "_pulse_unlock":               "Pulse Unlock",
+# Optional legacy buttons only (Pulse Unlock is implicit and always added)
+ENTITY_CHOICES_OPTIONAL = {
     "_resume_schedule":            "Resume Schedule",
     "_unlock_until_resume":        "Unlock Until Resume",
     "_override_card_or_pin":       "CardOrPin Until Resume",
@@ -22,7 +22,7 @@ ENTITY_CHOICES = {
 
 
 class ProtectorNetConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
-    """Handle Protector.Net config flow: login, partition, plans & entity selection."""
+    """Handle Protector.Net config flow: login, partition, plans & (minimal) entity selection."""
 
     VERSION = 1
 
@@ -162,7 +162,7 @@ class ProtectorNetConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                         errors=errors
                     )
 
-            # Filter out any System‐type “HA Door Log” and only keep Trigger plans
+            # Filter out any System “HA Door Log” and only keep Trigger plans
             triggers = [
                 p for p in raw
                 if p.get("PlanType") == "Trigger"
@@ -184,17 +184,24 @@ class ProtectorNetConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                     cv.multi_select(self._plans),
             }),
             description_placeholders={
-                "info": "Select which action plans to turn into buttons."
+                "info": "Select which trigger plans to clone (as System) and expose as Action Plan buttons."
             },
             errors=errors,
         )
 
     async def async_step_entity_selection(self, user_input=None):
+        """Pick *optional* legacy door buttons. Pulse Unlock is always added."""
         if user_input is not None:
             data    = self.context["entry_data"]
             options = self.context["entry_options"]
-            options["entities"] = user_input["entities"]
-            data["entities"]    = user_input["entities"]
+
+            # keep only valid optional keys
+            picked_optional = [e for e in user_input["entities"] if e in ENTITY_CHOICES_OPTIONAL]
+            # ALWAYS include Pulse Unlock
+            final_entities = ["_pulse_unlock", *picked_optional]
+
+            options["entities"] = final_entities
+            data["entities"]    = final_entities
 
             return self.async_create_entry(
                 title=self.context.get("entry_title", self._base_url),
@@ -202,14 +209,15 @@ class ProtectorNetConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 options=options,
             )
 
+        # Default: nothing selected
         return self.async_show_form(
             step_id="entity_selection",
             data_schema=vol.Schema({
-                vol.Required("entities", default=list(ENTITY_CHOICES.keys())):
-                    cv.multi_select(ENTITY_CHOICES),
+                vol.Required("entities", default=[]): cv.multi_select(ENTITY_CHOICES_OPTIONAL),
             }),
             description_placeholders={
-                "info": "Select which Protector.Net door entities to create."
+                "info": "Select any additional legacy door buttons you want. "
+                        "Pulse Unlock is always added automatically."
             },
         )
 
@@ -220,7 +228,7 @@ class ProtectorNetConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
 
 class ProtectorNetOptionsFlow(config_entries.OptionsFlow):
-    """Allow editing override_minutes, door-entities, and action-plan selection."""
+    """Allow editing override_minutes, optional legacy door buttons, and action-plan selection."""
 
     def __init__(self, entry):
         self.entry = entry
@@ -238,14 +246,22 @@ class ProtectorNetOptionsFlow(config_entries.OptionsFlow):
         self._plan_choices = {str(p["Id"]): p["Name"] for p in triggers}
 
         if user_input is not None:
+            # Force Pulse Unlock to remain present; keep only valid optional picks
+            picked_optional = [e for e in user_input.get("entities", []) if e in ENTITY_CHOICES_OPTIONAL]
+            user_input["entities"] = ["_pulse_unlock", *picked_optional]
             return self.async_create_entry(title="", data=user_input)
 
         default_override = self.entry.options.get(
             "override_minutes", DEFAULT_OVERRIDE_MINUTES
         )
-        default_entities = self.entry.options.get(
+
+        saved_entities = self.entry.options.get(
             "entities", self.entry.data.get("entities", [])
-        )
+        ) or []
+
+        # Show only optional ones in the picker (Pulse Unlock is implicit)
+        default_entities_optional = [e for e in saved_entities if e in ENTITY_CHOICES_OPTIONAL]
+
         default_plans = [
             str(x)
             for x in self.entry.options.get(
@@ -258,12 +274,13 @@ class ProtectorNetOptionsFlow(config_entries.OptionsFlow):
             step_id="init",
             data_schema=vol.Schema({
                 vol.Optional("override_minutes", default=default_override): int,
-                vol.Required("entities", default=default_entities):
-                    cv.multi_select(ENTITY_CHOICES),
+                vol.Required("entities", default=default_entities_optional):
+                    cv.multi_select(ENTITY_CHOICES_OPTIONAL),
                 vol.Required(KEY_PLAN_IDS, default=default_plans):
                     cv.multi_select(self._plan_choices),
             }),
             description_placeholders={
-                "info": "Adjust which door entities, action plans, and override duration to use."
+                "info": "Adjust Action Plan buttons and override duration. "
+                        "Pulse Unlock is always included automatically."
             },
         )
