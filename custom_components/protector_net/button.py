@@ -173,7 +173,7 @@ class BaseDoorButton(ProtectorNetDevice, ButtonEntity):
         return {
             "identifiers": {(DOMAIN, f"door:{self._host_key}:{self.door_id}|{self._entry_id}")},
             "name": self.door_name,
-            "manufacturer": "Hartmann Controls",
+            "manufacturer": "Yoel Goldstein/Vaayer LLC",
             "model": "Protector.Net Door",
             "via_device": (DOMAIN, self._hub_identifier),
             "configuration_url": self._entry.data.get("base_url"),
@@ -299,7 +299,7 @@ class ActionPlanButton(ProtectorNetDevice, ButtonEntity):
         device_ident = f"actionplans:{self._host_key}|{self._entry_id}"
         info = {
             "identifiers": {(DOMAIN, device_ident)},
-            "manufacturer": "Hartmann Controls",
+            "manufacturer": "Yoel Goldstein/Vaayer LLC",
             "model": "Protector.Net Action Plans",
             "name": f"Action Plans – {self._partition_name}",
             "configuration_url": self._entry.data.get("base_url"),
@@ -310,3 +310,4 @@ class ActionPlanButton(ProtectorNetDevice, ButtonEntity):
         success = await api.execute_action_plan(self.hass, self._entry_id, self._plan["Id"])
         if not success:
             _LOGGER.error("[%s] Failed to execute action plan %s", self._entry_id, self._plan["Id"])
+
