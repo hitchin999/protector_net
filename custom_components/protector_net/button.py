@@ -1,94 +1,155 @@
+from __future__ import annotations
+
+import asyncio
 import logging
 from urllib.parse import urlparse
 
 from homeassistant.components.button import ButtonEntity
-from homeassistant.core import HomeAssistant
 from homeassistant.config_entries import ConfigEntry
+from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
-from .device import ProtectorNetDevice
 from . import api
 from .const import DEFAULT_OVERRIDE_MINUTES, KEY_PLAN_IDS, DOMAIN
+from .device import ProtectorNetDevice
 
 _LOGGER = logging.getLogger(__name__)
+
+# Legacy door button keys (must match config_flow)
+LEGACY_PULSE = "_pulse_unlock"
+LEGACY_KEYS_OPTIONAL = {
+    "_resume_schedule",
+    "_unlock_until_resume",
+    "_override_card_or_pin",
+    "_unlock_until_next_schedule",
+    "_timed_override_unlock",
+}
+
+def _selected_legacy(entry) -> set[str]:
+    """
+    Return the set of legacy door buttons to expose.
+    Always includes Pulse Unlock. Optional picks come from entry.options/entities (or data fallback).
+    """
+    raw = entry.options.get("entities", entry.data.get("entities"))
+    if not raw:
+        return {LEGACY_PULSE}
+    if not isinstance(raw, list):
+        raw = [raw]
+    selected = {str(x).strip() for x in raw if x}
+    selected.add(LEGACY_PULSE)  # ensure Pulse Unlock is always present
+    # Only allow known keys
+    return {k for k in selected if (k == LEGACY_PULSE or k in LEGACY_KEYS_OPTIONAL)}
 
 
 async def async_setup_entry(
     hass: HomeAssistant,
     entry: ConfigEntry,
-    async_add_entities: AddEntitiesCallback
+    async_add_entities: AddEntitiesCallback,
 ) -> None:
     """
-    Set up Protector.Net door and action-plan buttons based on user selections.
+    Set up Protector.Net door and action-plan buttons.
+
+    Legacy door buttons are created based on the selection saved in config/options:
+      - Pulse Unlock is always included
+      - Other legacy buttons are only added if selected
+    Network work happens in a background task to avoid blocking HA startup.
     """
-    # Host used for unique_ids (sanitized); real host & hub id come from __init__.py
     host_safe = (urlparse(entry.data["base_url"]).hostname or "").replace(":", "_")
 
-    # Fetch doors & provision our HA log plan
-    try:
-        doors = await api.get_all_doors(hass, entry.entry_id)
-    except Exception as e:
-        _LOGGER.error("Failed to fetch doors from Protector.Net: %s", e)
-        return
-
-    try:
-        log_plan_id = await api.find_or_create_ha_log_plan(hass, entry.entry_id)
-        hass.data[DOMAIN][entry.entry_id]["ha_log_plan_id"] = log_plan_id
-        _LOGGER.debug("HA log plan id is %s", log_plan_id)
-    except Exception as e:
-        _LOGGER.error("Failed to create/find HA log plan: %s", e)
-        hass.data[DOMAIN][entry.entry_id]["ha_log_plan_id"] = None
-
-    selected = entry.options.get("entities", entry.data.get("entities", []))
-    override_mins = entry.options.get(
-        "override_minutes",
-        entry.data.get("override_minutes", DEFAULT_OVERRIDE_MINUTES)
-    )
-
-    raw_plan_ids = entry.options.get(KEY_PLAN_IDS, entry.data.get(KEY_PLAN_IDS, []))
-    plan_ids = [int(pid) for pid in raw_plan_ids]
-
-    system_ids = []
-    for trig_id in plan_ids:
+    async def _setup_buttons_later() -> None:
+        # Gather remote data with timeouts
         try:
-            sys_id = await api.find_or_clone_system_plan(hass, entry.entry_id, trig_id)
-            system_ids.append(sys_id)
+            await asyncio.sleep(0.5)
+            doors = await asyncio.wait_for(api.get_all_doors(hass, entry.entry_id), timeout=30)
+        except asyncio.TimeoutError:
+            _LOGGER.error("[%s] get_all_doors timed out; no door buttons will be created right now", entry.entry_id)
+            return
         except Exception as e:
-            _LOGGER.error("Error cloning trigger plan %s: %s", trig_id, e)
-    _LOGGER.debug("Protector Net: system plan ids=%s", system_ids)
+            _LOGGER.error("[%s] Failed to fetch doors from Protector.Net: %s", entry.entry_id, e)
+            return
 
-    entities: list[ButtonEntity] = []
-
-    # Door buttons
-    for door in doors:
-        if "_pulse_unlock" in selected:
-            entities.append(DoorPulseUnlockButton(hass, entry, door, host_safe))
-        if "_resume_schedule" in selected:
-            entities.append(DoorResumeScheduleButton(hass, entry, door, host_safe))
-        if "_unlock_until_resume" in selected:
-            entities.append(DoorOverrideUntilResumeButton(hass, entry, door, host_safe))
-        if "_override_card_or_pin" in selected:
-            entities.append(DoorOverrideUntilResumeCardOrPinButton(hass, entry, door, host_safe))
-        if "_unlock_until_next_schedule" in selected:
-            entities.append(DoorOverrideUntilNextScheduleButton(hass, entry, door, host_safe))
-        if "_timed_override_unlock" in selected:
-            entities.append(DoorTimedOverrideUnlockButton(hass, entry, door, host_safe, override_mins))
-
-    # Action Plan buttons (System clones)
-    if system_ids:
+        # Provision HA log plan (best-effort)
         try:
-            plans = await api.get_action_plans(hass, entry.entry_id)
+            log_plan_id = await asyncio.wait_for(api.find_or_create_ha_log_plan(hass, entry.entry_id), timeout=30)
+            hass.data[DOMAIN][entry.entry_id]["ha_log_plan_id"] = log_plan_id
+            _LOGGER.debug("[%s] HA log plan id is %s", entry.entry_id, log_plan_id)
         except Exception as e:
-            _LOGGER.error("Failed to fetch action plans: %s", e)
-            plans = []
+            _LOGGER.error("[%s] Failed to create/find HA log plan: %s", entry.entry_id, e)
+            hass.data[DOMAIN][entry.entry_id]["ha_log_plan_id"] = None
 
-        for plan in plans:
-            if plan["Id"] in system_ids:
-                entities.append(ActionPlanButton(hass, entry, plan, host_safe))
+        # Default minutes (options override data; both fall back to const)
+        override_mins = entry.options.get(
+            "override_minutes",
+            entry.data.get("override_minutes", DEFAULT_OVERRIDE_MINUTES),
+        )
 
-    async_add_entities(entities)
+        # Selected trigger plans to clone to system plans
+        raw_plan_ids = entry.options.get(KEY_PLAN_IDS, entry.data.get(KEY_PLAN_IDS, []))
+        plan_ids: list[int] = []
+        for pid in raw_plan_ids or []:
+            try:
+                plan_ids.append(int(pid))
+            except Exception:
+                continue
+
+        # Clone/resolve system plans
+        system_ids: list[int] = []
+        for trig_id in plan_ids:
+            try:
+                sys_id = await asyncio.wait_for(api.find_or_clone_system_plan(hass, entry.entry_id, trig_id), timeout=30)
+                system_ids.append(sys_id)
+            except asyncio.TimeoutError:
+                _LOGGER.error("[%s] find_or_clone_system_plan(%s) timed out", entry.entry_id, trig_id)
+            except Exception as e:
+                _LOGGER.error("[%s] Error cloning trigger plan %s: %s", entry.entry_id, trig_id, e)
+        _LOGGER.debug("[%s] System plan ids=%s", entry.entry_id, system_ids)
+
+        # ---------- Only add selected legacy door buttons (Pulse Unlock always) ----------
+        selected = _selected_legacy(entry)
+
+        entities: list[ButtonEntity] = []
+
+        for door in doors:
+            if LEGACY_PULSE in selected:
+                entities.append(DoorPulseUnlockButton(hass, entry, door, host_safe))
+            if "_resume_schedule" in selected:
+                entities.append(DoorResumeScheduleButton(hass, entry, door, host_safe))
+            if "_unlock_until_resume" in selected:
+                entities.append(DoorOverrideUntilResumeButton(hass, entry, door, host_safe))
+            if "_override_card_or_pin" in selected:
+                entities.append(DoorOverrideUntilResumeCardOrPinButton(hass, entry, door, host_safe))
+            if "_unlock_until_next_schedule" in selected:
+                entities.append(DoorOverrideUntilNextScheduleButton(hass, entry, door, host_safe))
+            if "_timed_override_unlock" in selected:
+                entities.append(DoorTimedOverrideUnlockButton(hass, entry, door, host_safe, override_mins))
+
+        # ---------- Action Plan buttons (System clones) ----------
+        if system_ids:
+            try:
+                plans = await asyncio.wait_for(api.get_action_plans(hass, entry.entry_id), timeout=30)
+            except asyncio.TimeoutError:
+                _LOGGER.error("[%s] get_action_plans timed out; skipping action plan buttons", entry.entry_id)
+                plans = []
+            except Exception as e:
+                _LOGGER.error("[%s] Failed to fetch action plans: %s", entry.entry_id, e)
+                plans = []
+
+            for plan in plans:
+                if plan.get("Id") in system_ids:
+                    entities.append(ActionPlanButton(hass, entry, plan, host_safe))
+
+        if entities:
+            async_add_entities(entities)
+            _LOGGER.debug("[%s] Added %d button entities", entry.entry_id, len(entities))
+        else:
+            _LOGGER.debug("[%s] No button entities to add", entry.entry_id)
+
+    hass.async_create_task(_setup_buttons_later())
 
 
+# -----------------------
+# Door-level buttons
+# -----------------------
 class BaseDoorButton(ProtectorNetDevice, ButtonEntity):
     """Base class for door buttons—handles per-door device_info & entry scoping."""
     _attr_has_entity_name = True
@@ -102,18 +163,13 @@ class BaseDoorButton(ProtectorNetDevice, ButtonEntity):
         self.door_id = door["Id"]
         self.door_name = door.get("Name", "Unknown Door")
 
-        # Values prepared in __init__.py (async_setup_entry) for this entry:
         entry_data = hass.data[DOMAIN][entry.entry_id]
-        # raw host (e.g. "host:port") used to match hub identifier; do not sanitize here
         self._host_key: str = entry_data.get("host") or (urlparse(entry.data["base_url"]).netloc or "")
         self._hub_identifier: str = entry_data.get("hub_identifier", f"hub:{self._host_key}|{self._entry_id}")
-
-        # For unique_id readability we keep the sanitized host
         self._host_safe = host_safe
 
     @property
     def device_info(self):
-        """One device per door; nested under the entry's hub device."""
         return {
             "identifiers": {(DOMAIN, f"door:{self._host_key}:{self.door_id}|{self._entry_id}")},
             "name": self.door_name,
@@ -131,24 +187,13 @@ class DoorPulseUnlockButton(BaseDoorButton):
         self._attr_unique_id = f"protector_net_{self._host_safe}_{self._entry_id}_{self.door_id}_pulse_unlock"
 
     async def async_press(self):
-        # 1) normal pulse unlock
         await api.pulse_unlock(self.hass, self._entry_id, [self.door_id])
-
-        # 2) fire HA Door Log
         plan_id = self.hass.data[DOMAIN][self._entry_id].get("ha_log_plan_id")
-        _LOGGER.debug("Calling HA Door Log plan %s", plan_id)
-        if not plan_id:
-            return
-
-        await api.execute_action_plan(
-            self.hass,
-            self._entry_id,
-            plan_id,
-            variables={
-                "App":  "Home Assistant",
-                "Door": self.door_name
-            }
-        )
+        if plan_id:
+            await api.execute_action_plan(
+                self.hass, self._entry_id, plan_id,
+                variables={"App": "Home Assistant", "Door": self.door_name},
+            )
 
 
 class DoorResumeScheduleButton(BaseDoorButton):
@@ -170,18 +215,11 @@ class DoorOverrideUntilResumeButton(BaseDoorButton):
     async def async_press(self):
         await api.set_override(self.hass, self._entry_id, [self.door_id], "Resume")
         plan_id = self.hass.data[DOMAIN][self._entry_id].get("ha_log_plan_id")
-        if not plan_id:
-            return
-
-        await api.execute_action_plan(
-            self.hass,
-            self._entry_id,
-            plan_id,
-            variables={
-                "App":  "Home Assistant",
-                "Door": self.door_name
-            }
-        )
+        if plan_id:
+            await api.execute_action_plan(
+                self.hass, self._entry_id, plan_id,
+                variables={"App": "Home Assistant", "Door": self.door_name},
+            )
 
 
 class DoorOverrideUntilResumeCardOrPinButton(BaseDoorButton):
@@ -203,18 +241,11 @@ class DoorOverrideUntilNextScheduleButton(BaseDoorButton):
     async def async_press(self):
         await api.set_override(self.hass, self._entry_id, [self.door_id], "Schedule")
         plan_id = self.hass.data[DOMAIN][self._entry_id].get("ha_log_plan_id")
-        if not plan_id:
-            return
-
-        await api.execute_action_plan(
-            self.hass,
-            self._entry_id,
-            plan_id,
-            variables={
-                "App":  "Home Assistant",
-                "Door": self.door_name
-            }
-        )
+        if plan_id:
+            await api.execute_action_plan(
+                self.hass, self._entry_id, plan_id,
+                variables={"App": "Home Assistant", "Door": self.door_name},
+            )
 
 
 class DoorTimedOverrideUnlockButton(BaseDoorButton):
@@ -225,30 +256,19 @@ class DoorTimedOverrideUnlockButton(BaseDoorButton):
         self._attr_unique_id = f"protector_net_{self._host_safe}_{self._entry_id}_{self.door_id}_timed_override_unlock"
 
     async def async_press(self):
-        await api.set_override(
-            self.hass,
-            self._entry_id,
-            [self.door_id],
-            "Time",
-            minutes=self._override_minutes
-        )
+        await api.set_override(self.hass, self._entry_id, [self.door_id], "Time", minutes=self._override_minutes)
         plan_id = self.hass.data[DOMAIN][self._entry_id].get("ha_log_plan_id")
-        if not plan_id:
-            return
-
-        await api.execute_action_plan(
-            self.hass,
-            self._entry_id,
-            plan_id,
-            variables={
-                "App":  "Home Assistant",
-                "Door": self.door_name
-            }
-        )
+        if plan_id:
+            await api.execute_action_plan(
+                self.hass, self._entry_id, plan_id,
+                variables={"App": "Home Assistant", "Door": self.door_name},
+            )
 
 
+# -----------------------
+# Hub-level (Action Plan) buttons
+# -----------------------
 class ActionPlanButton(ProtectorNetDevice, ButtonEntity):
-    """A button to execute a Protector.Net action plan (attached to the hub device)."""
     _attr_has_entity_name = True
 
     def __init__(self, hass: HomeAssistant, entry: ConfigEntry, plan: dict, host_safe: str):
@@ -259,9 +279,16 @@ class ActionPlanButton(ProtectorNetDevice, ButtonEntity):
         self._plan = plan
         self._host_safe = host_safe
 
-        # From __init__.py entry_data
         entry_data = hass.data[DOMAIN][entry.entry_id]
         self._host_key: str = entry_data.get("host") or (urlparse(entry.data["base_url"]).netloc or "")
+
+        if entry_data.get("partition_name"):
+            self._partition_name: str = entry_data["partition_name"]
+        elif entry.title and "–" in entry.title:
+            self._partition_name = entry.title.split("–", 1)[1].strip()
+        else:
+            self._partition_name = str(entry_data.get("partition_id"))
+
         self._hub_identifier: str = entry_data.get("hub_identifier", f"hub:{self._host_key}|{self._entry_id}")
 
         self._attr_name = f"Action Plan: {plan['Name']}"
@@ -269,16 +296,17 @@ class ActionPlanButton(ProtectorNetDevice, ButtonEntity):
 
     @property
     def device_info(self):
-        """Attach plan buttons to the hub device for this entry."""
-        return {
-            "identifiers": {(DOMAIN, self._hub_identifier)},  # same device as the hub
+        device_ident = f"actionplans:{self._host_key}|{self._entry_id}"
+        info = {
+            "identifiers": {(DOMAIN, device_ident)},
             "manufacturer": "Hartmann Controls",
-            "model": "Protector.Net",
-            "name": f"Protector.Net ({self._host_key})",
+            "model": "Protector.Net Action Plans",
+            "name": f"Action Plans – {self._partition_name}",
             "configuration_url": self._entry.data.get("base_url"),
         }
+        return info
 
     async def async_press(self) -> None:
         success = await api.execute_action_plan(self.hass, self._entry_id, self._plan["Id"])
         if not success:
-            _LOGGER.error("Failed to execute action plan %s", self._plan["Id"])
+            _LOGGER.error("[%s] Failed to execute action plan %s", self._entry_id, self._plan["Id"])
