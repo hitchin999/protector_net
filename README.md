@@ -1,190 +1,213 @@
-[![Total Downloads](https://img.shields.io/github/downloads/hitchin999/protector_net/total.svg?label=Total%20Downloads&style=for-the-badge&color=blue)](https://github.com/hitchin999/protector_net/releases)
 
+[![Total Downloads](https://img.shields.io/github/downloads/hitchin999/protector_net/total.svg?label=Total%20Downloads\&style=for-the-badge\&color=blue)](https://github.com/hitchin999/protector_net/releases)
 [![Active Protector.Net Installs][prot-badge]][prot-analytics]
 
 [prot-badge]: https://img.shields.io/badge/dynamic/json?label=Active%20Installs&url=https%3A%2F%2Fanalytics.home-assistant.io%2Fcustom_integrations.json&query=%24.protector_net.total&style=for-the-badge&color=blue
 [prot-analytics]: https://analytics.home-assistant.io/integration/protector_net
 
-# Protector.Net Access Control Integration for Home Assistant
+# Protector.Net Access Control for Home Assistant
 
-[![Open your Home Assistant instance and open a repository inside the Home Assistant Community Store.](https://my.home-assistant.io/badges/hacs_repository.svg)](https://my.home-assistant.io/redirect/hacs_repository/?owner=hitchin999&repository=protector_net&category=Integration)
+**Version 0.1.6 – Partition-scoped devices (Hub, Action Plans, All Doors), instant-sync override UI, and refined legacy buttons.**
 
+This custom integration controls **Hartmann Controls Protector.Net** door access systems via HTTP + a live **SignalR** websocket for instant updates.
 
-**Version 0.1.5 – “Home Assistant unlocked…” log entries in Protector.Net for every door-button press**
+---
 
-Custom Home Assistant integration to control Hartmann-Controls Protector.Net door access systems via their HTTP API.  
+## What’s new in 0.1.6
+
+* **Partition-scoped devices**
+
+  * **Hub device** per configured partition: `Hub Status – <Partition>`
+  * **Action Plans device** per partition: `Action Plans – <Partition>`
+  * **All Doors device** per partition: `All Doors – <Partition>` with an **All Doors Lockdown** switch
+  * Door entities remain grouped by **door device** *(unchanged)*
+
+* **5 real-time sensors**
+
+  1. **Hub Status – <Partition>** — `running / connecting / idle / stopped / error`
+     *Attributes:* `phase`, `connected`, `mapped_doors`, `partition_id`
+  2. **<Door> Lock State** — `Locked` / `Unlocked` (live strike/opener)
+  3. **<Door> Overridden** — `On` / `Off`
+  4. **<Door> Reader Mode** — friendly mapping of controller `timeZone`
+  5. **<Door> Last Door Log by** — state is **who** last acted (e.g., “Home Assistant”, person/cardholder)
+     *Attributes:* `Reader Message`, `Reader Message Time`, `Door Message`, `Door ID`, `Partition ID`
+
+* **Legacy door buttons — simplified & selectable**
+
+  * **Pulse Unlock** is **always included**.
+  * Other legacy buttons are **optional** (pick them in **Options**):
+
+    * Resume Schedule
+    * Unlock Until Resume
+    * Unlock Until Next Schedule
+    * CardOrPin Until Resume
+    * Timed Override Unlock (uses default minutes)
+  * Nothing is pre-selected by default.
+
+* **New per-door Override UI (synced instantly)**
+
+  * **Override** *(switch)* — ON applies the selected override; OFF resumes schedule.
+  * **Override Type** *(select)* — `For Specified Time` / `Until Resumed` / `Until Next Schedule`
+  * **Override Mode** *(select)* — includes **`None`**
+    OFF ⇒ shows **`None`**; ON ⇒ mirrors the live reader mode.
+  * **Override Minutes** *(number)* — used when type is “For Specified Time”.
+  * Internal dispatcher updates ensure **immediate UI refresh** (no need to leave/return the device page).
+
+> **Heads-up:** Device names changed (partition-scoped). If you filtered by **device** in dashboards/automations, re-select the new device names. **Entity IDs / unique_ids remain stable.**
 
 ---
 
 ## Features
 
-- **Cookie-Based Login**  
-  Securely logs in to Protector.Net, storing the `ss-id` cookie and automatically refreshing on `401 Unauthorized`.
-  
-- **Partition Selection**  
-  If your site has multiple partitions, pick one during setup and only doors from that partition will be imported.
-
-- **Configurable Entities**  
-  During setup (and via Options), select exactly which door button types to import:
-  - Pulse Unlock  
-  - Resume Schedule  
-  - Unlock Until Resume  
-  - Unlock Until Next Schedule  
-  - CardOrPin Until Resume  
-  - Timed Override Unlock (with configurable default duration)
-
-- **Action Plan Buttons**  
-  Import your Protector.Net Action Plans as Home Assistant buttons, and run them on demand.  
-
-- **Automatic Clone-and-Populate**  
-  Trigger-type Action Plans are cloned into “System” plans named `"<Original Name> (Home Assistant)"`.  
-  A two-step POST→PUT process ensures the full plan contents survive cloning.
-
-- **Home Assistant Door-Log**  
-  Every time you press a door-button in HA, the integration logs  
-  ```
-  Home Assistant unlocked <Door Name>
-  ```
-  in your Protector.Net panel’s system log.
-
-- **Fully UI-Driven**  
-  No YAML needed—complete setup and options flow in the Home Assistant UI.
+* ✅ Cookie login (`ss-id`) with automatic re-auth
+* ✅ Partition selection (imports only your chosen partition)
+* ✅ **Zero-polling** live updates via SignalR
+* ✅ Door controls: per-door override UI + Pulse Unlock (+ optional legacy buttons)
+* ✅ **All Doors Lockdown** switch (partition-wide)
+* ✅ **HA Door Log** entries when you use HA buttons (e.g., “Home Assistant unlocked …”)
+* ✅ All controls & options in the UI (HACS-friendly)
 
 ---
 
 ## Installation
 
-1. **Copy**  
-   Place the `protector_net/` folder into your HA config under `custom_components/`.
-2. **Restart**  
-   Restart Home Assistant.
-3. **Add Integration**  
-   In the UI: **Settings → Devices & Services → Add Integration → Protector.Net Access Control**  
-   Follow the prompts.
+**HACS (recommended):**
+
+1. In **HACS → Integrations**, search for **“Protector.Net Access Control”** and install.
+2. **Restart** Home Assistant.
+
+**Manual:**
+
+1. Copy `custom_components/protector_net/` into your Home Assistant `config/custom_components/`.
+2. **Restart** Home Assistant.
+
+Then go to **Settings → Devices & Services → Add Integration** → “Protector.Net Access Control”.
 
 ---
 
-## Configuration Steps
+## Setup & Options
 
-1. **Base URL**  
-   `https://your-server-host:port`
+* **Base URL** – `https://host:port`
+* **Credentials** – a Protector.Net user with sufficient privileges (**must be a System Administrator** in Hartmann)
+* **Default override minutes** – used for Timed Override
+* **Partition** – select exactly one
+* **Action Plans** – pick trigger plans to clone as **System** plans (so they can be executed from HA)
 
-2. **Credentials**  
-   - Username & Password must have **System Admin** privileges in Protector.Net.
+Revisit any time: **Settings → Devices & Services → Protector.Net → Options**.
 
-3. **Default Override Minutes**  
-   Used by the “Timed Override Unlock” button (default: 5 minutes).
+### Door Entities (legacy buttons)
 
-4. **Partition Selection**  
-   Choose one partition to import.
-
-5. **Entity Selection**  
-   Select which door-control buttons you want.
-
-6. **Action Plan Selection**  
-   Pick which Trigger-type plans to import as buttons. These will be cloned internally into System-type plans you can run on demand.
-
-7. **Finish**  
-   Integration creates the buttons; you can immediately use them.
+* **Pulse Unlock** is always included (not shown in the picker).
+* Choose any **additional** legacy buttons you want; **none** are pre-selected by default.
 
 ---
 
-## Entities Created
+## Devices & Entities
 
-### Door Buttons
+### 1) Hub device (per partition)
 
-| Entity Name                                  | Entity ID                                            | Action                                                         |
-|----------------------------------------------|------------------------------------------------------|----------------------------------------------------------------|
-| `<Door> Pulse Unlock`                        | `button.protector_net_<host>_<door>_pulse_unlock`    | Pulse unlock relay                                             |
-| `<Door> Resume Schedule`                     | `button.protector_net_<host>_<door>_resume_schedule` | Resume normal schedule                                         |
-| `<Door> Unlock Until Resume`                 | `button.protector_net_<host>_<door>_unlock_until_resume` | Unlock until manually resumed                              |
-| `<Door> Unlock Until Next Schedule`          | `button.protector_net_<host>_<door>_unlock_until_next_schedule` | Unlock until next event                               |
-| `<Door> CardOrPin Until Resume`              | `button.protector_net_<host>_<door>_cardorpin_until_resume` | Unlock until card/PIN                                   |
-| `<Door> Timed Override Unlock`               | `button.protector_net_<host>_<door>_timed_override_unlock` | Unlock for default minutes then resume schedule        |
+* **Device:** `Hub Status – <Partition>`
+* **Entity:** **Hub Status – <Partition>** *(sensor)*
+  **State:** `running / connecting / idle / stopped / error`
+  **Attributes:** `phase`, `connected`, `mapped_doors`, `partition_id`
 
-### Action Plan Buttons
+### 2) Door devices (one per door)
 
-| Entity Name                     | Entity ID                                        | Action                                         |
-|---------------------------------|---------------------------------------------------|------------------------------------------------|
-| `Action Plan: <Plan Name>`      | `button.protector_net_<host>_action_plan_<id>`    | Executes the cloned System-type plan via API   |
+**Sensors**
+
+* **Lock State** — `Locked` / `Unlocked`
+* **Overridden** — `On` / `Off`
+* **Reader Mode** — mapped from controller index:
+  `0/8 Lockdown, 1 Card, 2 Pin, 3 Card or Pin, 4 Card and Pin, 5 Unlock, 6 First Credential In, 7 Dual Credential`
+* **Last Door Log by** — highlights the last actor; attributes include the last **reader/action** message/time and the last **door** message.
+
+**Controls**
+
+* **Override** *(switch)* — ON applies selected **Type** + **Mode** (and minutes if “For Specified Time”); OFF resumes schedule and forces **Override Mode = None**.
+* **Override Type** *(select)* — `For Specified Time` / `Until Resumed` / `Until Next Schedule`
+* **Override Mode** *(select)* — `None`, `Card`, `Pin`, `Unlock`, `Card and Pin`, `Card or Pin`, `First Credential In`, `Dual Credential`, `Lockdown`
+
+  * OFF ⇒ shows **`None`**; ON ⇒ mirrors the panel’s current reader mode.
+* **Override Minutes** *(number)* — used when type is “For Specified Time”
+
+**Door Buttons**
+
+* **Always:** Pulse Unlock
+* **Optional (if selected in Options):** Resume Schedule, Unlock Until Resume, Unlock Until Next Schedule, CardOrPin Until Resume, Timed Override Unlock
+
+### 3) Action Plans device (per partition)
+
+* **Device:** `Action Plans – <Partition>`
+* **Entities:** `Action Plan: <Plan Name>` *(button)* — executes cloned System-type plans.
+
+### 4) All Doors device (per partition)
+
+* **Device:** `All Doors – <Partition>`
+* **Entity:** **All Doors Lockdown** *(switch)*
+  **ON:** apply **Lockdown** override on **all doors** in the partition.
+  **OFF:** **Resume Schedule** across all doors.
 
 ---
 
-## Options Flow
+## How “Last Door Log by” works
 
-After setup, you can adjust:
+* **State** becomes the **person/app** when:
 
-- **Default Override Minutes**  
-- **Door Entity Types**  
-- **Action Plans to Import**
+  * Access granted/denied events, or
+  * Action plan messages like “Home Assistant unlocked …”
+* **Attributes** are stable and minimal:
 
-**Path**: Settings → Devices & Services → Protector.Net → Options
+  * `Reader Message`, `Reader Message Time` (granted/denied or action text + timestamp)
+  * `Door Message` (e.g., “Door is now Locked/Unlocked”)
+  * `Door ID`, `Partition ID`
+
+Lock/Unlock **status** messages don’t flip the “by” state (that’s what **Lock State** is for).
 
 ---
 
-## Developer Notes
+## Troubleshooting
 
-### API Endpoints
-
-- **Login**: `POST /auth` → returns `ss-id` cookie  
-- **Partitions**: `GET /api/Partitions/ByPrivilege/Manage_Doors`  
-- **Doors**: `GET /api/doors?PartitionId=<id>&PageNumber=1&PerPage=500`  
-- **Action Plans**:  
-  - `GET /api/ActionPlans?PartitionId=<id>&PageNumber=1&PerPage=500`  
-  - `POST /api/ActionPlans` (create System plan)  
-  - `PUT /api/ActionPlans/{Id}` (update Contents)  
-  - `POST /api/ActionPlans/{Id}/Exec/{LogLevel}?PartitionId=<id>` (execute)
-
-### Clone-and-Populate Workflow
-
-1. **find_or_clone_system_plan()**  
-   - Checks for an existing System-type plan named `"<Trigger Name> (Home Assistant)"`.  
-   - If none exists:
-     1. **POST** skeleton System plan (no Contents)  
-     2. **PUT** the original plan’s `Contents` JSON back into it  
-   - Returns the System plan’s ID.
-
-2. **find_or_create_ha_log_plan()**  
-   - Ensures a single System plan named **HA Door Log** exists.  
-   - Populates its Contents once, so that **every** door-button press logs  
-     ```
-     Home Assistant unlocked <Door Name>
-     ```  
-     Plus a follow-up line `<Door Name> logged`.
-
-3. **execute_action_plan()**  
-   Issues a `POST /Exec/Info` with optional `{ "SessionVars": {...} }` body.
+* **Override ON with “None” selected**
+  The switch won’t apply and will return to OFF. Pick a concrete mode (e.g., Card or Pin) first.
 
 ---
 
 ## Changelog
 
+### 0.1.6
+
+* New: **Partition-scoped devices** (Hub + Action Plans + **All Doors**)
+* New: **All Doors Lockdown** switch (partition-wide)
+* New: **5 sensors** total (Hub Status, Lock State, Overridden, Reader Mode, **Last Door Log by**)
+* New: **Per-door Override UI** (Switch + Selects + Number), with **instant sync**
+* New: Stable attributes for “Last Door Log by” and tidier hub sensor attributes
+* Change: **Legacy buttons** refined — **Pulse Unlock always**; others **optional** via Options
+
+
 ### 0.1.5
-- 🆕 **New:** “Home Assistant unlocked…” log entries in Protector.Net for every door-button press
+
+* Door-action logs (“Home Assistant unlocked …”)
 
 ### 0.1.4
-- 🐛 **Fixed:** Action Plan Buttons now clone & populate plan contents via two-step POST→PUT  
-- 🔄 **Improved:** `find_or_clone_system_plan` reuses existing clones; no duplicates on reconfigure  
-- 🐛 **Fixed:** Empty Action Plan clones  
-- 🆕 **New:** “Home Assistant unlocked…” log entries in Protector.Net panel for every door-button press
+
+* Plan cloning fixes and reuse; HA Door Log plan
 
 ### 0.1.3
-- 🎉 **New:** Import & execute Protector.Net Action Plans as buttons  
-- 🔄 **Improved:** Options flow always refreshes available plans  
-- 🐛 **Fixed:** Entity uniqueness and “unavailable” plan errors  
+
+* Action Plans import/execute; options refresh
 
 ### 0.1.2
-- 🎉 **New:** Configurable door entity selection  
-- 🔄 **New:** Options flow for entity types  
-- 🐛 **Fixed:** MRO init issue in Button base class  
-- ⚙️ **Docs:** README updates  
+
+* Configurable door entities; options flow; base fixes
 
 ### 0.1.1
-- Partition selection  
-- Automatic session-ID refresh  
-- Dynamic integration title  
+
+* Partition selection; session refresh; dynamic titles
 
 ### 0.1.0
-- Initial release: door imports & basic button commands  
 
-> _By Yoel Goldstein / Vaayer LLC_
+* Initial release (doors & basic controls)
+
+---
+
+**Author:** Yoel Goldstein / Vaayer LLC
