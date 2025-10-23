@@ -119,7 +119,7 @@ class OverrideSwitch(ProtectorNetDevice, SwitchEntity):
         return {
             "identifiers": {(DOMAIN, f"door:{self._host_key}:{self._door_id}|{self._entry_id}")},
             "name": self._door_name,
-            "manufacturer": "Hartmann Controls",
+            "manufacturer": "Yoel Goldstein/Vaayer LLC",
             "model": "Protector.Net Door",
             "via_device": (DOMAIN, self._hub_identifier),
             "configuration_url": self._entry.data.get("base_url"),
