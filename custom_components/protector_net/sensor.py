@@ -253,7 +253,7 @@ class ProtectorHubSensor(SensorEntity, RestoreEntity):
     def device_info(self):
         return {
             "identifiers": {(DOMAIN, f"hub:{self._base_url.split('://',1)[1]}|{self._entry_id}")},
-            "manufacturer": "Hartmann Controls",
+            "manufacturer": "Yoel Goldstein/Vaayer LLC",
             "model": "Protector.Net Hub",
             "name": f"Hub Status – {self._partition_name}",
             "configuration_url": self._base_url,
