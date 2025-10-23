@@ -305,7 +305,7 @@ class AllDoorsLockdownSwitch(ProtectorNetDevice, SwitchEntity):
         # Exposed device info
         self._device_info = {
             "identifiers": {(DOMAIN, self._device_ident)},
-            "manufacturer": "Hartmann Controls",
+            "manufacturer": "Yoel Goldstein/Vaayer LLC",
             "model": "Protector.Net Partition",
             "name": f"All Doors – {partition_name}",
             "via_device": (DOMAIN, self._hub_identifier),
