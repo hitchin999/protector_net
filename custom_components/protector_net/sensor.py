@@ -352,7 +352,7 @@ class ProtectorDoorSensor(SensorEntity, RestoreEntity):
         host = self._base_url.split("://", 1)[1]
         return {
             "identifiers": {(DOMAIN, f"door:{host}:{self._door_id}|{self._entry_id}")},
-            "manufacturer": "Hartmann Controls",
+            "manufacturer": "Yoel Goldstein/Vaayer LLC",
             "model": "Protector.Net Door",
             "name": self._door_name,
             "configuration_url": self._base_url,
@@ -509,7 +509,7 @@ class ProtectorDoorLastLogSensor(SensorEntity, RestoreEntity):
         host = self._base_url.split("://", 1)[1]
         return {
             "identifiers": {(DOMAIN, f"door:{host}:{self._door_id}|{self._entry_id}")},
-            "manufacturer": "Hartmann Controls",
+            "manufacturer": "Yoel Goldstein/Vaayer LLC",
             "model": "Protector.Net Door",
             "name": self._door_name,
             "configuration_url": self._base_url,
