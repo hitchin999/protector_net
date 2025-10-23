@@ -1,12 +1,33 @@
 # custom_components/protector_net/api.py
 
+from __future__ import annotations
+
 import httpx
 import logging
 import json
+from typing import Iterable, Optional, Dict, Any, List
+
+from aiohttp import ClientError
 
 _LOGGER = logging.getLogger(__name__)
 DOMAIN = "protector_net"
 
+
+from .const import DOMAIN, FRIENDLY_TO_TZ_INDEX, OVERRIDE_MODE_LABEL_TO_TOKEN
+
+_LOGGER = logging.getLogger(f"{DOMAIN}.api")
+
+# Map API tokens to the controller "timeZone" index
+_TOKEN_TO_INDEX = {
+    "Lockdown": 0,
+    "Card": 1,
+    "Pin": 2,
+    "CardOrPin": 3,
+    "CardAndPin": 4,
+    "Unlock": 5,
+    "FirstCredentialIn": 6,
+    "DualCredential": 7,
+}
 
 async def login(hass, base_url: str, username: str, password: str) -> str:
     """
@@ -64,6 +85,10 @@ async def _request_with_reauth(
         return resp
 
 
+# -----------------------
+# Partition / Doors
+# -----------------------
+
 async def get_partitions(
     hass,
     base_url: str,
@@ -99,6 +124,10 @@ async def get_all_doors(
         return []
 
 
+# -----------------------
+# Door Commands
+# -----------------------
+
 async def pulse_unlock(
     hass,
     entry_id: str,
@@ -119,22 +148,23 @@ async def pulse_unlock(
         return False
 
 
+# (Legacy helper used by older buttons; prefers Unlock mode by default.)
 async def set_override(
     hass,
     entry_id: str,
     door_ids: list[int],
     override_type: str,
-    minutes: int = None
+    minutes: int | None = None
 ) -> bool:
     """
-    Override doors via PanelCommands/OverrideDoor.
+    Override doors via PanelCommands/OverrideDoor with TimeZoneMode='Unlock'.
+    Prefer using apply_override() for full control.
     """
     cfg = hass.data[DOMAIN][entry_id]
     url = f"{cfg['base_url']}/api/PanelCommands/OverrideDoor"
-    override_mins = minutes or cfg.get("override_minutes")
-    payload = {"OverrideType": override_type, "DoorIds": door_ids, "TimeZoneMode": "Unlock"}
+    payload: Dict[str, Any] = {"OverrideType": override_type, "DoorIds": door_ids, "TimeZoneMode": "Unlock"}
     if override_type == "Time":
-        payload["Minutes"] = override_mins
+        payload["Minutes"] = minutes or cfg.get("override_minutes")
     try:
         await _request_with_reauth(hass, entry_id, "POST", url, json=payload, timeout=10)
         _LOGGER.info("%s: Override %s sent to doors %s", entry_id, override_type, door_ids)
@@ -143,14 +173,98 @@ async def set_override(
         _LOGGER.error("%s: Error in set_override: %s", entry_id, e)
         return False
 
+async def apply_override(
+    hass,
+    entry_id: str,
+    door_ids: List[int],
+    *,
+    override_type: str,   # "Time" | "Resume" | "Schedule"
+    mode: str,            # "Card"|"Pin"|"Unlock"|"CardAndPin"|"CardOrPin"|"FirstCredentialIn"|"DualCredential"|"Lockdown"
+    minutes: int | None = None,
+) -> bool:
+    """
+    Apply an override.
 
+    We send BOTH the string token and an index for max compatibility, and we
+    alias the two special modes to the exact tokens the server uses.
+    """
+    cfg = hass.data[DOMAIN][entry_id]
+    url = f"{cfg['base_url']}/api/PanelCommands/OverrideDoor"
+
+    # Server-friendly token aliases for special modes (based on your WS samples):
+    #   First Credential In -> UNLOCKWITHFIRSTCARDIN
+    #   Dual Credential     -> DUALCARD
+    token_alias = {
+        "FirstCredentialIn": "UnlockWithFirstCardIn",
+        "DualCredential": "DualCard",
+    }
+    token_to_send = token_alias.get(mode, mode)
+
+    # Try to compute a best index for the mode (used by many panels)
+    # Prefer the legend cached at startup if available; fall back to static map.
+    legend_rev: Dict[str, int] = (hass.data[DOMAIN].get(entry_id, {}).get("tz_name_to_index") or {})
+
+    # Convert token -> a friendly label we can look up (e.g., "CardOrPin" -> "Card or Pin")
+    friendly_guess: Optional[str] = None
+    for lbl, tok in OVERRIDE_MODE_LABEL_TO_TOKEN.items():
+        if tok == mode:
+            friendly_guess = {"unlock": "Unlock"}.get(lbl, lbl.title())
+            break
+
+    idx: Optional[int] = None
+    if friendly_guess:
+        idx = legend_rev.get(friendly_guess.lower())
+        if idx is None:
+            idx = FRIENDLY_TO_TZ_INDEX.get(friendly_guess)
+
+    if idx is None:
+        # Last-resort static token → index
+        token_to_index = {
+            "Lockdown": 0,
+            "Card": 1,
+            "Pin": 2,
+            "CardOrPin": 3,
+            "CardAndPin": 4,
+            "Unlock": 5,
+            "FirstCredentialIn": 6,
+            "DualCredential": 7,
+        }
+        idx = token_to_index.get(mode)
+
+    payload: Dict[str, Any] = {
+        "DoorIds": door_ids,
+        "OverrideType": override_type,
+        "TimeZoneMode": token_to_send,   # string token
+    }
+    if override_type == "Time":
+        payload["Minutes"] = int(minutes or cfg.get("override_minutes"))
+
+    # Numeric forms for maximum compatibility (fixes First/Dual on some servers)
+    if idx is not None:
+        payload["ModeIndex"] = int(idx)
+        payload["TimeZoneModeIndex"] = int(idx)  # some servers expect this exact key
+        payload["TimeZone"] = int(idx)           # legacy/compat
+        payload["TimeZoneState"] = int(idx)      # legacy/compat
+
+    try:
+        await _request_with_reauth(hass, entry_id, "POST", url, json=payload, timeout=10)
+        _LOGGER.info(
+            "%s: Apply override type=%s mode=%s (alias=%s idx=%s) minutes=%s doors=%s",
+            entry_id, override_type, mode, token_to_send, idx, payload.get("Minutes"), door_ids
+        )
+        return True
+    except Exception as e:
+        _LOGGER.error("%s: Error in apply_override: %s (payload=%s)", entry_id, e, payload)
+        return False
+        
 async def override_until_resume_card_or_pin(
     hass,
     entry_id: str,
     door_ids: list[int]
 ) -> bool:
     """
-    Override doors until resume via CardOrPin.
+    Override doors until resume via CardOrPin (kept for backwards compatibility).
+    Prefer apply_override(..., override_type='Resume', mode='CardOrPin').
     """
     cfg = hass.data[DOMAIN][entry_id]
     url = f"{cfg['base_url']}/api/PanelCommands/OverrideDoor"
@@ -162,7 +276,6 @@ async def override_until_resume_card_or_pin(
     except Exception as e:
         _LOGGER.error("%s: Error in override_until_resume_card_or_pin: %s", entry_id, e)
         return False
-
 
 async def resume_schedule(
     hass,
@@ -183,6 +296,10 @@ async def resume_schedule(
         _LOGGER.error("%s: Error in resume_schedule: %s", entry_id, e)
         return False
 
+
+# -----------------------
+# Action Plans
+# -----------------------
 
 async def get_action_plans(
     hass,
@@ -303,7 +420,8 @@ async def execute_action_plan(
     except Exception as e:
         _LOGGER.error("%s: Error executing action plan %s: %s", entry_id, plan_id, e)
         return False
-        
+
+
 async def find_or_create_ha_log_plan(hass, entry_id: str) -> int:
     """
     Ensure a single System plan called “HA Door Log” exists, and return its ID.
@@ -340,7 +458,6 @@ async def find_or_create_ha_log_plan(hass, entry_id: str) -> int:
     plan_id = resp.json()["Id"]
 
     # 3) Populate its Contents via PUT
-    # single‐line log only, no nested “Always” block
     content = {
         "InitVar": {},
         "Action": {
@@ -371,3 +488,54 @@ async def find_or_create_ha_log_plan(hass, entry_id: str) -> int:
 
     return plan_id
 
+
+# -----------------------
+# System / Maps
+# -----------------------
+
+async def get_system_overview(hass, entry_id: str) -> dict:
+    """Return the /api/system/overview/System payload (top-level dict)."""
+    cfg = hass.data[DOMAIN][entry_id]
+    url = f"{cfg['base_url']}/api/system/overview/System"
+    resp = await _request_with_reauth(hass, entry_id, "GET", url, timeout=15)
+    return resp.json()  # caller will walk ["Status"]["Nodes"]
+
+
+async def get_door_time_zone_states(hass, entry_id: str) -> dict[int, dict]:
+    """
+    Returns {index: {name,color,...}} for DoorTimeZoneMode (legend for WS timeZone).
+    """
+    cfg = hass.data[DOMAIN][entry_id]
+    url = f"{cfg['base_url']}/api/TimeSpanStates/DoorTimeZoneMode"
+    resp = await _request_with_reauth(hass, entry_id, "GET", url, timeout=10)
+    items = resp.json()  # [{index,name,color,...}, ...]
+    return {int(x["index"]): x for x in items if "index" in x}
+
+
+from typing import Dict
+
+async def build_statusid_to_doorid_map(hass, entry_id: str) -> Dict[str, int]:
+    """
+    Build a {StatusId -> DoorId} map from /api/system/overview/System so
+    websocket 'status' frames can be routed to the correct door.
+    """
+    cfg = hass.data[DOMAIN][entry_id]
+    url = f"{cfg['base_url']}/api/system/overview/System"
+    resp = await _request_with_reauth(hass, entry_id, "GET", url, timeout=15)
+    data = resp.json() or {}
+
+    result: Dict[str, int] = {}
+
+    def walk(node):
+        if not isinstance(node, dict):
+            return
+        if node.get("Type") == "Door":
+            sid = node.get("StatusId")
+            did = node.get("Id")
+            if sid and did is not None:
+                result[sid] = int(did)
+        for child in node.get("Nodes", []):
+            walk(child)
+
+    walk(data.get("Status", {}))
+    return result
