@@ -7,9 +7,14 @@
 
 # Protector.Net Access Control for Home Assistant
 
-**Version 0.1.6 – Partition-scoped devices (Hub, Action Plans, All Doors), instant-sync override UI, and refined legacy buttons.**
-
 This custom integration controls **Hartmann Controls Protector.Net** door access systems via HTTP + a live **SignalR** websocket for instant updates.
+
+---
+
+## What’s new in 0.1.7
+
+* **Fix:** Door sensors could fail to appear when the selected partition was named **“Default Partition.”** Discovery is now partition-scoped and resilient, so those sensors load correctly. No reconfiguration needed.
+* **Reliability:** If an overview filter returns no doors at startup, discovery now falls back to the partition’s door list and retries after the hub reports mapped doors.
 
 ---
 
@@ -167,12 +172,17 @@ Lock/Unlock **status** messages don’t flip the “by” state (that’s what *
 
 ## Troubleshooting
 
-* **Override ON with “None” selected**
-  The switch won’t apply and will return to OFF. Pick a concrete mode (e.g., Card or Pin) first.
+* **Sensors didn’t appear previously for “Default Partition”**
+  Update to **0.1.7**; discovery now correctly loads those doors.
 
 ---
 
 ## Changelog
+
+### 0.1.7
+
+* Fix: Door sensors now load correctly when the selected partition is named **“Default Partition.”**
+* Reliability: More robust, partition-scoped discovery with safe fallback and retry.
 
 ### 0.1.6
 
@@ -180,9 +190,7 @@ Lock/Unlock **status** messages don’t flip the “by” state (that’s what *
 * New: **All Doors Lockdown** switch (partition-wide)
 * New: **5 sensors** total (Hub Status, Lock State, Overridden, Reader Mode, **Last Door Log by**)
 * New: **Per-door Override UI** (Switch + Selects + Number), with **instant sync**
-* New: Stable attributes for “Last Door Log by” and tidier hub sensor attributes
 * Change: **Legacy buttons** refined — **Pulse Unlock always**; others **optional** via Options
-
 
 ### 0.1.5
 
