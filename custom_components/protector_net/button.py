@@ -8,6 +8,8 @@ from homeassistant.components.button import ButtonEntity
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.helpers import entity_registry as er
+import re
 
 from . import api
 from .const import DEFAULT_OVERRIDE_MINUTES, KEY_PLAN_IDS, DOMAIN
@@ -40,6 +42,77 @@ def _selected_legacy(entry) -> set[str]:
     # Only allow known keys
     return {k for k in selected if (k == LEGACY_PULSE or k in LEGACY_KEYS_OPTIONAL)}
 
+def _migrate_button_unique_ids(hass: HomeAssistant, entry: ConfigEntry) -> None:
+    """
+    Migrate v1.0.5 button unique_ids -> v0.1.6 format (inject entry_id).
+    Old (1.0.5):
+      protector_net_{host}_{door_id}_{suffix}
+      protector_net_{host}_action_plan_{plan_id}
+    New (0.1.6):
+      protector_net_{host}_{entry_id}_{door_id}_{suffix}
+      protector_net_{host}_{entry_id}_action_plan_{plan_id}
+    """
+    registry = er.async_get(hass)
+    host = (urlparse(entry.data["base_url"]).hostname or "").replace(":", "_")
+    eid = entry.entry_id
+
+    door_suffixes = (
+        "pulse_unlock",
+        "resume_schedule",
+        "unlock_until_resume",
+        "cardorpin_until_resume",
+        "unlock_until_next_schedule",
+        "timed_override_unlock",
+    )
+
+    door_re = re.compile(
+        rf"^protector_net_{re.escape(host)}_(?P<door>\d+)_(?P<suf>{'|'.join(door_suffixes)})$"
+    )
+    plan_re = re.compile(
+        rf"^protector_net_{re.escape(host)}_action_plan_(?P<pid>\d+)$"
+    )
+    already_new_re = re.compile(
+        rf"^protector_net_{re.escape(host)}_{re.escape(eid)}_"
+    )
+
+    for entity in list(registry.entities.values()):
+        if entity.config_entry_id != eid:
+            continue
+        # integration platform must match our integration; entity domain must be 'button'
+        if entity.platform != DOMAIN or entity.domain != "button":
+            continue
+
+        uid = entity.unique_id or ""
+        if already_new_re.match(uid):
+            continue  # nothing to do
+
+        m = door_re.match(uid)
+        if m:
+            new_uid = f"protector_net_{host}_{eid}_{m.group('door')}_{m.group('suf')}"
+            if new_uid != uid:
+                try:
+                    registry.async_update_entity(entity.entity_id, new_unique_id=new_uid)
+                    _LOGGER.debug("[%s] migrated button unique_id: %s -> %s", eid, uid, new_uid)
+                except ValueError:
+                    _LOGGER.warning(
+                        "[%s] unique_id %s already exists; leaving %s as-is",
+                        eid, new_uid, entity.entity_id
+                    )
+            continue
+
+        m = plan_re.match(uid)
+        if m:
+            new_uid = f"protector_net_{host}_{eid}_action_plan_{m.group('pid')}"
+            if new_uid != uid:
+                try:
+                    registry.async_update_entity(entity.entity_id, new_unique_id=new_uid)
+                    _LOGGER.debug("[%s] migrated plan unique_id: %s -> %s", eid, uid, new_uid)
+                except ValueError:
+                    _LOGGER.warning(
+                        "[%s] unique_id %s already exists; leaving %s as-is",
+                        eid, new_uid, entity.entity_id
+                    )
+
 
 async def async_setup_entry(
     hass: HomeAssistant,
@@ -54,6 +127,8 @@ async def async_setup_entry(
       - Other legacy buttons are only added if selected
     Network work happens in a background task to avoid blocking HA startup.
     """
+    _migrate_button_unique_ids(hass, entry)
+    
     host_safe = (urlparse(entry.data["base_url"]).hostname or "").replace(":", "_")
 
     async def _setup_buttons_later() -> None:
@@ -310,4 +385,3 @@ class ActionPlanButton(ProtectorNetDevice, ButtonEntity):
         success = await api.execute_action_plan(self.hass, self._entry_id, self._plan["Id"])
         if not success:
             _LOGGER.error("[%s] Failed to execute action plan %s", self._entry_id, self._plan["Id"])
-
