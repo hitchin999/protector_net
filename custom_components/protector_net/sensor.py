@@ -182,11 +182,18 @@ async def async_setup_entry(
         else:
             status_roots = None
 
+        # Derive site filter from title if not explicitly set
         if not site_name_contains:
             if "–" in (entry.title or ""):
                 site_name_contains = (entry.title or "").split("–", 1)[1].strip()
             elif "-" in (entry.title or ""):
                 site_name_contains = (entry.title or "").split("-", 1)[-1].strip()
+
+        # >>> Fix: ignore the no-op/default label so we don't filter everything out
+        if site_name_contains and site_name_contains.strip().lower() == "default partition":
+            _LOGGER.debug("[%s] Ignoring site filter 'Default Partition' (treating as no filter)", entry.entry_id)
+            site_name_contains = None
+        # <<<
 
         doors = _iter_doors_from_overview(
             overview,
