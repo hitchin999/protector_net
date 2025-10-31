@@ -7,11 +7,7 @@ import logging
 import json
 from typing import Iterable, Optional, Dict, Any, List
 
-from aiohttp import ClientError
-
 _LOGGER = logging.getLogger(__name__)
-DOMAIN = "protector_net"
-
 
 from .const import DOMAIN, FRIENDLY_TO_TZ_INDEX, OVERRIDE_MODE_LABEL_TO_TOKEN
 
@@ -123,6 +119,36 @@ async def get_all_doors(
         _LOGGER.exception("%s: Error fetching doors: %s", entry_id, e)
         return []
 
+async def get_available_readers(hass, entry_id: str) -> list[dict]:
+    """Return partition-scoped readers -> doors (fixes Reader 2 / in-out readers)."""
+    cfg = hass.data[DOMAIN][entry_id]
+    base_url = cfg["base_url"]
+    partition_id = cfg.get("partition_id")
+
+    if not partition_id:
+        _LOGGER.debug("%s: get_available_readers: no partition_id in cfg", entry_id)
+        return []
+
+    url = f"{base_url}/api/AccessPrivilegeGroups/AvailableReaders/{partition_id}"
+    params = {"PageNumber": 1, "PerPage": 500}
+
+    try:
+        resp = await _request_with_reauth(
+            hass,
+            entry_id,
+            "GET",
+            url,
+            params=params,
+            timeout=10,
+        )
+        data = resp.json() or {}
+    except Exception as e:
+        _LOGGER.error("%s: get_available_readers failed: %s", entry_id, e)
+        return []
+
+    results = data.get("Results") or []
+    _LOGGER.debug("%s: get_available_readers: got %d items", entry_id, len(results))
+    return results
 
 # -----------------------
 # Door Commands
@@ -308,7 +334,6 @@ async def get_action_plans(
     """
     Overloaded: config_flow vs runtime.
     """
-    import httpx
     if len(args) == 3:
         base, cookie, part = args
         url = f"{base}/api/ActionPlans"
@@ -333,6 +358,53 @@ async def get_action_plans(
         _LOGGER.error("%s: Error fetching action plans: %s", entry_id, e)
         return []
 
+async def get_action_plans_filtered(
+    hass,
+    entry_id: str,
+    *,
+    name_filter: str,
+    per_page: int = 500,
+) -> list[dict]:
+    """Get action plans in this entry's partition, filtered by name on the server.
+    Some Protector.Net versions reject ?Filter=... with 400 → fall back silently.
+    """
+    cfg = hass.data[DOMAIN][entry_id]
+    url = f"{cfg['base_url']}/api/ActionPlans"
+    params = {
+        "PartitionId": cfg["partition_id"],
+        "PageNumber": 1,
+        "PerPage": per_page,
+        "Filter": name_filter,
+    }
+    try:
+        resp = await _request_with_reauth(
+            hass, entry_id, "GET", url, params=params, timeout=10
+        )
+        return resp.json().get("Results", [])
+    except httpx.HTTPStatusError as e:
+        # Some servers: 400 on ?Filter=... → just fall back to unfiltered
+        if e.response is not None and e.response.status_code == 400:
+            _LOGGER.debug(
+                "%s: server does not support ActionPlans Filter=%r, falling back to full list",
+                entry_id,
+                name_filter,
+            )
+            return await get_action_plans(hass, entry_id)
+        _LOGGER.error(
+            "%s: Error fetching filtered action plans (%s): %s",
+            entry_id,
+            name_filter,
+            e,
+        )
+        return []
+    except Exception as e:
+        _LOGGER.error(
+            "%s: Error fetching filtered action plans (%s): %s",
+            entry_id,
+            name_filter,
+            e,
+        )
+        return []
 
 async def get_action_plan_detail(
     hass,
@@ -346,7 +418,6 @@ async def get_action_plan_detail(
     url = f"{cfg['base_url']}/api/ActionPlans/{plan_id}"
     resp = await _request_with_reauth(hass, entry_id, "GET", url, timeout=10)
     return resp.json()
-
 
 async def find_or_clone_system_plan(
     hass,
@@ -370,10 +441,30 @@ async def find_or_clone_system_plan(
         orig_name = orig_name.replace(marker, "")
     clone_name = f"{orig_name}{marker}"
     # -- END patch --
-    existing = await get_action_plans(hass, entry_id)
+    # first try filtered by the exact clone name
+    existing = await get_action_plans_filtered(
+        hass,
+        entry_id,
+        name_filter=clone_name,
+    )
     for p in existing:
-        if p.get('PlanType') == 'System' and p.get('Name') == clone_name and p.get('PartitionId') == plan.get('PartitionId'):
-            return p.get('Id')
+        if (
+            p.get("PlanType") == "System"
+            and p.get("Name") == clone_name
+            and p.get("PartitionId") == plan.get("PartitionId")
+        ):
+            return p.get("Id")
+
+    # safety: old way, in case Filter is weird on some versions
+    fallback = await get_action_plans(hass, entry_id)
+    for p in fallback:
+        if (
+            p.get("PlanType") == "System"
+            and p.get("Name") == clone_name
+            and p.get("PartitionId") == plan.get("PartitionId")
+        ):
+            return p.get("Id")
+
     # 1) create skeleton
     payload = {
         "PlanType":     "System",
@@ -421,7 +512,6 @@ async def execute_action_plan(
         _LOGGER.error("%s: Error executing action plan %s: %s", entry_id, plan_id, e)
         return False
 
-
 async def find_or_create_ha_log_plan(hass, entry_id: str) -> int:
     """
     Ensure a single System plan called “HA Door Log” exists, and return its ID.
@@ -429,18 +519,28 @@ async def find_or_create_ha_log_plan(hass, entry_id: str) -> int:
     cfg = hass.data[DOMAIN][entry_id]
     marker_name = "HA Door Log"
 
-    # 1) Fetch all existing plans
-    all_plans = await get_action_plans(hass, entry_id)
-    for p in all_plans:
+    # 1) Try filtered (cheaper, server-side)
+    plans = await get_action_plans_filtered(
+        hass,
+        entry_id,
+        name_filter=marker_name,
+    )
+
+    # 2) If nothing found, fall back to full list
+    if not plans:
+        plans = await get_action_plans(hass, entry_id)
+
+    # 3) If it exists already, just return it
+    for p in plans:
         if (
-            p["PlanType"] == "System"
-            and p["Name"] == marker_name
-            and p["PartitionId"] == cfg["partition_id"]
+            p.get("PlanType") == "System"
+            and p.get("Name") == marker_name
+            and p.get("PartitionId") == cfg["partition_id"]
         ):
             return p["Id"]
 
-    # 2) Not found → create skeleton
-    payload = {
+    # 4) Not found → create skeleton
+    create_payload = {
         "PlanType":     "System",
         "Name":         marker_name,
         "Description":  "Log each Home Assistant door button press",
@@ -452,30 +552,30 @@ async def find_or_create_ha_log_plan(hass, entry_id: str) -> int:
         entry_id,
         "POST",
         f"{cfg['base_url']}/api/ActionPlans",
-        json=payload,
+        json=create_payload,
         timeout=10,
     )
     plan_id = resp.json()["Id"]
 
-    # 3) Populate its Contents via PUT
+    # 5) Populate its Contents via PUT
     content = {
         "InitVar": {},
         "Action": {
             "_Type": "Log",
             "Parameters": {
                 "Level":   1,
-                "Message": "@{Session.App} unlocked @{Session.Door}"
+                "Message": "@{Session.App} unlocked @{Session.Door}",
             },
             "Fail":   None,
             "Always": None,
-            "Then":   None
-        }
+            "Then":   None,
+        },
     }
     put_body = {
-        "Id":         plan_id,
+        "Id": plan_id,
         "Properties": [
             {"Name": "Contents", "Value": json.dumps(content)}
-        ]
+        ],
     }
     await _request_with_reauth(
         hass,
@@ -487,7 +587,6 @@ async def find_or_create_ha_log_plan(hass, entry_id: str) -> int:
     )
 
     return plan_id
-
 
 # -----------------------
 # System / Maps
