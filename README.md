@@ -11,6 +11,12 @@ This custom integration controls **Hartmann Controls Protector.Net** door access
 
 ---
 
+## What’s new in 0.1.8
+
+* **Fix:** Reader notifications (including “Reader 2” / in–out readers on the same ODM/TDM) now map cleanly to the right **door** because we also pull the partition-scoped **AvailableReaders** API (Reader → DoorId), not just the name.
+
+----
+
 ## What’s new in 0.1.7
 
 * **Fix:** Door sensors could fail to appear when the selected partition was named **“Default Partition.”** Discovery is now partition-scoped and resilient, so those sensors load correctly. No reconfiguration needed.
@@ -178,6 +184,10 @@ Lock/Unlock **status** messages don’t flip the “by” state (that’s what *
 ---
 
 ## Changelog
+
+### 0.1.8
+
+* Fix: Reader notifications (including “Reader 2” / in–out readers on the same ODM/TDM) now map cleanly to the right **door** because we also pull the partition-scoped **AvailableReaders** API (Reader → DoorId), not just the name.
 
 ### 0.1.7
 
