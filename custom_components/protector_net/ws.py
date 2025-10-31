@@ -228,12 +228,53 @@ class SignalRClient:
         self._reader_by_name = reader_by_name
         self._name_index = name_index
 
+        # ---- extra: pull explicit partition readers and merge ----
+        try:
+            from . import api as _api
+            extra_readers = await _api.get_available_readers(self.hass, self.entry_id)
+        except Exception as e:
+            extra_readers = []
+            _LOGGER.error("[%s] Failed to fetch partition readers: %s", self.entry_id, e)
+
+        merged = 0
+        if extra_readers:
+            for rd in extra_readers:
+                rid = rd.get("Id")
+                door_id_from_api = rd.get("DoorId")
+                rname = (rd.get("Name") or "").strip()
+
+                if not isinstance(rid, int) or not isinstance(door_id_from_api, int):
+                    continue
+
+                # keep it partition-scoped
+                if self._allowed_door_ids and door_id_from_api not in self._allowed_door_ids:
+                    continue
+
+                # 1) id → door
+                self._reader_by_id[rid] = door_id_from_api
+
+                # 2) name → door
+                if rname:
+                    norm = rname.lower()
+                    self._reader_by_name[norm] = door_id_from_api
+                    base = self._strip_reader_suffix(rname)
+                    if base and base != norm:
+                        self._reader_by_name[base] = door_id_from_api
+
+                merged += 1
+
         _LOGGER.debug(
-            "[%s] Built maps (filtered): doors=%d, readers_by_id=%d, readers_by_name=%d, names=%d",
-            self.entry_id, len(door_map), len(reader_by_id), len(reader_by_name), len(name_index)
+            "[%s] Built maps (filtered): doors=%d, readers_by_id=%d (+%d from partition), readers_by_name=%d, names=%d",
+            self.entry_id,
+            len(self._door_map),
+            len(self._reader_by_id),
+            merged,
+            len(self._reader_by_name),
+            len(self._name_index),
         )
-        if door_map:
-            sample = {k: v for k, v in list(door_map.items())[:10]}
+
+        if self._door_map:
+            sample = {k: v for k, v in list(self._door_map.items())[:10]}
             _LOGGER.debug("[%s] Map sample: %s", self.entry_id, sample)
 
     def _panels_from_map(self) -> List[str]:
@@ -550,7 +591,7 @@ class SignalRClient:
                     ntype = (note.get("NotificationType") or "").upper()
 
                     did = self._door_id_from_notification(note)
-
+                    
                     if did is None:
                         # Mute noisy ActionPlan state chatter with no door routing
                         if ntype.startswith("ACTIONPLAN_"):
@@ -558,10 +599,11 @@ class SignalRClient:
                         _LOGGER.debug("[%s] Unmapped notification: %s", self.entry_id, note)
                         self._push_hub_state()
                         continue
-
+                    
+                    # partition guard
                     if allowed_door_ids and did not in allowed_door_ids:
-                        # Skip other partitions
                         continue
+
 
                     # Route to "Last Door Log" sensor
                     async_dispatcher_send(
