@@ -242,17 +242,18 @@ class SignalRClient:
                 rid = rd.get("Id")
                 door_id_from_api = rd.get("DoorId")
                 rname = (rd.get("Name") or "").strip()
-
+            
                 if not isinstance(rid, int) or not isinstance(door_id_from_api, int):
                     continue
-
+            
                 # keep it partition-scoped
-                if self._allowed_door_ids and door_id_from_api not in self._allowed_door_ids:
-                    continue
-
+                # 👇 always make sure this door is treated as allowed
+                if door_id_from_api not in self._allowed_door_ids:
+                    self._allowed_door_ids.add(door_id_from_api)
+            
                 # 1) id → door
                 self._reader_by_id[rid] = door_id_from_api
-
+            
                 # 2) name → door
                 if rname:
                     norm = rname.lower()
@@ -274,6 +275,8 @@ class SignalRClient:
         )
 
         if self._door_map:
+            # make sure we allow every door we actually mapped
+            self._allowed_door_ids |= {did for (_sid, (did, _)) in self._door_map.items()}
             sample = {k: v for k, v in list(self._door_map.items())[:10]}
             _LOGGER.debug("[%s] Map sample: %s", self.entry_id, sample)
 
@@ -584,26 +587,26 @@ class SignalRClient:
                         if isinstance(a, dict):
                             notes_iter.append(a)
 
-                allowed_door_ids = self._allowed_door_ids or {did for (_sid, (did, _)) in self._door_map.items()}
-
+                allowed_door_ids = self._allowed_door_ids or {
+                    did for (_sid, (did, _)) in self._door_map.items()
+                }
+                
                 for note in notes_iter:
                     msg = note.get("Message") or ""
                     ntype = (note.get("NotificationType") or "").upper()
-
+                
                     did = self._door_id_from_notification(note)
-                    
+                
                     if did is None:
-                        # Mute noisy ActionPlan state chatter with no door routing
                         if ntype.startswith("ACTIONPLAN_"):
                             continue
                         _LOGGER.debug("[%s] Unmapped notification: %s", self.entry_id, note)
                         self._push_hub_state()
                         continue
-                    
-                    # partition guard
+                
+                    # ✅ skip doors that are NOT in this HA entry's partition
                     if allowed_door_ids and did not in allowed_door_ids:
                         continue
-
 
                     # Route to "Last Door Log" sensor
                     async_dispatcher_send(
