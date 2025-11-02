@@ -11,6 +11,17 @@ This custom integration controls **Hartmann Controls Protector.Net** door access
 
 ---
 
+## What’s new in 0.1.9
+
+### Fixed
+- **Last Door Log not updating for some doors** – fixed a bug where notifications coming from a *reader* (instead of directly from the door) were being dropped because the door ID wasn’t in the partition allowlist yet. We now:
+  - merge doors from `get_available_readers(...)` into the allowed-door set, **and**
+  - also add every door we discover in the SignalR system overview tree (`_door_map`) into the allowed set,
+  so reader-based notifications no longer get filtered out.
+
+----
+
+
 ## What’s new in 0.1.8
 
 * **Fix:** Reader notifications (including “Reader 2” / in–out readers on the same ODM/TDM) now map cleanly to the right **door** because we also pull the partition-scoped **AvailableReaders** API (Reader → DoorId), not just the name.
@@ -184,6 +195,9 @@ Lock/Unlock **status** messages don’t flip the “by” state (that’s what *
 ---
 
 ## Changelog
+
+### 0.1.9
+* Fix: **Last Door Log not updating for some doors** – fixed a bug where notifications coming from a *reader* (instead of directly from the door) were being dropped because the door ID wasn’t in the partition allowlist yet.
 
 ### 0.1.8
 
