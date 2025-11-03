@@ -42,20 +42,23 @@ class SignalRClient:
         self._task: Optional[asyncio.Task] = None
         self._stop = asyncio.Event()
 
-        # Partition-scoped allowlist and maps
-        self._allowed_door_ids: Set[int] = set()         # doors in THIS entry’s partition
-        self._door_map: Dict[str, Tuple[int, str]] = {}  # statusId -> (door_id, name) [filtered]
-        self._name_index: Dict[str, int] = {}            # normalized door name -> door_id [filtered]
-        self._reader_by_id: dict[int, int] = {}          # reader_id -> door_id [filtered]
-        self._reader_by_name: dict[str, int] = {}        # reader_name(lower/variants) -> door_id [filtered]
-        self._last_door_status_at: dict[int, float] = {}
-        self._baseline_reader_tz: dict[int, int] = {}    # door_id -> last known non-overridden timeZone
+        # ❗ keep track of which partition this HA entry belongs to
+        self._partition_id: int | None = None
 
-        # Actively managed handles for clean shutdown
+        # Partition-scoped allowlist and maps
+        self._allowed_door_ids: Set[int] = set()
+        self._door_map: Dict[str, Tuple[int, str]] = {}
+        self._name_index: Dict[str, int] = {}
+        self._reader_by_id: dict[int, int] = {}
+        self._reader_by_name: dict[str, int] = {}
+        self._last_door_status_at: dict[int, float] = {}
+        self._baseline_reader_tz: dict[int, int] = {}
+
+        # Actively managed handles
         self._session: ClientSession | None = None
         self._ws: Any | None = None
 
-        # Hub status attrs (exposed via hub sensor)
+        # Hub status attrs
         self.phase = "idle"
         self.connected = False
         self.last_error: str | None = None
@@ -133,7 +136,9 @@ class SignalRClient:
             "last_statusId": self.last_statusId,
             "last_door_payload": self.last_door_payload,
             "last_log_line": self.last_log_line,
+            "partition_id": self._partition_id,
         }
+
         async_dispatcher_send(self.hass, f"{DISPATCH_HUB}_{self.entry_id}", data)
 
     # Internals ---------------------------------------------------------------
@@ -242,19 +247,19 @@ class SignalRClient:
                 rid = rd.get("Id")
                 door_id_from_api = rd.get("DoorId")
                 rname = (rd.get("Name") or "").strip()
-            
+
                 if not isinstance(rid, int) or not isinstance(door_id_from_api, int):
                     continue
-            
-                # keep it partition-scoped
-                # 👇 always make sure this door is treated as allowed
-                if door_id_from_api not in self._allowed_door_ids:
-                    self._allowed_door_ids.add(door_id_from_api)
-            
-                # 1) id → door
+
+                # ❗ stay inside the doors we got from get_all_doors()
+                if self._allowed_door_ids and door_id_from_api not in self._allowed_door_ids:
+                    # reader is for some OTHER partition -> skip
+                    continue
+
+                # 1) reader-id -> door-id
                 self._reader_by_id[rid] = door_id_from_api
-            
-                # 2) name → door
+
+                # 2) reader-name -> door-id (plus "Kitchen Reader" → "Kitchen")
                 if rname:
                     norm = rname.lower()
                     self._reader_by_name[norm] = door_id_from_api
@@ -274,11 +279,11 @@ class SignalRClient:
             len(self._name_index),
         )
 
+
         if self._door_map:
-            # make sure we allow every door we actually mapped
-            self._allowed_door_ids |= {did for (_sid, (did, _)) in self._door_map.items()}
             sample = {k: v for k, v in list(self._door_map.items())[:10]}
             _LOGGER.debug("[%s] Map sample: %s", self.entry_id, sample)
+
 
     def _panels_from_map(self) -> List[str]:
         ctrls: set[str] = set()
@@ -380,6 +385,10 @@ class SignalRClient:
         base: str = cfg["base_url"]
         cookie: str = f"ss-id={cfg['session_cookie']}"
         verify_ssl: bool = bool(cfg.get("verify_ssl", False))
+        
+        # 👇 capture partition from the entry config (what you selected in config_flow)
+        self._partition_id = cfg.get("partition_id")
+
 
         self.phase = "starting"
         self._push_hub_state()
@@ -587,25 +596,40 @@ class SignalRClient:
                         if isinstance(a, dict):
                             notes_iter.append(a)
 
-                allowed_door_ids = self._allowed_door_ids or {
-                    did for (_sid, (did, _)) in self._door_map.items()
-                }
-                
+                allowed_door_ids = self._allowed_door_ids
+                if not allowed_door_ids:
+                    _LOGGER.warning(
+                        "[%s] Notification arrived but allowed_door_ids is empty – dropping to avoid cross-partition mixups",
+                        self.entry_id,
+                    )
+                    continue
+
                 for note in notes_iter:
                     msg = note.get("Message") or ""
                     ntype = (note.get("NotificationType") or "").upper()
-                
+
+                    # 👇 hard partition gate from the WS client's configured partition
+                    note_part = note.get("PartitionId")
+                    if self._partition_id is not None and note_part is not None:
+                        try:
+                            if int(note_part) != int(self._partition_id):
+                                # not for this partition -> ignore completely
+                                continue
+                        except (TypeError, ValueError):
+                            # weird PartitionId -> fall through to door-id check
+                            pass
+
                     did = self._door_id_from_notification(note)
-                
+
                     if did is None:
                         if ntype.startswith("ACTIONPLAN_"):
                             continue
                         _LOGGER.debug("[%s] Unmapped notification: %s", self.entry_id, note)
                         self._push_hub_state()
                         continue
-                
-                    # ✅ skip doors that are NOT in this HA entry's partition
-                    if allowed_door_ids and did not in allowed_door_ids:
+
+                    # ✅ final guard: door must be in THIS entry's allowlist
+                    if did not in allowed_door_ids:
                         continue
 
                     # Route to "Last Door Log" sensor
@@ -648,20 +672,16 @@ class SignalRClient:
                             {"door_id": did, "status": payload},
                         )
 
-                    # 1) Structured override line: "<Door> has been overridden. Current state is <Mode>"
                     if "has been overridden" in msg_l and "current state is" in msg_l:
                         m = re.search(r"current state is\s+([a-z\s/]+)", msg_l)
                         mode_txt = (m.group(1).strip() if m else "")
-
-                        # Longest-first, word-boundary matching to avoid
-                        # "card" matching inside "card or pin" / "card and pin".
                         modes_ordered = [
                             (r"\bcard\s+or\s+pin\b", 3),
                             (r"\bcard\s+and\s+pin\b", 4),
                             (r"\bfirst\s+credential\s+in\b", 6),
                             (r"\bdual\s+credential\b", 7),
-                            (r"\blockdown\b", 0),       # 0 for lockdown
-                            (r"\bunlock(?:ed)?\b", 5),  # unlock/unlocked
+                            (r"\blockdown\b", 0),
+                            (r"\bunlock(?:ed)?\b", 5),
                             (r"\bpin\b", 2),
                             (r"\bcard\b", 1),
                         ]
@@ -670,7 +690,6 @@ class SignalRClient:
                             if re.search(pat, mode_txt):
                                 tz = val
                                 break
-
                         payload = {"overridden": True}
                         if tz is not None:
                             payload["timeZone"] = tz
@@ -679,7 +698,6 @@ class SignalRClient:
                                 payload["opener"] = True
                         _emit_status(payload)
 
-                    # 2) Our action-plan phrasing from HA buttons
                     elif ("unlock until resume" in msg_l
                           or "unlock until next schedule" in msg_l
                           or "timed override unlock" in msg_l):
@@ -689,7 +707,6 @@ class SignalRClient:
                           or "card or pin until resume" in msg_l):
                         _emit_status({"overridden": True, "timeZone": 3})
 
-                    # 3) Resume/clear override messages
                     elif (
                         "resume schedule" in msg_l
                         or "schedule resumed" in msg_l
@@ -700,7 +717,6 @@ class SignalRClient:
                         restore_tz = self._baseline_reader_tz.get(did, 1)
                         _emit_status({"overridden": False, "timeZone": restore_tz})
 
-                    # 4) Explicit lock-state notifications keep Lock State in sync
                     if ntype == "DOOR_LOCK_STATE":
                         if "unlocked" in msg_l:
                             _emit_status({"strike": True, "opener": True})
