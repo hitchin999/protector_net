@@ -286,6 +286,7 @@ class ProtectorHubSensor(SensorEntity, RestoreEntity):
                 "connected": la.get("connected"),
                 "mapped_doors": la.get("mapped_doors"),
                 "partition_id": la.get("partition_id", self._partition_id),
+                "system_type": la.get("system_type"),
             }
             self.async_write_ha_state()
 
@@ -293,12 +294,21 @@ class ProtectorHubSensor(SensorEntity, RestoreEntity):
 
         @callback
         def _hub_evt(data: dict[str, Any]) -> None:
-            # Keep these **only**:
+            # Map capability → friendly system type
+            supp = data.get("supports_status_snapshot")
+            system_type = (
+                "Odyssey" if supp is True
+                else "ProtectorNET" if supp is False
+                else "Unknown"
+            )
+
+            # Keep these **only** (plus system_type):
             self._last_attrs = {
                 "phase": data.get("phase"),
                 "connected": data.get("connected"),
                 "mapped_doors": data.get("mapped_doors"),
-                "partition_id": self._partition_id,  # <- minimal attribute set
+                "partition_id": self._partition_id,
+                "system_type": system_type,
             }
             self._attr_native_value = "running" if data.get("connected") else (data.get("phase") or "idle")
             self.async_write_ha_state()
