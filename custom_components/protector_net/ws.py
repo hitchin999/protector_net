@@ -13,7 +13,11 @@ from aiohttp import ClientError, ClientSession, TCPConnector, WSMsgType
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.dispatcher import async_dispatcher_send
 
-from .const import DOMAIN
+try:
+    from .const import DOMAIN, FRIENDLY_TO_TZ_INDEX  # map REST TimeZone strings → index
+except Exception:
+    from .const import DOMAIN
+    FRIENDLY_TO_TZ_INDEX = {}
 
 _LOGGER = logging.getLogger(f"{DOMAIN}.ws")
 
@@ -78,6 +82,10 @@ class SignalRClient:
         self.last_door_payload: Dict[str, Any] | None = None
         self.last_log_line: str | None = None
 
+        # --- Odyssey capability detection + sync task handle ---
+        self._supports_status_snapshot: Optional[bool] = None
+        self._sync_task: Optional[asyncio.Task] = None
+
     # Public -----------------------------------------------------------------
 
     def async_start(self) -> None:
@@ -90,6 +98,13 @@ class SignalRClient:
     async def async_stop(self) -> None:
         """Stop the WS client quickly and deterministically so HA can reload."""
         self._stop.set()
+
+        # Cancel periodic sync loop if running
+        if self._sync_task and not self._sync_task.done():
+            self._sync_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._sync_task
+        self._sync_task = None
 
         # Proactively close the websocket/session so the recv loop breaks now
         try:
@@ -137,6 +152,7 @@ class SignalRClient:
             "last_door_payload": self.last_door_payload,
             "last_log_line": self.last_log_line,
             "partition_id": self._partition_id,
+            "supports_status_snapshot": self._supports_status_snapshot,
         }
 
         async_dispatcher_send(self.hass, f"{DISPATCH_HUB}_{self.entry_id}", data)
@@ -279,11 +295,9 @@ class SignalRClient:
             len(self._name_index),
         )
 
-
         if self._door_map:
             sample = {k: v for k, v in list(self._door_map.items())[:10]}
             _LOGGER.debug("[%s] Map sample: %s", self.entry_id, sample)
-
 
     def _panels_from_map(self) -> List[str]:
         ctrls: set[str] = set()
@@ -377,6 +391,156 @@ class SignalRClient:
 
         return None
 
+    # ---------- Odyssey capability + REST snapshot helpers ----------
+
+    async def _detect_odyssey_status_support(self) -> None:
+        """Probe once: if /api/Doors/{id}/Status exists on this server, enable snapshots."""
+        if self._supports_status_snapshot is not None:
+            return
+        # Ensure we have something to probe
+        if not self._allowed_door_ids:
+            await self._refresh_allowed_doors()
+        test_did = next(iter(self._allowed_door_ids), None)
+        if test_did is None:
+            self._supports_status_snapshot = False
+            _LOGGER.debug("[%s] No doors available to probe snapshot support", self.entry_id)
+            return
+        from . import api
+        try:
+            js = await api.get_door_status(self.hass, self.entry_id, int(test_did))
+        except Exception as e:
+            js = None
+            _LOGGER.debug("[%s] Snapshot probe error for door %s: %s", self.entry_id, test_did, e)
+        if js and isinstance(js, dict) and ("TimeZone" in js or "Lock" in js):
+            self._supports_status_snapshot = True
+            _LOGGER.debug("[%s] Odyssey door status endpoint detected; snapshots enabled", self.entry_id)
+        else:
+            self._supports_status_snapshot = False
+            _LOGGER.debug("[%s] Odyssey door status endpoint not available; snapshots disabled", self.entry_id)
+
+    def _map_rest_status_to_payload(self, js: dict) -> dict[str, Any]:
+        """
+        Convert Odyssey REST door status into the WS-like compact payload the rest
+        of the integration expects: {strike, opener, overridden, timeZone}
+        """
+        # Lock: "Locked"/"Unlocked" (treat unknown as None)
+        lock_s = (js.get("Lock") or "").strip().lower()
+        if lock_s == "locked":
+            strike = False
+            opener = False
+        elif lock_s == "unlocked":
+            strike = True
+            opener = True
+        else:
+            strike = None
+            opener = None
+
+        # Override: "NoOverride" vs any other value
+        ov = js.get("Override")
+        if ov is None:
+            overridden: Optional[bool] = None
+        else:
+            overridden = False if str(ov).lower() == "nooverride" else True
+
+        # TimeZone: token like "Card", "CardOrPin", "Unlock", etc. → numeric index
+        tz_token = js.get("TimeZone")
+        tz_idx: Optional[int] = None
+        if tz_token is not None:
+            if isinstance(tz_token, int):
+                tz_idx = tz_token
+            else:
+                token = str(tz_token).strip()
+                # Try FRIENDLY_TO_TZ_INDEX (expects human labels like "Card or Pin")
+                # First, common normalizations:
+                normalized_candidates = {
+                    token,
+                    token.replace(" ", ""),           # "Card Or Pin" → "CardOrPin"
+                    token.replace("_", ""),           # "Card_Or_Pin" → "CardOrPin"
+                    token.title().replace("Or", "or") # best-effort title case
+                }
+                # Direct known tokens
+                token_map = {
+                    "Lockdown": 0,
+                    "Card": 1,
+                    "Pin": 2,
+                    "CardOrPin": 3,
+                    "Card or Pin": 3,
+                    "CardAndPin": 4,
+                    "Card and Pin": 4,
+                    "Unlock": 5,
+                    "FirstCredentialIn": 6,
+                    "First Credential In": 6,
+                    "DualCredential": 7,
+                    "Dual Credential": 7,
+                }
+                for cand in normalized_candidates:
+                    if cand in token_map:
+                        tz_idx = token_map[cand]
+                        break
+                if tz_idx is None:
+                    # Try friendly map (case-insensitive)
+                    for friendly, idx in (FRIENDLY_TO_TZ_INDEX or {}).items():
+                        if friendly.lower() == token.lower():
+                            tz_idx = idx
+                            break
+
+        return {"strike": strike, "opener": opener, "overridden": overridden, "timeZone": tz_idx}
+
+    async def _sync_all_statuses(self, reason: str = "periodic") -> None:
+        """Snapshot all allowed doors from REST and dispatch as statuses (Odyssey only)."""
+        if not self._supports_status_snapshot:
+            return
+        # need an allowlist
+        if not self._allowed_door_ids:
+            await self._refresh_allowed_doors()
+        if not self._allowed_door_ids:
+            return
+
+        from . import api
+        for did in sorted(self._allowed_door_ids):
+            try:
+                js = await api.get_door_status(self.hass, self.entry_id, int(did))
+            except Exception:
+                js = None
+            if not js or not isinstance(js, dict):
+                continue
+            payload = self._map_rest_status_to_payload(js)
+
+            # Cache baseline reader mode when not overridden
+            try:
+                tz_val = payload.get("timeZone")
+                ov_val = payload.get("overridden")
+                if tz_val is not None and ov_val is False:
+                    self._baseline_reader_tz[int(did)] = int(tz_val)
+            except Exception:
+                pass
+
+            _LOGGER.debug("[%s] %s sync -> door_id=%s payload=%s", self.entry_id, reason, did, payload)
+            async_dispatcher_send(
+                self.hass,
+                f"{DISPATCH_DOOR}_{self.entry_id}",
+                {"door_id": int(did), "status": payload},
+            )
+
+    async def _periodic_sync_loop(self) -> None:
+        """Run lightweight periodic syncs while connected (captures schedule flips)."""
+        if not self._supports_status_snapshot:
+            return
+        try:
+            await asyncio.sleep(5)  # let WS settle
+            while self.connected and not self._stop.is_set():
+                await self._sync_all_statuses("periodic")
+                try:
+                    await asyncio.wait_for(
+                        self._stop.wait(), timeout=60 + random.uniform(0, 3)
+                    )
+                except asyncio.TimeoutError:
+                    continue
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            _LOGGER.debug("[%s] periodic sync loop ended: %s", self.entry_id, e)
+
     # ---------- Runner / message loop ----------
 
     async def _runner(self) -> None:
@@ -388,7 +552,6 @@ class SignalRClient:
         
         # 👇 capture partition from the entry config (what you selected in config_flow)
         self._partition_id = cfg.get("partition_id")
-
 
         self.phase = "starting"
         self._push_hub_state()
@@ -409,6 +572,7 @@ class SignalRClient:
                 while not self._stop.is_set():
                     try:
                         await self._build_door_map()
+                        await self._detect_odyssey_status_support()
 
                         token = await self._negotiate(session, base, cookie)
                         self.connection_token = token
@@ -451,6 +615,13 @@ class SignalRClient:
                             _LOGGER.debug("[%s] WS connected. Listening… (mapped_doors=%d)",
                                           self.entry_id, len(self._door_map))
 
+                            # ---- Odyssey: immediate snapshot + periodic sync (gated) ----
+                            if self._supports_status_snapshot:
+                                self.hass.async_create_task(self._sync_all_statuses("connect"))
+                                if self._sync_task and not self._sync_task.done():
+                                    self._sync_task.cancel()
+                                self._sync_task = self.hass.async_create_task(self._periodic_sync_loop())
+
                             async for msg in ws:
                                 if self._stop.is_set():
                                     break
@@ -474,6 +645,11 @@ class SignalRClient:
                         _LOGGER.error("[%s] WS error: %s", self.entry_id, e)
                         self._push_hub_state()
 
+                        # stop periodic sync if running
+                        if self._sync_task and not self._sync_task.done():
+                            self._sync_task.cancel()
+                        self._sync_task = None
+
                         sleep_for = min(backoff, max_backoff) + random.uniform(0, 1.5)
                         _LOGGER.debug("[%s] Reconnecting in %.2fs (backoff=%.1fs, cap=%.1fs)",
                                       self.entry_id, sleep_for, backoff, max_backoff)
@@ -490,6 +666,12 @@ class SignalRClient:
             self._session = None
             self.connected = False
             self.phase = "stopped"
+            # stop periodic sync if running
+            if self._sync_task and not self._sync_task.done():
+                self._sync_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await self._sync_task
+            self._sync_task = None
             self._push_hub_state()
 
     async def _handle_text(self, payload: str) -> None:
@@ -518,6 +700,18 @@ class SignalRClient:
 
                 if stype == "Door":
                     self.door_events_seen += 1
+
+                    # --- normalize 'overridden' and 'timeZone' from WS (Odyssey may send 0/1 or strings) ---
+                    ov_val = st.get("overridden", None)
+                    if isinstance(ov_val, int):
+                        st["overridden"] = bool(ov_val)
+                    tz_val = st.get("timeZone", None)
+                    if isinstance(tz_val, str):
+                        try:
+                            st["timeZone"] = int(tz_val)
+                        except ValueError:
+                            pass
+
                     compact = {k: st.get(k) for k in ("strike", "opener", "overridden", "timeZone")}
                     self.last_door_payload = compact
 
@@ -549,11 +743,11 @@ class SignalRClient:
 
                     # Cache baseline reader mode when not overridden
                     try:
-                        tz_val = st.get("timeZone", None)
-                        ov_val = st.get("overridden", None)
-                        if tz_val is not None and not ov_val:
+                        tz_val2 = st.get("timeZone", None)
+                        ov_val2 = st.get("overridden", None)
+                        if tz_val2 is not None and not ov_val2:
                             try:
-                                tz_int = int(tz_val)
+                                tz_int = int(tz_val2)
                             except (TypeError, ValueError):
                                 tz_int = None
                             if tz_int is not None:
