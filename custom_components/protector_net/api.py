@@ -535,7 +535,47 @@ async def get_door_time_zone_states(hass, entry_id: str) -> dict[int, dict]:
     resp = await _request_with_reauth(hass, entry_id, "GET", url, timeout=10)
     items = resp.json()  # [{index,name,color,...}, ...]
     return {int(x["index"]): x for x in items if "index" in x}
+    
+async def get_door_status(
+    hass,
+    entry_id: str,
+    door_id: int
+) -> Optional[dict]:
+    """
+    Fetch current status for a single door.
 
+    Odyssey servers expose:
+        GET /api/Doors/{door_id}/Status
+    Some variants may be case-insensitive; try lowercase fallback once.
+
+    Returns a dict or None on error / unsupported.
+    """
+    cfg = hass.data[DOMAIN][entry_id]
+
+    # Try canonical (PascalCase) path first
+    url_main = f"{cfg['base_url']}/api/Doors/{door_id}/Status"
+    try:
+        resp = await _request_with_reauth(hass, entry_id, "GET", url_main, timeout=10)
+        return resp.json()
+    except httpx.HTTPStatusError as e:
+        if e.response is not None and e.response.status_code == 404:
+            # Fallback to lowercase path (some deployments differ)
+            url_fallback = f"{cfg['base_url']}/api/doors/{door_id}/status"
+            try:
+                resp2 = await _request_with_reauth(hass, entry_id, "GET", url_fallback, timeout=10)
+                return resp2.json()
+            except httpx.HTTPStatusError as e2:
+                if e2.response is not None and e2.response.status_code == 404:
+                    # Not supported on this server (likely Protector.Net)
+                    return None
+                excepted = True
+            except Exception:
+                return None
+            return None
+        # Other HTTP errors – treat as unsupported for snapshot purposes
+        return None
+    except Exception:
+        return None
 
 from typing import Dict
 
