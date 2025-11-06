@@ -1,81 +1,20 @@
-
-[![Total Downloads](https://img.shields.io/github/downloads/hitchin999/protector_net/total.svg?label=Total%20Downloads\&style=for-the-badge\&color=blue)](https://github.com/hitchin999/protector_net/releases)
+[![Total Downloads](https://img.shields.io/github/downloads/hitchin999/protector_net/total.svg?label=Total%20Downloads&style=for-the-badge&color=blue)](https://github.com/hitchin999/protector_net/releases)
 [![Active Protector.Net Installs][prot-badge]][prot-analytics]
 
 [prot-badge]: https://img.shields.io/badge/dynamic/json?label=Active%20Installs&url=https%3A%2F%2Fanalytics.home-assistant.io%2Fcustom_integrations.json&query=%24.protector_net.total&style=for-the-badge&color=blue
 [prot-analytics]: https://analytics.home-assistant.io/integration/protector_net
 
-# Protector.Net Access Control for Home Assistant
+# Protector.Net & Odyssey Access Control for Home Assistant
 
-This custom integration controls **Hartmann Controls Protector.Net** door access systems via HTTP + a live **SignalR** websocket for instant updates.
-
----
-
-## What’s new in 0.1.9
-
-### Fixed
-- **Last Door Log not updating for some doors** – fixed a bug where notifications coming from a *reader* (instead of directly from the door) were being dropped because the door ID wasn’t in the partition allowlist yet. We now:
-  - merge doors from `get_available_readers(...)` into the allowed-door set, **and**
-  - also add every door we discover in the SignalR system overview tree (`_door_map`) into the allowed set,
-  so reader-based notifications no longer get filtered out.
-
-----
-
-
-## What’s new in 0.1.8
-
-* **Fix:** Reader notifications (including “Reader 2” / in–out readers on the same ODM/TDM) now map cleanly to the right **door** because we also pull the partition-scoped **AvailableReaders** API (Reader → DoorId), not just the name.
-
-----
-
-## What’s new in 0.1.7
-
-* **Fix:** Door sensors could fail to appear when the selected partition was named **“Default Partition.”** Discovery is now partition-scoped and resilient, so those sensors load correctly. No reconfiguration needed.
-* **Reliability:** If an overview filter returns no doors at startup, discovery now falls back to the partition’s door list and retries after the hub reports mapped doors.
+This custom integration controls **Hartmann Controls Protector.Net _and_ Odyssey** door access systems via HTTP + a live **SignalR** websocket for instant updates.
 
 ---
 
-## What’s new in 0.1.6
+## What’s new in 0.2.1
 
-* **Partition-scoped devices**
-
-  * **Hub device** per configured partition: `Hub Status – <Partition>`
-  * **Action Plans device** per partition: `Action Plans – <Partition>`
-  * **All Doors device** per partition: `All Doors – <Partition>` with an **All Doors Lockdown** switch
-  * Door entities remain grouped by **door device** *(unchanged)*
-
-* **5 real-time sensors**
-
-  1. **Hub Status – <Partition>** — `running / connecting / idle / stopped / error`
-     *Attributes:* `phase`, `connected`, `mapped_doors`, `partition_id`
-  2. **<Door> Lock State** — `Locked` / `Unlocked` (live strike/opener)
-  3. **<Door> Overridden** — `On` / `Off`
-  4. **<Door> Reader Mode** — friendly mapping of controller `timeZone`
-  5. **<Door> Last Door Log by** — state is **who** last acted (e.g., “Home Assistant”, person/cardholder)
-     *Attributes:* `Reader Message`, `Reader Message Time`, `Door Message`, `Door ID`, `Partition ID`
-
-* **Legacy door buttons — simplified & selectable**
-
-  * **Pulse Unlock** is **always included**.
-  * Other legacy buttons are **optional** (pick them in **Options**):
-
-    * Resume Schedule
-    * Unlock Until Resume
-    * Unlock Until Next Schedule
-    * CardOrPin Until Resume
-    * Timed Override Unlock (uses default minutes)
-  * Nothing is pre-selected by default.
-
-* **New per-door Override UI (synced instantly)**
-
-  * **Override** *(switch)* — ON applies the selected override; OFF resumes schedule.
-  * **Override Type** *(select)* — `For Specified Time` / `Until Resumed` / `Until Next Schedule`
-  * **Override Mode** *(select)* — includes **`None`**
-    OFF ⇒ shows **`None`**; ON ⇒ mirrors the live reader mode.
-  * **Override Minutes** *(number)* — used when type is “For Specified Time”.
-  * Internal dispatcher updates ensure **immediate UI refresh** (no need to leave/return the device page).
-
-> **Heads-up:** Device names changed (partition-scoped). If you filtered by **device** in dashboards/automations, re-select the new device names. **Entity IDs / unique_ids remain stable.**
+### New
+- **Odyssey servers are now supported** — auto-detected at runtime (no new options needed).
+- **Status snapshots (Odyssey only):** on connect and ~every 60s we read `/api/Doors/{id}/Status` and normalize to the same payload used by Protector.Net:
 
 ---
 
@@ -88,7 +27,8 @@ This custom integration controls **Hartmann Controls Protector.Net** door access
 * ✅ **All Doors Lockdown** switch (partition-wide)
 * ✅ **HA Door Log** entries when you use HA buttons (e.g., “Home Assistant unlocked …”)
 * ✅ All controls & options in the UI (HACS-friendly)
-
+* ✅ **Odyssey servers supported** (auto-detect)
+  
 ---
 
 ## Installation
@@ -131,7 +71,7 @@ Revisit any time: **Settings → Devices & Services → Protector.Net → Option
 * **Device:** `Hub Status – <Partition>`
 * **Entity:** **Hub Status – <Partition>** *(sensor)*
   **State:** `running / connecting / idle / stopped / error`
-  **Attributes:** `phase`, `connected`, `mapped_doors`, `partition_id`
+  **Attributes:** `phase`, `connected`, `mapped_doors`, `partition_id`, `system_type` *(“Odyssey” or “ProtectorNET”)* 
 
 ### 2) Door devices (one per door)
 
@@ -196,20 +136,23 @@ Lock/Unlock **status** messages don’t flip the “by” state (that’s what *
 
 ## Changelog
 
-### 0.1.9
+### 0.2.1
+* New: **Odyssey servers supported** (auto-detect, no config changes).
+* New: **Odyssey status snapshots** on connect and periodically (~60s) to catch schedule flips.
+* Improvement: Normalize WS types for `overridden` and `timeZone` from Odyssey.
+
+### 0.2.0
 * Fix: **Last Door Log not updating for some doors** – fixed a bug where notifications coming from a *reader* (instead of directly from the door) were being dropped because the door ID wasn’t in the partition allowlist yet.
+* Note: **0.1.9 withdrawn**.
 
 ### 0.1.8
-
 * Fix: Reader notifications (including “Reader 2” / in–out readers on the same ODM/TDM) now map cleanly to the right **door** because we also pull the partition-scoped **AvailableReaders** API (Reader → DoorId), not just the name.
 
 ### 0.1.7
-
 * Fix: Door sensors now load correctly when the selected partition is named **“Default Partition.”**
 * Reliability: More robust, partition-scoped discovery with safe fallback and retry.
 
 ### 0.1.6
-
 * New: **Partition-scoped devices** (Hub + Action Plans + **All Doors**)
 * New: **All Doors Lockdown** switch (partition-wide)
 * New: **5 sensors** total (Hub Status, Lock State, Overridden, Reader Mode, **Last Door Log by**)
@@ -217,27 +160,21 @@ Lock/Unlock **status** messages don’t flip the “by” state (that’s what *
 * Change: **Legacy buttons** refined — **Pulse Unlock always**; others **optional** via Options
 
 ### 0.1.5
-
 * Door-action logs (“Home Assistant unlocked …”)
 
 ### 0.1.4
-
 * Plan cloning fixes and reuse; HA Door Log plan
 
 ### 0.1.3
-
 * Action Plans import/execute; options refresh
 
 ### 0.1.2
-
 * Configurable door entities; options flow; base fixes
 
 ### 0.1.1
-
 * Partition selection; session refresh; dynamic titles
 
 ### 0.1.0
-
 * Initial release (doors & basic controls)
 
 ---
