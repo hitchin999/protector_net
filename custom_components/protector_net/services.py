@@ -159,6 +159,7 @@ SERVICE_OVERRIDE_DOOR_SCHEMA = vol.Schema(
         vol.Optional("mode", default="Unlock"): vol.In(OVERRIDE_DOOR_MODES),
         vol.Optional("override_type", default="until_resumed"): vol.In(OVERRIDE_TYPES),
         vol.Optional("minutes"): vol.All(vol.Coerce(int), vol.Range(min=1)),
+        vol.Optional("until"): cv.string,  # ISO datetime — auto-computes minutes
     }
 )
 
@@ -986,11 +987,32 @@ async def async_setup_services(hass: HomeAssistant) -> None:
     async def handle_override_door(call: ServiceCall) -> dict[str, Any]:
         """Handle the override_door service call - apply override to doors."""
         from . import api
+        from homeassistant.util import dt as dt_util
+        import math
         
         device_ids = _normalize_device_ids(call.data["door_device_id"])
         mode = call.data.get("mode", "Unlock")
         override_type = call.data.get("override_type", "until_resumed")
         minutes = call.data.get("minutes")
+        until_raw = call.data.get("until")
+        
+        # --- 'until' datetime support ---
+        # If 'until' is provided, auto-set override_type to for_time and
+        # compute minutes from (until - now).
+        if until_raw:
+            try:
+                until_dt = datetime.fromisoformat(str(until_raw))
+                if until_dt.tzinfo is None:
+                    until_dt = dt_util.as_local(until_dt)
+                now = dt_util.now()
+                delta_seconds = (until_dt - now).total_seconds()
+                if delta_seconds <= 0:
+                    return {"success": False, "error": f"'until' datetime {until_raw} is in the past"}
+                minutes = max(1, math.ceil(delta_seconds / 60))
+                override_type = "for_time"
+                _LOGGER.info("override_door: 'until' %s -> computed %d minutes", until_raw, minutes)
+            except (ValueError, TypeError) as e:
+                return {"success": False, "error": f"Invalid 'until' datetime: {until_raw} ({e})"}
         
         # Map override_type to API token
         type_map = {
