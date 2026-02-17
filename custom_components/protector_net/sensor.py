@@ -16,6 +16,7 @@ from homeassistant.helpers.typing import StateType
 from homeassistant.helpers.restore_state import RestoreEntity
 
 from .const import DOMAIN
+from .services import DISPATCH_TEMP_CODE, DISPATCH_OTR
 
 _LOGGER = logging.getLogger(f"{DOMAIN}.sensor")
 
@@ -138,6 +139,16 @@ LAST_LOG_DESC = ProtectorDoorDesc(
     name="Last Door Log by",
 )
 
+TEMP_CODE_DESC = ProtectorDoorDesc(
+    key="temp_code",
+    name="Temp Code",
+)
+
+OTR_SCHEDULES_DESC = ProtectorDoorDesc(
+    key="otr_schedules",
+    name="OTR Schedules",
+)
+
 
 # ------------------------
 # Setup
@@ -154,6 +165,7 @@ async def async_setup_entry(
 
     # Create hub status sensor immediately so platform returns quickly
     hub_ent = ProtectorHubSensor(hass, entry.entry_id, base_url)
+    
     async_add_entities([hub_ent])
 
     # Defer door discovery to a background task (don’t block startup)
@@ -215,6 +227,8 @@ async def async_setup_entry(
             entities.append(ProtectorDoorSensor(hass, entry.entry_id, base_url, did, dname, OVERRIDDEN_DESC))
             entities.append(ProtectorDoorSensor(hass, entry.entry_id, base_url, did, dname, READER_MODE_DESC))
             entities.append(ProtectorDoorLastLogSensor(hass, entry.entry_id, base_url, did, dname, LAST_LOG_DESC))
+            entities.append(ProtectorDoorTempCodeSensor(hass, entry.entry_id, base_url, did, dname, TEMP_CODE_DESC))
+            entities.append(ProtectorDoorOTRSensor(hass, entry.entry_id, base_url, did, dname, OTR_SCHEDULES_DESC))
 
         async_add_entities(entities)
         _LOGGER.debug("[%s] Added %d door sensors", entry.entry_id, len(entities))
@@ -322,8 +336,181 @@ class ProtectorHubSensor(SensorEntity, RestoreEntity):
 
 
 # ------------------------
-# Door sensors (3 metrics) + RestoreEntity
+# OTR Schedules sensor - shows OneTimeRun schedules per door
 # ------------------------
+from datetime import timedelta
+
+OTR_UPDATE_INTERVAL = timedelta(minutes=5)
+
+
+class ProtectorDoorOTRSensor(SensorEntity, RestoreEntity):
+    """Shows OTR (One Time Run) schedules for a specific door from Hartmann."""
+
+    _attr_should_poll = False  # We'll use our own timer
+
+    def __init__(
+        self,
+        hass: HomeAssistant,
+        entry_id: str,
+        base_url: str,
+        door_id: int,
+        door_name: str,
+        desc: ProtectorDoorDesc,
+    ) -> None:
+        self.hass = hass
+        self._entry_id = entry_id
+        self._base_url = base_url
+        self._door_id = int(door_id)
+        self._door_name = door_name
+        self.entity_description = desc
+        host = base_url.split("://", 1)[1]
+
+        self._attr_name = f"{door_name} {desc.name or desc.key}"
+        self._attr_unique_id = f"{DOMAIN}_{host}_door_{door_id}_{desc.key}|{entry_id}"
+
+        self._attr_native_value: StateType = 0
+        self._attr_unit_of_measurement = "schedules"
+        self._attr_icon = "mdi:calendar-clock"
+        
+        self._schedules: List[Dict[str, Any]] = []
+        self._last_updated: Optional[str] = None
+        self._unsub_timer: Optional[Callable[[], None]] = None
+        self._unsub_otr: Optional[Callable[[], None]] = None
+
+    @property
+    def device_info(self):
+        host = self._base_url.split("://", 1)[1]
+        return {
+            "identifiers": {(DOMAIN, f"door:{host}:{self._door_id}|{self._entry_id}")},
+            "manufacturer": "Yoel Goldstein/Vaayer LLC",
+            "model": "Protector.Net Door",
+            "name": self._door_name,
+            "configuration_url": self._base_url,
+            "via_device": (DOMAIN, f"hub:{host}|{self._entry_id}"),
+        }
+
+    @property
+    def extra_state_attributes(self) -> Dict[str, Any]:
+        from datetime import datetime
+        
+        # Separate active vs upcoming
+        now = datetime.now().isoformat()
+        active = []
+        upcoming = []
+        
+        for s in self._schedules:
+            start = s.get("start_time", "")
+            stop = s.get("stop_time", "")
+            
+            schedule_info = {
+                "id": s.get("id"),
+                "name": s.get("name"),
+                "mode": s.get("mode"),
+                "start": start,
+                "stop": stop,
+            }
+            
+            # Simple comparison (ISO format strings compare correctly)
+            if start <= now <= stop:
+                active.append(schedule_info)
+            elif start > now:
+                upcoming.append(schedule_info)
+        
+        return {
+            "active_schedules": active,
+            "upcoming_schedules": upcoming,
+            "all_schedules": self._schedules,
+            "total_count": len(self._schedules),
+            "active_count": len(active),
+            "upcoming_count": len(upcoming),
+            "last_updated": self._last_updated,
+            "door_id": self._door_id,
+        }
+
+    async def async_added_to_hass(self) -> None:
+        await super().async_added_to_hass()
+
+        # Restore last state
+        last = await self.async_get_last_state()
+        if last:
+            if last.state not in (STATE_UNKNOWN, STATE_UNAVAILABLE, None, ""):
+                try:
+                    self._attr_native_value = int(last.state)
+                except (ValueError, TypeError):
+                    self._attr_native_value = 0
+            la = last.attributes or {}
+            self._schedules = la.get("all_schedules", [])
+            self._last_updated = la.get("last_updated")
+            self.async_write_ha_state()
+        
+        # Initial fetch
+        await self._async_fetch_schedules()
+        
+        # Schedule periodic updates every 5 minutes
+        from homeassistant.helpers.event import async_track_time_interval
+        
+        async def _scheduled_update(_now):
+            await self._async_fetch_schedules()
+        
+        self._unsub_timer = async_track_time_interval(
+            self.hass, _scheduled_update, OTR_UPDATE_INTERVAL
+        )
+        
+        # Listen for immediate OTR update signals (fired by create/delete services)
+        @callback
+        def _handle_otr_signal(data=None):
+            self.hass.async_create_task(self._async_fetch_schedules())
+        
+        signal = f"{DISPATCH_OTR}_{self._entry_id}"
+        self._unsub_otr = async_dispatcher_connect(self.hass, signal, _handle_otr_signal)
+
+    async def async_will_remove_from_hass(self) -> None:
+        if self._unsub_timer:
+            self._unsub_timer()
+            self._unsub_timer = None
+        if self._unsub_otr:
+            self._unsub_otr()
+            self._unsub_otr = None
+
+    async def _async_fetch_schedules(self) -> None:
+        """Fetch OTR schedules for this door from Hartmann."""
+        from . import api
+        from datetime import datetime
+        
+        try:
+            # Get all schedules from API
+            all_schedules = await api.get_one_time_runs(self.hass, self._entry_id)
+            
+            # Filter to only schedules for this door
+            door_schedules = []
+            for s in all_schedules:
+                door_ids = s.get("door_ids", [])
+                if self._door_id in door_ids:
+                    door_schedules.append(s)
+                elif not door_ids and s.get("door_name") == self._door_name:
+                    # Fallback: match by door name if door_ids couldn't be resolved
+                    door_schedules.append(s)
+            
+            self._schedules = door_schedules
+            self._attr_native_value = len(door_schedules)
+            self._last_updated = datetime.now().isoformat()
+            self.async_write_ha_state()
+            
+            _LOGGER.debug(
+                "[%s] Updated OTR schedules for door %d: %d schedules",
+                self._entry_id, self._door_id, len(door_schedules)
+            )
+        except Exception as e:
+            _LOGGER.warning(
+                "[%s] Failed to fetch OTR schedules for door %d: %s",
+                self._entry_id, self._door_id, e
+            )
+
+    async def async_update(self) -> None:
+        """Manual refresh support."""
+        await self._async_fetch_schedules()
+
+
 class ProtectorDoorSensor(SensorEntity, RestoreEntity):
     """One door metric (Lock State / Overridden / Reader Mode) as ENUM sensors with fixed options."""
 
@@ -468,6 +655,7 @@ class ProtectorDoorLastLogSensor(SensorEntity, RestoreEntity):
       - USER_ACCESS_GRANTED    -> "<Name> granted access"
       - USER_ACCESS_DENIED     -> "<Name> denied access"
       - ACTIONPLAN_MESSAGE/STATE like "Home Assistant unlocked Door" -> "<Name> unlocked/locked"
+      - OTR events ("One Time Run Time Zone Changed to Mode X") -> "OTR Unlock @ time"
       - DOOR_LOCK_STATE does NOT change state (we only update Door Message)
     """
 
@@ -602,12 +790,31 @@ class ProtectorDoorLastLogSensor(SensorEntity, RestoreEntity):
             if ntype in {"READER_ACCESS_GRANTED", "READER_ACCESS_DENIED", "USER_ACCESS_GRANTED", "USER_ACCESS_DENIED"}:
                 who = self._extract_name_for_reader_line(msg) or (evt.get("source") or {}).get("name") or raw.get("SourceName")
                 if who:
+                    # Format time for state (e.g., "@ 1:06 AM")
+                    time_suffix = ""
+                    if ts:
+                        try:
+                            from datetime import datetime
+                            # Try parsing common formats
+                            for fmt in ["%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M:%S.%f", "%B %d, %Y at %I:%M:%S %p"]:
+                                try:
+                                    dt = datetime.strptime(ts[:26] if 'T' in ts else ts, fmt)
+                                    time_suffix = f" @ {dt.strftime('%-I:%M %p')}"
+                                    break
+                                except ValueError:
+                                    continue
+                            if not time_suffix:
+                                # Fallback: use current time
+                                time_suffix = f" @ {datetime.now().strftime('%-I:%M %p')}"
+                        except Exception:
+                            pass
+                    
                     if "granted access" in msg_l:
-                        self._attr_native_value = f"{who} granted access"
+                        self._attr_native_value = f"{who} granted access{time_suffix}"
                     elif "denied access" in msg_l:
-                        self._attr_native_value = f"{who} denied access"
+                        self._attr_native_value = f"{who} denied access{time_suffix}"
                     else:
-                        self._attr_native_value = f"{who} " + ("granted access" if "granted" in msg_l else "denied access" if "denied" in msg_l else "event")
+                        self._attr_native_value = f"{who} " + ("granted access" if "granted" in msg_l else "denied access" if "denied" in msg_l else "event") + time_suffix
 
                 self._attrs["Reader Message"] = msg
                 self._attrs["Reader Message Time"] = ts
@@ -618,12 +825,29 @@ class ProtectorDoorLastLogSensor(SensorEntity, RestoreEntity):
             if ntype in {"ACTIONPLAN_MESSAGE", "ACTIONPLAN_STATE"}:
                 who = self._extract_name_for_action_line(msg) or (evt.get("source") or {}).get("name") or raw.get("SourceName")
                 if who:
+                    # Format time for state (e.g., "@ 1:06 AM")
+                    time_suffix = ""
+                    if ts:
+                        try:
+                            from datetime import datetime
+                            for fmt in ["%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M:%S.%f", "%B %d, %Y at %I:%M:%S %p"]:
+                                try:
+                                    dt = datetime.strptime(ts[:26] if 'T' in ts else ts, fmt)
+                                    time_suffix = f" @ {dt.strftime('%-I:%M %p')}"
+                                    break
+                                except ValueError:
+                                    continue
+                            if not time_suffix:
+                                time_suffix = f" @ {datetime.now().strftime('%-I:%M %p')}"
+                        except Exception:
+                            pass
+                    
                     if self._is_unlock_msg(msg_l):
-                        self._attr_native_value = f"{who} unlocked"
+                        self._attr_native_value = f"{who} unlocked{time_suffix}"
                     elif self._is_lock_msg(msg_l):
-                        self._attr_native_value = f"{who} locked"
+                        self._attr_native_value = f"{who} locked{time_suffix}"
                     else:
-                        self._attr_native_value = who
+                        self._attr_native_value = f"{who}{time_suffix}"
 
                 # Treat the AP line as the "Reader Message"
                 self._attrs["Reader Message"] = msg or (f"{who} action" if who else None)
@@ -638,6 +862,36 @@ class ProtectorDoorLastLogSensor(SensorEntity, RestoreEntity):
                 self.async_write_ha_state()
                 return
 
+            # --- OTR (One Time Run) events: update state + Door Message ---
+            if "one time run" in msg_l:
+                # Message like: "Door Gate Front Door One Time Run Time Zone Changed to Mode Unlock"
+                time_suffix = ""
+                if ts:
+                    try:
+                        from datetime import datetime
+                        for fmt in ["%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M:%S.%f", "%B %d, %Y at %I:%M:%S %p"]:
+                            try:
+                                dt = datetime.strptime(ts[:26] if 'T' in ts else ts, fmt)
+                                time_suffix = f" @ {dt.strftime('%-I:%M %p')}"
+                                break
+                            except ValueError:
+                                continue
+                        if not time_suffix:
+                            time_suffix = f" @ {datetime.now().strftime('%-I:%M %p')}"
+                    except Exception:
+                        pass
+                
+                # Extract mode from "Changed to Mode <Mode>"
+                mode_match = re.search(r"changed to mode\s+(\w+)", msg_l, flags=re.IGNORECASE)
+                mode_str = mode_match.group(1).title() if mode_match else "OTR"
+                
+                self._attr_native_value = f"OTR {mode_str}{time_suffix}"
+                self._attrs["Reader Message"] = msg
+                self._attrs["Reader Message Time"] = ts
+                self._attrs["Door Message"] = msg
+                self.async_write_ha_state()
+                return
+
             # Other/unknown types: store door lock text if it obviously looks like one
             if "door " in msg_l and (" unlocked" in msg_l or " locked" in msg_l):
                 self._attrs["Door Message"] = msg
@@ -648,6 +902,179 @@ class ProtectorDoorLastLogSensor(SensorEntity, RestoreEntity):
             return
 
         self._unsub = async_dispatcher_connect(self.hass, signal, _handle_log)
+
+    async def async_will_remove_from_hass(self) -> None:
+        if self._unsub:
+            self._unsub()
+            self._unsub = None
+
+
+# ------------------------
+# Temp Code sensor (per door) + RestoreEntity
+# ------------------------
+class ProtectorDoorTempCodeSensor(SensorEntity, RestoreEntity):
+    """
+    Sensor tracking temporary access codes for a door.
+    
+    State: Last created code (or "None" if no codes)
+    Attributes:
+      - active_codes: List of all active codes with names
+      - last_code_name: Name of the last created code
+      - last_code_created: Timestamp of last code creation
+    """
+
+    _attr_should_poll = False
+
+    def __init__(
+        self,
+        hass: HomeAssistant,
+        entry_id: str,
+        base_url: str,
+        door_id: int,
+        door_name: str,
+        desc: ProtectorDoorDesc,
+    ) -> None:
+        self.hass = hass
+        self._entry_id = entry_id
+        self._base_url = base_url
+        self._door_id = int(door_id)
+        self._door_name = door_name
+        self.entity_description = desc
+        host = base_url.split("://", 1)[1]
+
+        self._attr_name = f"{door_name} {desc.name or desc.key}"
+        self._attr_unique_id = f"{DOMAIN}_{host}_door_{door_id}_{desc.key}|{entry_id}"
+
+        self._attr_native_value: StateType = "None"
+
+        # Attributes for tracking codes
+        self._attrs: Dict[str, Any] = {
+            "active_codes": [],  # List of {"code_name": str, "code": str, "user_id": int}
+            "last_code_name": None,
+            "last_code_created": None,
+            "door_id": self._door_id,
+        }
+        self._unsub: Optional[Callable[[], None]] = None
+
+    @property
+    def device_info(self):
+        host = self._base_url.split("://", 1)[1]
+        return {
+            "identifiers": {(DOMAIN, f"door:{host}:{self._door_id}|{self._entry_id}")},
+            "manufacturer": "Yoel Goldstein/Vaayer LLC",
+            "model": "Protector.Net Door",
+            "name": self._door_name,
+            "configuration_url": self._base_url,
+            "via_device": (DOMAIN, f"hub:{host}|{self._entry_id}"),
+        }
+
+    @property
+    def extra_state_attributes(self) -> Dict[str, Any]:
+        return dict(self._attrs)
+
+    @property
+    def icon(self) -> str:
+        """Return an icon based on whether codes exist."""
+        if self._attrs.get("active_codes"):
+            return "mdi:key-plus"
+        return "mdi:key-outline"
+
+    async def async_added_to_hass(self) -> None:
+        await super().async_added_to_hass()
+
+        # Restore last state & attributes
+        last = await self.async_get_last_state()
+        if last:
+            if last.state not in (STATE_UNKNOWN, STATE_UNAVAILABLE, None, ""):
+                self._attr_native_value = last.state
+            la = last.attributes or {}
+            for key in ("active_codes", "last_code_name", "last_code_created", "door_id"):
+                if key in la:
+                    self._attrs[key] = la[key]
+            # Ensure door_id is correct
+            self._attrs["door_id"] = self._door_id
+            self.async_write_ha_state()
+
+        signal = f"{DISPATCH_TEMP_CODE}_{self._entry_id}"
+
+        @callback
+        def _handle_temp_code(evt: dict[str, Any]) -> None:
+            """Handle temp code create/delete events from services."""
+            if int(evt.get("door_id")) != self._door_id:
+                return
+
+            action = evt.get("action")
+            
+            if action == "create":
+                code = evt.get("code")
+                code_name = evt.get("code_name")
+                user_id = evt.get("user_id")
+                
+                # Update state to the new code
+                self._attr_native_value = code
+                
+                # Add to active codes list
+                active_codes = list(self._attrs.get("active_codes", []))
+                
+                # Add the new code
+                new_entry = {
+                    "code_name": code_name,
+                    "code": code,
+                    "user_id": user_id,
+                    "start_time": evt.get("start_time"),
+                    "end_time": evt.get("end_time"),
+                }
+                active_codes.append(new_entry)
+                
+                # Update attributes
+                self._attrs["active_codes"] = active_codes
+                self._attrs["last_code_name"] = code_name
+                self._attrs["last_code_created"] = evt.get("timestamp") or None
+                
+                _LOGGER.debug(
+                    "[%s] Door %d: Created temp code '%s': %s",
+                    self._entry_id, self._door_id, code_name, code
+                )
+                
+            elif action == "delete":
+                code = evt.get("code")
+                
+                # Remove from active codes list
+                active_codes = list(self._attrs.get("active_codes", []))
+                active_codes = [c for c in active_codes if c.get("code") != code]
+                self._attrs["active_codes"] = active_codes
+                
+                # Update state to the most recent remaining code or "None"
+                if active_codes:
+                    self._attr_native_value = active_codes[-1].get("code")
+                else:
+                    self._attr_native_value = "None"
+                
+                _LOGGER.debug(
+                    "[%s] Door %d: Deleted temp code: %s",
+                    self._entry_id, self._door_id, code
+                )
+            
+            elif action == "update":
+                update_name = evt.get("code_name")
+                active_codes = list(self._attrs.get("active_codes", []))
+                for entry in active_codes:
+                    if entry.get("code_name") == update_name:
+                        if evt.get("end_time") is not None:
+                            entry["end_time"] = evt["end_time"]
+                        if evt.get("start_time") is not None:
+                            entry["start_time"] = evt["start_time"]
+                        break
+                self._attrs["active_codes"] = active_codes
+                
+                _LOGGER.debug(
+                    "[%s] Door %d: Updated temp code '%s'",
+                    self._entry_id, self._door_id, update_name
+                )
+            
+            self.async_write_ha_state()
+
+        self._unsub = async_dispatcher_connect(self.hass, signal, _handle_temp_code)
 
     async def async_will_remove_from_hass(self) -> None:
         if self._unsub:
