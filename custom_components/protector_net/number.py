@@ -57,7 +57,7 @@ class OverrideMinutesNumber(ProtectorNetDevice, NumberEntity):
 
     _attr_has_entity_name = True
     _attr_native_min_value = 1
-    _attr_native_max_value = 480  # 8 hours cap; adjust if you prefer
+    _attr_native_max_value = 2147483647  # int32 max - Hartmann accepts very large values
     _attr_native_step = 1
     _attr_unit_of_measurement = "min"
     _attr_mode = "box"  # direct entry
