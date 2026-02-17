@@ -198,6 +198,9 @@ async def async_setup_entry(
             if "_timed_override_unlock" in selected:
                 entities.append(DoorTimedOverrideUnlockButton(hass, entry, door, host_safe, override_mins))
 
+        # ---------- Hub-level: Update Panels button ----------
+        entities.append(UpdatePanelsButton(hass, entry, host_safe))
+
         # ---------- Action Plan buttons (System clones) ----------
         if system_ids:
             try:
@@ -343,6 +346,49 @@ class DoorTimedOverrideUnlockButton(BaseDoorButton):
 # -----------------------
 # Hub-level (Action Plan) buttons
 # -----------------------
+
+class UpdatePanelsButton(ProtectorNetDevice, ButtonEntity):
+    """Button to push config to all connected panels."""
+    _attr_has_entity_name = True
+    _attr_icon = "mdi:upload-network"
+
+    def __init__(self, hass: HomeAssistant, entry: ConfigEntry, host_safe: str):
+        super().__init__(entry)
+        self.hass = hass
+        self._entry = entry
+        self._entry_id = entry.entry_id
+        self._host_safe = host_safe
+
+        entry_data = hass.data[DOMAIN][entry.entry_id]
+        self._host_key: str = entry_data.get("host") or (urlparse(entry.data["base_url"]).netloc or "")
+        self._base_url = entry.data["base_url"]
+
+        if entry_data.get("partition_name"):
+            self._partition_name: str = entry_data["partition_name"]
+        elif entry.title and "–" in entry.title:
+            self._partition_name = entry.title.split("–", 1)[1].strip()
+        else:
+            self._partition_name = str(entry_data.get("partition_id"))
+
+        self._attr_name = "Update Panels"
+        self._attr_unique_id = f"protector_net_{self._host_safe}_{self._entry_id}_update_panels"
+
+    @property
+    def device_info(self):
+        return {
+            "identifiers": {(DOMAIN, f"hub:{self._base_url.split('://',1)[1]}|{self._entry_id}")},
+            "manufacturer": "Yoel Goldstein/Vaayer LLC",
+            "model": "Protector.Net Hub",
+            "name": f"Hub Status – {self._partition_name}",
+            "configuration_url": self._base_url,
+        }
+
+    async def async_press(self) -> None:
+        result = await api.update_panels(self.hass, self._entry_id)
+        if not result.get("success"):
+            _LOGGER.error("[%s] Failed to update panels: %s", self._entry_id, result.get("error"))
+
+
 class ActionPlanButton(ProtectorNetDevice, ButtonEntity):
     _attr_has_entity_name = True
 
