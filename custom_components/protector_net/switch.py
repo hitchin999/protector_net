@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
+from datetime import datetime as dt_datetime
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlparse
 
@@ -11,6 +13,7 @@ from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.dispatcher import async_dispatcher_connect, async_dispatcher_send
 from homeassistant.helpers import entity_registry as er
+from homeassistant.util import dt as dt_util
 
 from .device import ProtectorNetDevice
 from . import api
@@ -161,6 +164,29 @@ class OverrideSwitch(ProtectorNetDevice, SwitchEntity):
                 _LOGGER.error("[%s] Door %s: Invalid type/mode -> %r / %r", self._entry_id, self._door_id, type_label, mode_label)
                 self._set_local_active(False)
                 return
+
+            # --- Override Until datetime support ---
+            # When type is "For Specified Time", prefer the datetime picker
+            # value over raw minutes (auto-compute the delta).
+            if type_token == "Time":
+                override_until: dt_datetime | None = self._ui.get("override_until")
+                if override_until is not None:
+                    now = dt_util.now()
+                    # Ensure both are tz-aware for comparison
+                    if override_until.tzinfo is None:
+                        override_until = dt_util.as_local(override_until)
+                    delta = (override_until - now).total_seconds()
+                    if delta > 0:
+                        minutes = max(1, math.ceil(delta / 60))
+                        _LOGGER.debug(
+                            "[%s] Door %s: Using Override Until %s -> %d minutes",
+                            self._entry_id, self._door_id, override_until.isoformat(), minutes,
+                        )
+                    else:
+                        _LOGGER.warning(
+                            "[%s] Door %s: Override Until %s is in the past; falling back to %d minutes",
+                            self._entry_id, self._door_id, override_until.isoformat(), minutes,
+                        )
 
             minutes_arg = minutes if type_token == "Time" else None
 
