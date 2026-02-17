@@ -19,7 +19,7 @@ _LOGGER = logging.getLogger(DOMAIN)
 
 # Platforms we expose
 # (Old per-action buttons are going away except Pulse Unlock; new controls live in select/number/switch.)
-PLATFORMS: list[str] = ["button", "sensor", "select", "number", "switch"]
+PLATFORMS: list[str] = ["button", "sensor", "select", "number", "switch", "datetime"]
 
 
 async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
