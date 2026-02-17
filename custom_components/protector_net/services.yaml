@@ -303,6 +303,13 @@ override_door:
           max: 1440
           mode: box
           unit_of_measurement: minutes
+    until:
+      name: Until
+      description: Override until this date/time (auto-computes minutes, sets type to "For Specified Time"). Takes precedence over minutes if both are provided.
+      required: false
+      example: "2026-02-18T14:00:00"
+      selector:
+        datetime:
 
 resume_door:
   name: Resume Door
