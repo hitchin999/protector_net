@@ -12,6 +12,7 @@ KEY_PLAN_IDS = "plan_ids"
 DEFAULT_OVERRIDE_MINUTES = 5
 DEFAULT_OVERRIDE_TYPE = "For Specified Time"
 DEFAULT_OVERRIDE_MODE = "Card"  # used only when an override is active
+DEFAULT_PIN_DIGITS = 4  # Most PIN/prox readers default to 4 digits
 
 # --- Override Type / Mode options shown in the selects -----------------------
 
