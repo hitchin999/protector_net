@@ -1,0 +1,319 @@
+# services.yaml for Protector.Net / Hartmann Control
+
+create_temp_code:
+  name: Create Temp Code
+  description: Create a temporary PIN code for door access. Creates a user in Hartmann with PIN-only credential.
+  fields:
+    door_device_id:
+      name: Door(s)
+      description: The door(s) to create the code for
+      required: true
+      selector:
+        device:
+          multiple: true
+          filter:
+            - integration: protector_net
+    code_name:
+      name: Code Name
+      description: A friendly name for this code (e.g., "Guest Room 101", "Airbnb John Smith")
+      required: true
+      example: "Guest Booking 12345"
+      selector:
+        text:
+    random_code:
+      name: Random Code
+      description: Generate a random code (if unchecked, you must provide a manual code)
+      required: false
+      default: true
+      selector:
+        boolean:
+    code_digits:
+      name: Code Digits
+      description: Number of digits for the random code (4-9). Defaults to the value configured in integration options.
+      required: false
+      selector:
+        number:
+          min: 4
+          max: 9
+          mode: box
+    manual_code:
+      name: Manual Code
+      description: Manually specify the PIN code (only used if Random Code is unchecked)
+      required: false
+      example: "123456"
+      selector:
+        text:
+    start_time:
+      name: Start Time
+      description: When the code becomes active (ISO datetime). If not set, code is active immediately.
+      required: false
+      example: "2026-02-15T14:00:00"
+      selector:
+        datetime:
+    end_time:
+      name: End Time
+      description: When the code expires (ISO datetime). If not set, code never expires.
+      required: false
+      example: "2026-02-17T11:00:00"
+      selector:
+        datetime:
+
+delete_temp_code:
+  name: Delete Temp Code
+  description: Delete a temporary PIN code from door(s). Removes the user from Hartmann.
+  fields:
+    door_device_id:
+      name: Door(s)
+      description: The door(s) to delete the code from
+      required: true
+      selector:
+        device:
+          multiple: true
+          filter:
+            - integration: protector_net
+    code:
+      name: Code
+      description: The PIN code to delete
+      required: true
+      example: "123456"
+      selector:
+        text:
+
+delete_temp_code_by_name:
+  name: Delete Temp Code by Name
+  description: Delete a temporary PIN code by its name (useful for calendar-based automations where you know the booking name but not the code)
+  fields:
+    door_device_id:
+      name: Door(s)
+      description: The door(s) to delete the code from
+      required: true
+      selector:
+        device:
+          multiple: true
+          filter:
+            - integration: protector_net
+    code_name:
+      name: Code Name
+      description: The name of the code to delete (must match exactly what was used when creating)
+      required: true
+      example: "John Smith - Room 101"
+      selector:
+        text:
+    force_remove:
+      name: Force Remove
+      description: Remove from sensor even if Hartmann deletion fails (useful for cleaning stale entries)
+      required: false
+      default: false
+      selector:
+        boolean:
+
+clear_all_temp_codes:
+  name: Clear All Temp Codes
+  description: Remove all temporary codes from door(s). Attempts to delete from Hartmann and always clears the sensor.
+  fields:
+    door_device_id:
+      name: Door(s)
+      description: The door(s) to clear all codes from
+      required: true
+      selector:
+        device:
+          multiple: true
+          filter:
+            - integration: protector_net
+
+update_temp_code:
+  name: Update Temp Code
+  description: Update the start/end time of an existing temporary code without changing the PIN. Useful for extending guest stays.
+  fields:
+    door_device_id:
+      name: Door(s)
+      description: The door(s) the code belongs to
+      required: true
+      selector:
+        device:
+          multiple: true
+          filter:
+            - integration: protector_net
+    code_name:
+      name: Code Name
+      description: The name of the code to update (must match exactly)
+      required: true
+      selector:
+        text:
+    start_time:
+      name: Start Time
+      description: New start time (ISO datetime). Leave empty to keep current.
+      required: false
+      selector:
+        datetime:
+    end_time:
+      name: End Time
+      description: New end time (ISO datetime). Leave empty to keep current.
+      required: false
+      selector:
+        datetime:
+
+update_panels:
+  name: Update Panels
+  description: Push current configuration to all connected panels. Use after creating/updating temp codes or OTR schedules for immediate effect.
+
+create_otr_schedule:
+  name: Create OTR Schedule
+  description: Schedule a future door override (unlock, lockdown, etc.) using Hartmann's OneTimeRun feature. The override is stored in the panel and executes even if Home Assistant is offline.
+  fields:
+    door_device_id:
+      name: Door(s)
+      description: The door(s) to schedule the override for
+      required: true
+      selector:
+        device:
+          multiple: true
+          filter:
+            - integration: protector_net
+    start_time:
+      name: Start Time
+      description: When the override should start (ISO datetime, e.g. "2026-02-10T09:00:00")
+      required: true
+      example: "2026-02-10T09:00:00"
+      selector:
+        datetime:
+    stop_time:
+      name: Stop Time
+      description: When the override should end (ISO datetime, e.g. "2026-02-10T14:00:00")
+      required: true
+      example: "2026-02-10T14:00:00"
+      selector:
+        datetime:
+    mode:
+      name: Mode
+      description: Door mode during the scheduled period
+      required: false
+      default: "Unlock"
+      selector:
+        select:
+          options:
+            - "Unlock"
+            - "Lockdown"
+            - "Card"
+            - "Pin"
+            - "CardOrPin"
+            - "CardAndPin"
+            - "UnlockWithFirstCardIn"
+            - "DualCard"
+    name:
+      name: Schedule Name
+      description: Optional name for this schedule (auto-generated if not provided)
+      required: false
+      example: "Morning Unlock"
+      selector:
+        text:
+    description:
+      name: Description
+      description: Optional description for this schedule
+      required: false
+      selector:
+        text:
+
+delete_otr_schedule:
+  name: Delete OTR Schedule
+  description: Delete OTR schedules. Pick a door to delete ALL its OTR schedules, or provide a specific schedule ID.
+  fields:
+    door_device_id:
+      name: Door
+      description: The door whose OTR schedules should be deleted. If no schedule_id is given, ALL OTR schedules for this door are removed.
+      required: false
+      selector:
+        device:
+          multiple: true
+          filter:
+            - integration: protector_net
+    schedule_id:
+      name: Schedule ID
+      description: Optional specific schedule ID to delete. If omitted, all OTR schedules for the selected door are deleted.
+      required: false
+      selector:
+        number:
+          min: 1
+          mode: box
+
+get_otr_schedules:
+  name: Get OTR Schedules
+  description: Get a list of all OTR (One Time Run) schedules
+  fields:
+    door_device_id:
+      name: Door
+      description: Optional door to filter results or identify integration instance
+      required: false
+      selector:
+        device:
+          multiple: true
+          filter:
+            - integration: protector_net
+
+override_door:
+  name: Override Door
+  description: Apply an override to door(s) (unlock, lockdown, etc.). Single service call instead of setting mode + turning on override switch.
+  fields:
+    door_device_id:
+      name: Door(s)
+      description: The door(s) to override
+      required: true
+      selector:
+        device:
+          multiple: true
+          filter:
+            - integration: protector_net
+    mode:
+      name: Mode
+      description: Door mode during override
+      required: false
+      default: "Unlock"
+      selector:
+        select:
+          options:
+            - "Unlock"
+            - "Lockdown"
+            - "Card"
+            - "Pin"
+            - "CardOrPin"
+            - "CardAndPin"
+            - "FirstCredentialIn"
+            - "DualCredential"
+    override_type:
+      name: Override Type
+      description: How long the override should last
+      required: false
+      default: "until_resumed"
+      selector:
+        select:
+          options:
+            - label: "Until Resumed"
+              value: "until_resumed"
+            - label: "For Specified Time"
+              value: "for_time"
+            - label: "Until Next Schedule"
+              value: "until_schedule"
+    minutes:
+      name: Minutes
+      description: Duration in minutes (only used when Override Type is "For Specified Time")
+      required: false
+      selector:
+        number:
+          min: 1
+          max: 1440
+          mode: box
+          unit_of_measurement: minutes
+
+resume_door:
+  name: Resume Door
+  description: Resume normal schedule for door(s) (turn off any active override)
+  fields:
+    door_device_id:
+      name: Door(s)
+      description: The door(s) to resume
+      required: true
+      selector:
+        device:
+          multiple: true
+          filter:
+            - integration: protector_net
