@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlparse
 
@@ -249,6 +250,12 @@ class OverrideTypeSelect(_DoorEntityBase, SelectEntity):
 
 # ───────────────────────── Mode select ─────────────────────────
 
+# Grace period (seconds) after user picks a mode before WS sync can
+# snap it back to "None".  Gives the user time to configure mode and
+# then flip the Override switch.
+_MODE_SELECT_GRACE_SECONDS = 15
+
+
 class OverrideModeSelect(_DoorEntityBase, SelectEntity):
     _attr_has_entity_name = True
 
@@ -259,6 +266,7 @@ class OverrideModeSelect(_DoorEntityBase, SelectEntity):
         self._attr_unique_id = f"protector_net_{host_safe}_{self._entry_id}_{self.door_id}_override_mode"
         self._attr_options = list(OVERRIDE_MODE_OPTIONS)
         self._attr_current_option = "None"
+        self._pending_until: float = 0  # monotonic deadline for grace period
 
     @property
     def device_class(self) -> Optional[str]:
@@ -291,8 +299,12 @@ class OverrideModeSelect(_DoorEntityBase, SelectEntity):
         return None
 
     def _desired_option(self) -> str:
-        # OFF -> "None"
+        # OFF -> normally "None", but honour grace period so the user's
+        # pending selection isn't immediately overwritten by WS sync.
         if not self._ui.get("active"):
+            pending = self._ui.get("mode_selected")
+            if pending and pending != "None" and time.monotonic() < self._pending_until:
+                return pending
             return "None"
         # ON -> mirror reader mode, but normalize to one of our options
         rm = self._ui.get("reader_mode")
@@ -300,6 +312,9 @@ class OverrideModeSelect(_DoorEntityBase, SelectEntity):
         return mapped or "None"
 
     def _after_ws_bucket_update(self) -> None:
+        # Clear grace period once the override is actually active
+        if self._ui.get("active"):
+            self._pending_until = 0
         desired = self._desired_option()
         if self._attr_current_option != desired:
             _LOGGER.debug(
@@ -314,7 +329,16 @@ class OverrideModeSelect(_DoorEntityBase, SelectEntity):
         if option not in self._attr_options:
             raise ValueError(f"Invalid override mode: {option}")
 
-        # This sets the *desired* mode for next ON. Display still mirrors reader_mode when ON.
+        # This sets the *desired* mode for next ON.
         self._ui["mode_selected"] = option if option != "None" else "None"
-        # Recompute display (will be None if OFF, or mirror reader if ON)
-        self._after_ws_bucket_update()
+
+        # Start grace period so WS/sensor sync won't snap back to "None"
+        # while the user is still configuring before toggling the switch.
+        if option != "None":
+            self._pending_until = time.monotonic() + _MODE_SELECT_GRACE_SECONDS
+        else:
+            self._pending_until = 0
+
+        # Show the user's selection immediately
+        self._attr_current_option = option
+        self.async_write_ha_state()
