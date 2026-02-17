@@ -6,7 +6,7 @@ from urllib.parse import urlparse, urlsplit
 from homeassistant import config_entries
 from homeassistant.helpers import config_validation as cv
 
-from .const import DOMAIN, DEFAULT_OVERRIDE_MINUTES, KEY_PLAN_IDS
+from .const import DOMAIN, DEFAULT_OVERRIDE_MINUTES, DEFAULT_PIN_DIGITS, KEY_PLAN_IDS
 from . import api
 
 _LOGGER = logging.getLogger(__name__)
@@ -31,6 +31,7 @@ class ProtectorNetConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         self._username = None
         self._password = None
         self._override_mins = None
+        self._pin_digits = None
         self._session_cookie = None
         self._partitions = {}
         self._plans = {}
@@ -46,6 +47,7 @@ class ProtectorNetConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             vol.Required("username"): str,
             vol.Required("password"): str,
             vol.Optional("override_minutes", default=DEFAULT_OVERRIDE_MINUTES): int,
+            vol.Optional("pin_digits", default=DEFAULT_PIN_DIGITS): int,
         })
 
         if user_input:
@@ -54,6 +56,7 @@ class ProtectorNetConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             self._username      = user_input["username"]
             self._password      = user_input["password"]
             self._override_mins = user_input["override_minutes"]
+            self._pin_digits    = user_input.get("pin_digits", DEFAULT_PIN_DIGITS)
 
             try:
                 self._session_cookie = await api.login(
@@ -108,7 +111,8 @@ class ProtectorNetConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 "partition_id":   partition_id,
             }
             self.context["entry_options"] = {
-                "override_minutes": self._override_mins
+                "override_minutes": self._override_mins,
+                "pin_digits": self._pin_digits,
             }
 
             return await self.async_step_plans()
@@ -216,7 +220,8 @@ class ProtectorNetConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 vol.Required("entities", default=[]): cv.multi_select(ENTITY_CHOICES_OPTIONAL),
             }),
             description_placeholders={
-                "info": "Select any additional legacy door buttons you want. "
+                "info": "⚠️ These legacy button entities are optional and only needed for backwards compatibility. "
+                        "You can leave this empty - the new Override switch/selects provide the same functionality. "
                         "Pulse Unlock is always added automatically."
             },
         )
@@ -254,6 +259,10 @@ class ProtectorNetOptionsFlow(config_entries.OptionsFlow):
         default_override = self.entry.options.get(
             "override_minutes", DEFAULT_OVERRIDE_MINUTES
         )
+        
+        default_pin_digits = self.entry.options.get(
+            "pin_digits", DEFAULT_PIN_DIGITS
+        )
 
         saved_entities = self.entry.options.get(
             "entities", self.entry.data.get("entities", [])
@@ -274,13 +283,14 @@ class ProtectorNetOptionsFlow(config_entries.OptionsFlow):
             step_id="init",
             data_schema=vol.Schema({
                 vol.Optional("override_minutes", default=default_override): int,
+                vol.Optional("pin_digits", default=default_pin_digits): int,
                 vol.Required("entities", default=default_entities_optional):
                     cv.multi_select(ENTITY_CHOICES_OPTIONAL),
                 vol.Required(KEY_PLAN_IDS, default=default_plans):
                     cv.multi_select(self._plan_choices),
             }),
             description_placeholders={
-                "info": "Adjust Action Plan buttons and override duration. "
+                "info": "Adjust Action Plan buttons, override duration, and temp code settings. "
                         "Pulse Unlock is always included automatically."
             },
         )
