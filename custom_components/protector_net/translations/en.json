@@ -7,7 +7,8 @@
           "base_url":         "Protector.Net URL",
           "username":         "Protector.Net Username (With System Admin Rights)",
           "password":         "Protector.Net Password",
-          "override_minutes": "Default Override Minutes"
+          "override_minutes": "Default Override Minutes",
+          "pin_digits":       "Default PIN Code Digits (4-9)"
         }
       },
       "partition": {
@@ -23,9 +24,10 @@
         }
       },
       "entity_selection": {
-        "title": "Door Entities",
+        "title": "Door Entities (Optional)",
+        "description": "These legacy button entities are optional and only needed for backwards compatibility. You can leave this empty.",
         "data": {
-          "entities": "Select What Door Entities to Enable"
+          "entities": "Select What Door Entities to Enable (Leave Empty If Not Needed)"
         }
       }
     }
@@ -36,8 +38,105 @@
         "title": "Protector.Net Options",
         "data": {
           "override_minutes": "Default Override Minutes",
+          "pin_digits":       "Default PIN Code Digits (4-9)",
           "entities":         "Select Door Entities to Enable",
           "plan_ids":         "Select Action Plans to Enable (If There Is Any)"
+        }
+      }
+    }
+  },
+  "services": {
+    "create_temp_code": {
+      "name": "Create Temp Code",
+      "description": "Create a temporary PIN code for door access",
+      "fields": {
+        "door_device_id": {
+          "name": "Door(s)",
+          "description": "The door(s) to create the code for"
+        },
+        "code_name": {
+          "name": "Code Name",
+          "description": "A friendly name for this code (e.g., 'Guest Room 101')"
+        },
+        "random_code": {
+          "name": "Random Code",
+          "description": "Generate a random code"
+        },
+        "code_digits": {
+          "name": "Code Digits",
+          "description": "Number of digits for the random code (4-9)"
+        },
+        "manual_code": {
+          "name": "Manual Code",
+          "description": "Manually specify the PIN code"
+        },
+        "start_time": {
+          "name": "Start Time",
+          "description": "When the code becomes active (ISO datetime)"
+        },
+        "end_time": {
+          "name": "End Time",
+          "description": "When the code expires (ISO datetime)"
+        }
+      }
+    },
+    "delete_temp_code": {
+      "name": "Delete Temp Code",
+      "description": "Delete a temporary PIN code from door(s)",
+      "fields": {
+        "door_device_id": {
+          "name": "Door(s)",
+          "description": "The door(s) to delete the code from"
+        },
+        "code": {
+          "name": "Code",
+          "description": "The PIN code to delete"
+        }
+      }
+    },
+    "delete_temp_code_by_name": {
+      "name": "Delete Temp Code by Name",
+      "description": "Delete a temporary PIN code by its name (for calendar-based automations)",
+      "fields": {
+        "door_device_id": {
+          "name": "Door(s)",
+          "description": "The door(s) to delete the code from"
+        },
+        "code_name": {
+          "name": "Code Name",
+          "description": "The name of the code to delete (must match exactly)"
+        }
+      }
+    },
+    "override_door": {
+      "name": "Override Door",
+      "description": "Apply an override to door(s) (unlock, lockdown, etc.)",
+      "fields": {
+        "door_device_id": {
+          "name": "Door(s)",
+          "description": "The door(s) to override"
+        },
+        "mode": {
+          "name": "Mode",
+          "description": "Door mode during override"
+        },
+        "override_type": {
+          "name": "Override Type",
+          "description": "How long the override should last"
+        },
+        "minutes": {
+          "name": "Minutes",
+          "description": "Duration in minutes (for timed override)"
+        }
+      }
+    },
+    "resume_door": {
+      "name": "Resume Door",
+      "description": "Resume normal schedule for door(s)",
+      "fields": {
+        "door_device_id": {
+          "name": "Door(s)",
+          "description": "The door(s) to resume"
         }
       }
     }
