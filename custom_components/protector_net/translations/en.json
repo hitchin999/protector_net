@@ -127,6 +127,10 @@
         "minutes": {
           "name": "Minutes",
           "description": "Duration in minutes (for timed override)"
+        },
+        "until": {
+          "name": "Until",
+          "description": "Override until this date/time (auto-computes minutes)"
         }
       }
     },
