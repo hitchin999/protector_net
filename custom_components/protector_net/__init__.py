@@ -13,6 +13,7 @@ from homeassistant.helpers.typing import ConfigType
 from .const import DOMAIN, UI_STATE
 from .ws import SignalRClient
 from . import api
+from .services import async_setup_services, async_unload_services
 
 _LOGGER = logging.getLogger(DOMAIN)
 
@@ -24,6 +25,10 @@ PLATFORMS: list[str] = ["button", "sensor", "select", "number", "switch"]
 async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
     """Set up the integration (domain) once."""
     hass.data.setdefault(DOMAIN, {})
+    
+    # Register services (only once per domain)
+    await async_setup_services(hass)
+    
     _LOGGER.debug("async_setup for %s initialized", DOMAIN)
     return True
 
