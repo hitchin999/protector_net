@@ -103,7 +103,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     # If HA already running (entry added later), start immediately; otherwise wait for STARTED.
     if hass.is_running:
-        hass.async_create_task(_deferred_start())
+        await _deferred_start()
     else:
         entry.async_on_unload(
             hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STARTED, _deferred_start)
@@ -133,3 +133,4 @@ async def _async_update_listener(hass: HomeAssistant, entry: ConfigEntry) -> Non
     """Handle options updates by reloading the entry."""
     _LOGGER.debug("[%s] Options updated; reloading entry", entry.entry_id)
     await hass.config_entries.async_reload(entry.entry_id)
+
