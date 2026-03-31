@@ -13,6 +13,7 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.dispatcher import async_dispatcher_connect
 from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.event import async_track_state_change_event
+from homeassistant.helpers.restore_state import RestoreEntity
 
 from .const import (
     DOMAIN,
@@ -219,7 +220,7 @@ class _DoorEntityBase(ProtectorNetDevice):
 
 # ───────────────────────── Type select ─────────────────────────
 
-class OverrideTypeSelect(_DoorEntityBase, SelectEntity):
+class OverrideTypeSelect(_DoorEntityBase, SelectEntity, RestoreEntity):
     _attr_has_entity_name = True
 
     def __init__(self, hass: HomeAssistant, entry: ConfigEntry, door: dict):
@@ -229,6 +230,15 @@ class OverrideTypeSelect(_DoorEntityBase, SelectEntity):
         self._attr_unique_id = f"protector_net_{host_safe}_{self._entry_id}_{self.door_id}_override_type"
         self._attr_options = list(OVERRIDE_TYPE_OPTIONS)
         self._attr_current_option = self._ui.get("type", DEFAULT_OVERRIDE_TYPE)
+
+    async def async_added_to_hass(self) -> None:
+        # Restore last known override type before WS listeners start
+        last = await self.async_get_last_state()
+        if last and last.state in OVERRIDE_TYPE_OPTIONS:
+            self._attr_current_option = last.state
+            self._ui["type"] = last.state
+
+        await super().async_added_to_hass()
 
     @property
     def device_class(self) -> Optional[str]:
