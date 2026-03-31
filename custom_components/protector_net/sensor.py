@@ -60,12 +60,14 @@ READER_MODE_OPTIONS = [
 def _iter_doors_from_overview(
     overview: dict[str, Any],
     *,
+    allowed_door_ids: Optional[set[int]] = None,
     site_name_contains: Optional[str] = None,
     status_roots: Optional[List[str]] = None,
 ) -> List[Tuple[int, str, str, str]]:
     """
     Return list of (door_id, door_name, status_id_key, site_name) from System Overview tree,
     filtered by:
+      - allowed_door_ids: if set, door Id must be in this set (partition-scoped, from API)
       - site_name_contains: door must be under a top-level Site whose Name contains this text
       - status_roots: door StatusId must start with one of these roots (controller ids)
     """
@@ -78,7 +80,9 @@ def _iter_doors_from_overview(
         if roots:
             roots = [r.split("::", 1)[0] for r in roots]
 
-    def door_allowed(door_status_id: str, site_name: Optional[str]) -> bool:
+    def door_allowed(door_id: int, door_status_id: str, site_name: Optional[str]) -> bool:
+        if allowed_door_ids is not None and door_id not in allowed_door_ids:
+            return False
         if site_match:
             if not site_name or site_match not in site_name.lower():
                 return False
@@ -98,7 +102,7 @@ def _iter_doors_from_overview(
                 name = sub.get("Name")
                 sid = sub.get("StatusId")
                 if isinstance(did, int) and sid and name:
-                    if door_allowed(str(sid), current_site_name):
+                    if door_allowed(did, str(sid), current_site_name):
                         out.append((did, str(name), str(sid), current_site_name or ""))
             else:
                 walk(sub, current_site_name)
@@ -182,7 +186,23 @@ async def async_setup_entry(
             _LOGGER.error("[%s] Failed to fetch system overview for sensors: %s", entry.entry_id, e)
             return
 
-        # Pull optional filters
+        # ---- Primary filter: partition-scoped door IDs from API (same as WS client) ----
+        allowed_door_ids: Optional[set[int]] = None
+        try:
+            partition_doors = await api.get_all_doors(hass, entry.entry_id)
+            if partition_doors:
+                allowed_door_ids = {int(d["Id"]) for d in partition_doors if "Id" in d}
+                _LOGGER.debug(
+                    "[%s] Partition door allowlist: %d doors",
+                    entry.entry_id, len(allowed_door_ids),
+                )
+        except Exception as e:
+            _LOGGER.warning(
+                "[%s] Could not fetch partition doors; falling back to site-name filter: %s",
+                entry.entry_id, e,
+            )
+
+        # ---- Optional explicit filters (from options / cfg) ----
         opt = entry.options or {}
         site_name_contains: Optional[str] = opt.get("site_name_contains") or cfg.get("site_name_contains")
         raw_roots = opt.get("status_roots") or cfg.get("status_roots")
@@ -194,8 +214,8 @@ async def async_setup_entry(
         else:
             status_roots = None
 
-        # Derive site filter from title if not explicitly set
-        if not site_name_contains:
+        # Only derive site filter from title when we have no partition allowlist
+        if not site_name_contains and allowed_door_ids is None:
             if "–" in (entry.title or ""):
                 site_name_contains = (entry.title or "").split("–", 1)[1].strip()
             elif "-" in (entry.title or ""):
@@ -209,12 +229,15 @@ async def async_setup_entry(
 
         doors = _iter_doors_from_overview(
             overview,
+            allowed_door_ids=allowed_door_ids,
             site_name_contains=site_name_contains,
             status_roots=status_roots,
         )
         _LOGGER.debug(
-            "[%s] Doors after filter (site=%r, roots=%r): %d",
-            entry.entry_id, site_name_contains, status_roots, len(doors)
+            "[%s] Doors after filter (allowed_ids=%s, site=%r, roots=%r): %d",
+            entry.entry_id,
+            len(allowed_door_ids) if allowed_door_ids is not None else "None",
+            site_name_contains, status_roots, len(doors),
         )
 
         if not doors:
