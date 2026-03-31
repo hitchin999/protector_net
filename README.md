@@ -10,6 +10,16 @@ This custom integration controls **Hartmann Controls Protector.Net _and_ Odyssey
 
 ---
 
+## What’s new in 0.2.3
+
+### Fix: Door sensors missing on some Odyssey servers
+On certain Hartmann systems, the overview tree’s site names didn’t match the partition name, causing door discovery to silently find zero doors — only the Hub Status sensor would appear. Discovery now uses the partition’s own door list from the API (the same reliable source the websocket client already uses), with the old site-name filter as a fallback.
+
+### Fix: Override Type resets after restart
+The Override Type select (“Until Resumed”, “For Specified Time”, etc.) used to reset to “For Specified Time” every time Home Assistant restarted, because the Hartmann API doesn’t expose the current override type. The select now persists its value across restarts.
+
+---
+
 ## What’s new in 0.2.2
 
 ### Temporary Access Codes
@@ -287,12 +297,22 @@ Lock/Unlock **status** messages don’t flip the “by” state (that’s what *
 
 ## Troubleshooting
 
+* **Door sensors missing (only Hub Status appears)**
+  If you see “No doors matched filters” in the logs, update to **0.2.3**. Older versions relied on site-name matching which fails on some Odyssey servers. The fix uses partition-scoped door discovery instead.
+
+* **Override Type resets to “For Specified Time” after restart**
+  Update to **0.2.3**; the Override Type select now persists across restarts.
+
 * **Sensors didn’t appear previously for “Default Partition”**
   Update to **0.1.7**; discovery now correctly loads those doors.
 
 ---
 
 ## Changelog
+
+### 0.2.3
+* Fix: **Door sensors missing on some Odyssey servers** — discovery now uses the partition’s API door list instead of fragile site-name matching
+* Fix: **Override Type select** now persists across restarts via RestoreEntity
 
 ### 0.2.2
 * New: **Temporary access codes** — `create_temp_code`, `update_temp_code`, `delete_temp_code`, `delete_temp_code_by_name`, `clear_all_temp_codes`
