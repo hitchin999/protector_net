@@ -11,6 +11,7 @@ from typing import Any, Dict, Optional, Tuple, List, Set
 
 from aiohttp import ClientError, ClientSession, TCPConnector, WSMsgType
 from homeassistant.core import HomeAssistant, callback
+from homeassistant.const import EVENT_HOMEASSISTANT_STOP
 from homeassistant.helpers.dispatcher import async_dispatcher_send
 
 try:
@@ -85,6 +86,7 @@ class SignalRClient:
         # --- Odyssey capability detection + sync task handle ---
         self._supports_status_snapshot: Optional[bool] = None
         self._sync_task: Optional[asyncio.Task] = None
+        self._unsub_stop: Optional[Any] = None
 
     # Public -----------------------------------------------------------------
 
@@ -95,9 +97,23 @@ class SignalRClient:
         self._stop.clear()
         self._task = self.hass.async_create_task(self._runner())
 
+        # Ensure clean shutdown: stop WS when HA is stopping so tasks
+        # don't survive past the "final writes" stage.
+        if self._unsub_stop is None:
+            async def _on_ha_stop(_event) -> None:
+                await self.async_stop()
+            self._unsub_stop = self.hass.bus.async_listen_once(
+                EVENT_HOMEASSISTANT_STOP, _on_ha_stop
+            )
+
     async def async_stop(self) -> None:
         """Stop the WS client quickly and deterministically so HA can reload."""
         self._stop.set()
+
+        # Unsubscribe HA stop listener (avoid double-fire on reload vs shutdown)
+        if self._unsub_stop:
+            self._unsub_stop()
+            self._unsub_stop = None
 
         # Cancel periodic sync loop if running
         if self._sync_task and not self._sync_task.done():
@@ -307,13 +323,31 @@ class SignalRClient:
                 ctrls.add(root)
         return sorted(ctrls)
 
-    async def _negotiate(self, session: ClientSession, base: str, cookie: str) -> str:
+    async def _negotiate(self, session: ClientSession, base: str, cookie: str) -> tuple[str, str]:
+        """Negotiate a SignalR connection token; re-auth on 401.
+
+        Returns (connection_token, cookie_header) — cookie may be refreshed.
+        """
+        from . import api
+
         url = f"{base}/rt/notificationHub/negotiate?negotiateVersion=1"
         headers = {"Cookie": cookie, "Content-Type": "text/plain"}
         async with session.post(url, headers=headers, data=b"") as resp:
+            if resp.status == 401:
+                _LOGGER.debug("[%s] Negotiate got 401; re-authenticating", self.entry_id)
+                cfg = self.hass.data[DOMAIN][self.entry_id]
+                new_cookie = await api.login(
+                    self.hass, cfg["base_url"], cfg["username"], cfg["password"],
+                )
+                cfg["session_cookie"] = new_cookie
+                cookie = f"ss-id={new_cookie}"
+                async with session.post(url, headers={"Cookie": cookie, "Content-Type": "text/plain"}, data=b"") as resp2:
+                    resp2.raise_for_status()
+                    data = await resp2.json()
+                    return data["connectionToken"], cookie
             resp.raise_for_status()
             data = await resp.json()
-            return data["connectionToken"]
+            return data["connectionToken"], cookie
 
     async def _send_invocation(self, ws, target: str, args: list[Any], inv_id: str) -> None:
         frame = {
@@ -547,7 +581,6 @@ class SignalRClient:
         """Main websocket loop."""
         cfg = self.hass.data[DOMAIN][self.entry_id]
         base: str = cfg["base_url"]
-        cookie: str = f"ss-id={cfg['session_cookie']}"
         verify_ssl: bool = bool(cfg.get("verify_ssl", False))
         
         # 👇 capture partition from the entry config (what you selected in config_flow)
@@ -570,11 +603,16 @@ class SignalRClient:
             async with ClientSession(connector=connector, trust_env=False) as session:
                 self._session = session
                 while not self._stop.is_set():
+                    # Read cookie fresh each iteration — _request_with_reauth
+                    # (called by _build_door_map) may have refreshed it after a 401.
+                    cookie = f"ss-id={cfg['session_cookie']}"
                     try:
                         await self._build_door_map()
+                        # Re-read cookie after _build_door_map in case it triggered re-auth
+                        cookie = f"ss-id={cfg['session_cookie']}"
                         await self._detect_odyssey_status_support()
 
-                        token = await self._negotiate(session, base, cookie)
+                        token, cookie = await self._negotiate(session, base, cookie)
                         self.connection_token = token
                         scheme = "wss" if base.startswith("https") else "ws"
                         self.ws_url = f"{scheme}://{base.split('://',1)[1]}/rt/notificationHub?id={token}"
