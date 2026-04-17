@@ -14,6 +14,7 @@ from homeassistant.helpers.dispatcher import async_dispatcher_connect
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.typing import StateType
 from homeassistant.helpers.restore_state import RestoreEntity
+from homeassistant.util import dt as dt_util
 
 from .const import DOMAIN
 from .services import DISPATCH_TEMP_CODE, DISPATCH_OTR
@@ -24,6 +25,25 @@ _LOGGER = logging.getLogger(f"{DOMAIN}.sensor")
 DISPATCH_DOOR = f"{DOMAIN}_door_event"
 DISPATCH_HUB = f"{DOMAIN}_hub_event"
 DISPATCH_LOG = f"{DOMAIN}_door_log"  # Last Door Log updates
+
+_TS_FORMATS = ["%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M:%S.%f", "%B %d, %Y at %I:%M:%S %p"]
+
+def _format_event_time(ts: str | None) -> str:
+    """Parse a Hartmann UTC timestamp and return ' @ H:MM AM/PM' in local time."""
+    if not ts:
+        return ""
+    from datetime import datetime
+    for fmt in _TS_FORMATS:
+        try:
+            dt = datetime.strptime(ts[:26] if "T" in ts else ts, fmt)
+            # Hartmann sends UTC; convert to HA's local timezone
+            dt_utc = dt.replace(tzinfo=dt_util.UTC)
+            dt_local = dt_util.as_local(dt_utc)
+            return f" @ {dt_local.strftime('%-I:%M %p')}"
+        except ValueError:
+            continue
+    # Fallback: use current local time
+    return f" @ {dt_util.now().strftime('%-I:%M %p')}"
 
 # Reader-mode mapping (full)
 MODE_MAP = {
@@ -813,24 +833,7 @@ class ProtectorDoorLastLogSensor(SensorEntity, RestoreEntity):
             if ntype in {"READER_ACCESS_GRANTED", "READER_ACCESS_DENIED", "USER_ACCESS_GRANTED", "USER_ACCESS_DENIED"}:
                 who = self._extract_name_for_reader_line(msg) or (evt.get("source") or {}).get("name") or raw.get("SourceName")
                 if who:
-                    # Format time for state (e.g., "@ 1:06 AM")
-                    time_suffix = ""
-                    if ts:
-                        try:
-                            from datetime import datetime
-                            # Try parsing common formats
-                            for fmt in ["%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M:%S.%f", "%B %d, %Y at %I:%M:%S %p"]:
-                                try:
-                                    dt = datetime.strptime(ts[:26] if 'T' in ts else ts, fmt)
-                                    time_suffix = f" @ {dt.strftime('%-I:%M %p')}"
-                                    break
-                                except ValueError:
-                                    continue
-                            if not time_suffix:
-                                # Fallback: use current time
-                                time_suffix = f" @ {datetime.now().strftime('%-I:%M %p')}"
-                        except Exception:
-                            pass
+                    time_suffix = _format_event_time(ts)
                     
                     if "granted access" in msg_l:
                         self._attr_native_value = f"{who} granted access{time_suffix}"
@@ -848,22 +851,7 @@ class ProtectorDoorLastLogSensor(SensorEntity, RestoreEntity):
             if ntype in {"ACTIONPLAN_MESSAGE", "ACTIONPLAN_STATE"}:
                 who = self._extract_name_for_action_line(msg) or (evt.get("source") or {}).get("name") or raw.get("SourceName")
                 if who:
-                    # Format time for state (e.g., "@ 1:06 AM")
-                    time_suffix = ""
-                    if ts:
-                        try:
-                            from datetime import datetime
-                            for fmt in ["%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M:%S.%f", "%B %d, %Y at %I:%M:%S %p"]:
-                                try:
-                                    dt = datetime.strptime(ts[:26] if 'T' in ts else ts, fmt)
-                                    time_suffix = f" @ {dt.strftime('%-I:%M %p')}"
-                                    break
-                                except ValueError:
-                                    continue
-                            if not time_suffix:
-                                time_suffix = f" @ {datetime.now().strftime('%-I:%M %p')}"
-                        except Exception:
-                            pass
+                    time_suffix = _format_event_time(ts)
                     
                     if self._is_unlock_msg(msg_l):
                         self._attr_native_value = f"{who} unlocked{time_suffix}"
@@ -888,21 +876,7 @@ class ProtectorDoorLastLogSensor(SensorEntity, RestoreEntity):
             # --- OTR (One Time Run) events: update state + Door Message ---
             if "one time run" in msg_l:
                 # Message like: "Door Gate Front Door One Time Run Time Zone Changed to Mode Unlock"
-                time_suffix = ""
-                if ts:
-                    try:
-                        from datetime import datetime
-                        for fmt in ["%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M:%S.%f", "%B %d, %Y at %I:%M:%S %p"]:
-                            try:
-                                dt = datetime.strptime(ts[:26] if 'T' in ts else ts, fmt)
-                                time_suffix = f" @ {dt.strftime('%-I:%M %p')}"
-                                break
-                            except ValueError:
-                                continue
-                        if not time_suffix:
-                            time_suffix = f" @ {datetime.now().strftime('%-I:%M %p')}"
-                    except Exception:
-                        pass
+                time_suffix = _format_event_time(ts)
                 
                 # Extract mode from "Changed to Mode <Mode>"
                 mode_match = re.search(r"changed to mode\s+(\w+)", msg_l, flags=re.IGNORECASE)
