@@ -18,6 +18,9 @@ If the Hartmann session cookie expired while the WebSocket was running, the conn
 ### Fix: Last Door Log timestamps showing UTC instead of local time
 Event timestamps like “Home Assistant unlocked @ 6:39 AM” were displaying the raw UTC time from the Hartmann server instead of converting to your local timezone. Now correctly shows local time (e.g., “@ 2:39 AM” for EDT).
 
+### Fix: No more phantom activity entries after restart
+Restarting or reloading the integration used to create a wall of fake state-change entries in the Activity log (e.g., “Override Type changed to For Specified Time”, “Lock State changed to Locked”) even though nothing actually happened at the door. Sensors now restore silently without triggering history entries.
+
 ---
 
 ## What’s new in 0.2.3
@@ -322,6 +325,9 @@ Lock/Unlock **status** messages don’t flip the “by” state (that’s what *
 * **Last Door Log shows wrong time (off by several hours)**
   Update to **0.2.4**. Timestamps from Hartmann are in UTC and were being displayed without timezone conversion.
 
+* **Fake activity entries after every restart/reload**
+  Update to **0.2.4**. Sensors now restore their previous state silently without creating history entries.
+
 * **Sensors didn’t appear previously for “Default Partition”**
   Update to **0.1.7**; discovery now correctly loads those doors.
 
@@ -333,6 +339,7 @@ Lock/Unlock **status** messages don’t flip the “by” state (that’s what *
 * Fix: **WebSocket auto-reconnect after session expiry** — credentials refresh on each reconnect; negotiate re-authenticates on 401
 * Fix: **Clean HA shutdown** — WebSocket tasks stop on EVENT_HOMEASSISTANT_STOP (no more shutdown warnings)
 * Fix: **Last Door Log timestamps** now display in local time instead of raw UTC
+* Fix: **No phantom activity entries** on restart/reload — sensors restore silently
 
 ### 0.2.3
 * Fix: **Door sensors missing on some Odyssey servers** — discovery now uses the partition’s API door list instead of fragile site-name matching
