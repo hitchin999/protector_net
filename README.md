@@ -10,6 +10,16 @@ This custom integration controls **Hartmann Controls Protector.Net _and_ Odyssey
 
 ---
 
+## What’s new in 0.2.4
+
+### Fix: WebSocket auto-heals after session expiry
+If the Hartmann session cookie expired while the WebSocket was running, the connection would drop and never recover — every reconnect attempt failed silently because it kept using the stale cookie. The WebSocket client now refreshes its credentials on each reconnect attempt, re-authenticates automatically on 401 errors, and shuts down cleanly when Home Assistant stops (no more “Task was still running” warnings in the logs).
+
+### Fix: Last Door Log timestamps showing UTC instead of local time
+Event timestamps like “Home Assistant unlocked @ 6:39 AM” were displaying the raw UTC time from the Hartmann server instead of converting to your local timezone. Now correctly shows local time (e.g., “@ 2:39 AM” for EDT).
+
+---
+
 ## What’s new in 0.2.3
 
 ### Fix: Door sensors missing on some Odyssey servers
@@ -303,12 +313,26 @@ Lock/Unlock **status** messages don’t flip the “by” state (that’s what *
 * **Override Type resets to “For Specified Time” after restart**
   Update to **0.2.3**; the Override Type select now persists across restarts.
 
+* **WebSocket disconnects and never reconnects**
+  Update to **0.2.4**. Older versions captured the session cookie once at startup; if it expired, reconnects would fail forever. The WS client now re-authenticates automatically.
+
+* **“Task was still running after final writes shutdown stage” warnings**
+  Update to **0.2.4**; the WebSocket tasks now stop cleanly when Home Assistant shuts down.
+
+* **Last Door Log shows wrong time (off by several hours)**
+  Update to **0.2.4**. Timestamps from Hartmann are in UTC and were being displayed without timezone conversion.
+
 * **Sensors didn’t appear previously for “Default Partition”**
   Update to **0.1.7**; discovery now correctly loads those doors.
 
 ---
 
 ## Changelog
+
+### 0.2.4
+* Fix: **WebSocket auto-reconnect after session expiry** — credentials refresh on each reconnect; negotiate re-authenticates on 401
+* Fix: **Clean HA shutdown** — WebSocket tasks stop on EVENT_HOMEASSISTANT_STOP (no more shutdown warnings)
+* Fix: **Last Door Log timestamps** now display in local time instead of raw UTC
 
 ### 0.2.3
 * Fix: **Door sensors missing on some Odyssey servers** — discovery now uses the partition’s API door list instead of fragile site-name matching
