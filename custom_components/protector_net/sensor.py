@@ -345,7 +345,6 @@ class ProtectorHubSensor(SensorEntity, RestoreEntity):
                 "partition_id": la.get("partition_id", self._partition_id),
                 "system_type": la.get("system_type"),
             }
-            self.async_write_ha_state()
 
         signal = f"{DISPATCH_HUB}_{self._entry_id}"
 
@@ -484,7 +483,6 @@ class ProtectorDoorOTRSensor(SensorEntity, RestoreEntity):
             la = last.attributes or {}
             self._schedules = la.get("all_schedules", [])
             self._last_updated = la.get("last_updated")
-            self.async_write_ha_state()
         
         # Initial fetch
         await self._async_fetch_schedules()
@@ -620,7 +618,6 @@ class ProtectorDoorSensor(SensorEntity, RestoreEntity):
         last = await self.async_get_last_state()
         if last and last.state not in (STATE_UNKNOWN, STATE_UNAVAILABLE, None, ""):
             self._attr_native_value = last.state
-            self.async_write_ha_state()
 
         signal = f"{DISPATCH_DOOR}_{self._entry_id}"
 
@@ -809,7 +806,6 @@ class ProtectorDoorLastLogSensor(SensorEntity, RestoreEntity):
                     self._attrs[key] = la[key]
             # ensure Door ID is correct even if entry_id changed
             self._attrs["Door ID"] = self._door_id
-            self.async_write_ha_state()
 
         signal = f"{DISPATCH_LOG}_{self._entry_id}"
 
@@ -990,7 +986,6 @@ class ProtectorDoorTempCodeSensor(SensorEntity, RestoreEntity):
                     self._attrs[key] = la[key]
             # Ensure door_id is correct
             self._attrs["door_id"] = self._door_id
-            self.async_write_ha_state()
 
         signal = f"{DISPATCH_TEMP_CODE}_{self._entry_id}"
 
