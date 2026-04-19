@@ -21,6 +21,9 @@ Event timestamps like “Home Assistant unlocked @ 6:39 AM” were displaying th
 ### Fix: No more phantom activity entries after restart
 Restarting or reloading the integration used to create a wall of fake state-change entries in the Activity log (e.g., “Override Type changed to For Specified Time”, “Lock State changed to Locked”) even though nothing actually happened at the door. Sensors now restore silently without triggering history entries.
 
+### Quieter logs during server reboots
+Transient connection errors (timeouts, connection refused) during Hartmann server reboots no longer show as errors in the HA log. They’re now logged as warnings since the integration always retries and self-heals.
+
 ---
 
 ## What’s new in 0.2.3
@@ -340,6 +343,7 @@ Lock/Unlock **status** messages don’t flip the “by” state (that’s what *
 * Fix: **Clean HA shutdown** — WebSocket tasks stop on EVENT_HOMEASSISTANT_STOP (no more shutdown warnings)
 * Fix: **Last Door Log timestamps** now display in local time instead of raw UTC
 * Fix: **No phantom activity entries** on restart/reload — sensors restore silently
+* Improvement: **Quieter logs** — transient connection errors downgraded from ERROR to WARNING
 
 ### 0.2.3
 * Fix: **Door sensors missing on some Odyssey servers** — discovery now uses the partition’s API door list instead of fragile site-name matching
