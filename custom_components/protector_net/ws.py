@@ -199,7 +199,7 @@ class SignalRClient:
             doors = await api.get_all_doors(self.hass, self.entry_id)
             self._allowed_door_ids = {int(d["Id"]) for d in doors or [] if "Id" in d}
         except Exception as e:
-            _LOGGER.error("[%s] Failed to fetch allowed doors: %s", self.entry_id, e)
+            _LOGGER.warning("[%s] Failed to fetch allowed doors (will retry): %s", self.entry_id, e)
             self._allowed_door_ids = set()
 
     async def _build_door_map(self) -> None:
@@ -213,7 +213,7 @@ class SignalRClient:
         try:
             ov = await api.get_system_overview(self.hass, self.entry_id)
         except Exception as e:
-            _LOGGER.error("[%s] Failed to fetch system overview: %s", self.entry_id, e)
+            _LOGGER.warning("[%s] Failed to fetch system overview (will retry): %s", self.entry_id, e)
             self._door_map = {}
             self._reader_by_id = {}
             self._reader_by_name = {}
@@ -271,7 +271,7 @@ class SignalRClient:
             extra_readers = await _api.get_available_readers(self.hass, self.entry_id)
         except Exception as e:
             extra_readers = []
-            _LOGGER.error("[%s] Failed to fetch partition readers: %s", self.entry_id, e)
+            _LOGGER.warning("[%s] Failed to fetch partition readers: %s", self.entry_id, e)
 
         merged = 0
         if extra_readers:
@@ -680,7 +680,7 @@ class SignalRClient:
                         self.connected = False
                         self.phase = "error"
                         self.last_error = str(e)
-                        _LOGGER.error("[%s] WS error: %s", self.entry_id, e)
+                        _LOGGER.warning("[%s] WS error (will retry): %s", self.entry_id, e)
                         self._push_hub_state()
 
                         # stop periodic sync if running
