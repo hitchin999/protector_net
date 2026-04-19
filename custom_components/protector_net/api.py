@@ -116,7 +116,7 @@ async def get_all_doors(
         resp = await _request_with_reauth(hass, entry_id, "GET", url, params=params, timeout=10)
         return resp.json().get("Results", [])
     except Exception as e:
-        _LOGGER.exception("%s: Error fetching doors: %s", entry_id, e)
+        _LOGGER.warning("%s: Error fetching doors: %s", entry_id, e)
         return []
 
 async def get_available_readers(hass, entry_id: str) -> list[dict]:
@@ -143,7 +143,7 @@ async def get_available_readers(hass, entry_id: str) -> list[dict]:
         )
         data = resp.json() or {}
     except Exception as e:
-        _LOGGER.error("%s: get_available_readers failed: %s", entry_id, e)
+        _LOGGER.warning("%s: get_available_readers failed: %s", entry_id, e)
         return []
 
     results = data.get("Results") or []
@@ -1513,7 +1513,7 @@ async def get_one_time_runs(
         return schedules
         
     except Exception as e:
-        _LOGGER.error("%s: Error fetching OneTimeRun schedules: %s", entry_id, e)
+        _LOGGER.warning("%s: Error fetching OneTimeRun schedules: %s", entry_id, e)
         return []
 
 
