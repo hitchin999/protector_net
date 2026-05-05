@@ -10,7 +10,157 @@ This custom integration controls **Hartmann Controls Protector.Net _and_ Odyssey
 
 ---
 
-## What’s new in 0.2.4
+## What's new in 0.2.5
+
+### HA-managed door schedules (survives panel reboots)
+The existing `override_door` (and the "Unlock Until" controls it powers) lives **only in the panel's RAM**. If a door panel reboots mid-override, it forgets the override and falls back to whatever base schedule the door has set in Hartmann. That made the common "Always Card or Pin in Hartmann + HA override on top" pattern unreliable for anything safety-critical or scheduled — rental check-ins, facility opening hours, scheduled lockdowns, etc.
+
+This release adds a parallel mechanism that rewrites the door's **actual schedule** in Hartmann. Changes persist across panel reboots because they are the schedule, not an override layered on top of it.
+
+#### How it works
+
+A door has three states with this feature:
+
+1. **Unmanaged** (default) — door behaves exactly as before. Untouched.
+2. **Managed** — integration has created a dedicated `DoorTimeZone` in Hartmann for this door (named like `HA[abc1234] Front Door` — an HA prefix with a short id, plus the door's name) and recorded the door's *current* `DoorTimeZoneId` for rollback. The door itself still points at its original schedule. Calling `set_door_schedule_mode` updates the HA Door Time Zone but has no effect on the door yet — useful for staging the mode you want before flipping the door over.
+3. **Active** — door's `DoorTimeZoneId` is flipped to the HA Door Time Zone, plus an Update Panels is sent so the panel hardware picks it up. Now the door follows the HA schedule and `set_door_schedule_mode` controls it for real.
+
+This three-state model lets you migrate door-by-door at your own pace: provision everything first, get your automations updated to call the new service, verify the staged mode looks right, then flip doors to Active in batches once you're confident.
+
+#### Enabling it
+
+1. Open the integration's **Configure** panel and pick **Door Time Zones (HA-controlled schedules)** from the menu.
+2. Under **Create Door Time Zones (HA-controlled schedules)**, all doors are pre-ticked. Untick the ones you DON'T want HA to manage, then tick **"Apply changes to managed doors on submit"**.
+   - This last checkbox is required — it's a safety gate so opening this page can't accidentally rewrite anything.
+3. *(Optional, in the same submit)* Under **Activate Door Time Zones (switch to HA schedules now)**, leave all doors pre-ticked (or untick what you want to leave on its original schedule), then tick **"Apply changes to active doors on submit"**.
+4. *(Optional)* Tick **"Auto-add new doors found in Hartmann"** at the bottom if you want any future doors added in Hartmann to be automatically managed AND activated by HA on the next hourly sync.
+5. Submit. The integration creates one Door Time Zone per ticked door in Hartmann (named like `HA[abc1234] Front Door`, 24/7 "Card or Pin"), and — for doors you also activated — flips their `DoorTimeZoneId` to the HA Door Time Zone and fires Update Panels.
+6. Update your automations to call `protector_net.set_door_schedule_mode` instead of `override_door` for the doors you now want to control via schedule.
+
+The two sections work independently: tick only "Apply" on Create to provision without activating (verify in Hartmann first), then come back later and tick "Apply" on Activate.
+
+#### The new service
+
+```yaml
+service: protector_net.set_door_schedule_mode
+data:
+  door_device_id: "{{ device_id('button.front_door_pulse_unlock') }}"
+  mode: "Unlock"        # any of: Lockdown, Card, Pin, CardOrPin,
+                        #          CardAndPin, Unlock, UnlockWithFirstCardIn, DualCard
+```
+
+Behavior:
+
+- Rewrites all 7 days of the door's HA Door Time Zone to the requested mode (12:00 AM → 11:59 PM).
+- If the door is **Active**, fires Update Panels automatically so the change reaches hardware.
+- If the door is only **Managed** (not yet Active), updates the HA Door Time Zone but does NOT push to panels — the new mode takes effect when you activate the door later.
+- **Idempotent** — calling with the door's current mode is a no-op (no Hartmann writes, no panel push).
+- Refuses doors that aren't in the managed set with a clear error pointing back to integration options.
+
+Typical booking-style usage:
+
+```yaml
+# At check-in time
+service: protector_net.set_door_schedule_mode
+data:
+  door_device_id: "{{ device_id('button.front_door_pulse_unlock') }}"
+  mode: "Unlock"
+
+# At check-out time
+service: protector_net.set_door_schedule_mode
+data:
+  door_device_id: "{{ device_id('button.front_door_pulse_unlock') }}"
+  mode: "CardOrPin"
+```
+
+Both calls survive a panel reboot during the booking window, because the door's actual schedule changed.
+
+#### Auto-add new doors
+
+Tick **"Auto-add new doors found in Hartmann"** under Door Time Zones to have new doors picked up automatically:
+
+- The hourly background sync compares Hartmann's live door list against your saved managed-doors set
+- Any door in Hartmann that's not yet managed gets a 24/7 "CardOrPin" Door Time Zone created AND gets activated to use it (one operation, no second visit needed)
+- Only **new** doors are touched — existing ones (managed, unmanaged, or deactivated) are left exactly as they are
+- Doors REMOVED from Hartmann are not auto-deprovisioned — that's a destructive action and stays manual
+
+Caveat: if you turn this on, then later untick a door from "Create Door Time Zones" to deprovision it, the next hourly sync will add it back. Turn auto-add off if you want a door to stay deprovisioned.
+
+#### Rollback
+
+- **Per-door**: open Door Time Zones, untick the door from "Create Door Time Zones", tick "Apply changes to managed doors on submit", and submit. The integration repoints the door's `DoorTimeZoneId` back to the original (recorded at provisioning time), fires Update Panels, and deletes the HA Door Time Zone.
+- **Whole integration**: deleting the integration runs the same cleanup for every managed door automatically. Best-effort — orphaned HA Door Time Zones are tagged with the entry's id in their Description field (`protector_net:<entry_id>:door:<door_id>`) so you can find and remove them manually in Hartmann if anything goes wrong mid-cleanup.
+
+#### Coexistence with `override_door`
+
+The existing `override_door` service is **unchanged**. Keep using it for ad-hoc unlocks and the JS card. The two systems coexist cleanly: an active panel override still wins until cleared, regardless of which schedule sits underneath. Once the override is resumed, the door falls back to whichever schedule it's pointing at — original or HA-managed.
+
+### Panels Online sensor
+Each integration entry now exposes a `sensor.panels_online_<partition>` entity on its Hub device. State is the integer count of panels currently online; attributes give the breakdown:
+
+```yaml
+state: 1
+attributes:
+  online_panels:
+    - name: Main Panel
+      mac: 44B7D0A029D0
+      model: PRS-Door-Master
+      ip: 192.168.1.42
+  offline_panels: []
+  online_count: 1
+  offline_count: 0
+  total_count: 1
+  all_online: true
+  last_updated: "2026-05-01T13:23:58"
+```
+
+Polled every 60 seconds (Hartmann's `/api/PanelCommands/PanelsOnline` endpoint). The MAC → friendly-name + IP map comes from `/api/Panels` and is cached, so the steady-state poll is one cheap API call.
+
+Useful for "notify me if any panel goes offline" automations:
+
+```yaml
+trigger:
+  - platform: state
+    entity_id: sensor.panels_online_default_partition
+    attribute: all_online
+    to: false
+action:
+  - service: notify.mobile_app_yourphone
+    data:
+      title: "Hartmann panel offline"
+      message: >-
+        Offline:
+        {{ state_attr('sensor.panels_online_default_partition', 'offline_panels')
+           | map(attribute='name') | join(', ') }}
+```
+
+### Manage Active PINs view (Hartman Door Lock Card)
+A new "Manage Active PINs" panel in the bulk actions area lets you see every active temp code at a glance — name, expiry, how many doors it unlocks, and the PIN itself (hidden behind a "show" toggle by default; flip the new `always_show_temp_pin: true` card option if you'd rather see them all). Clicking a code expands it inline so you can:
+
+- **Add or remove doors** without changing the PIN — checkboxes for every door, one Save click applies the diff. Behind the scenes this hits the new `add_door_to_temp_code` / `remove_door_from_temp_code` services, so the same Hartmann user gets assigned to (or removed from) the new doors' Access Privilege Groups.
+- **Extend the expiry** with a datetime picker — same PIN, no interruption to the guest.
+- **Delete now** — removes the Hartmann user immediately.
+
+Removing the last door is allowed — the Hartmann user record stays intact (you can re-add doors later or delete it manually from the Hartmann admin UI).
+
+### Multi-door temp codes now actually work
+Bulk-creating a PIN for multiple doors at once would previously only succeed for the **first** door — every subsequent door got rejected by Hartmann with “PIN provided is not available. This could indicate the PIN is in use or being blocked by Enhanced Pin Security.” The integration was creating a separate Hartmann user for each door with the same PIN, and Hartmann’s built-in PIN-uniqueness rule blocked all but the first.
+
+The `create_temp_code` service now creates **one** Hartmann user with a single PIN credential and assigns that user to each requested door’s Access Privilege Group. Bulk-creating a code across 6 doors now does what you’d expect: 6 working doors, one user record. `update_temp_code` and `delete_temp_code` now propagate changes/cleanups to every sensor that was tracking the same code, so the per-door temp_code sensors stay in sync.
+
+### Auto-deletion of expired temp codes
+Temp codes created with an `end_time` now auto-delete themselves the moment they expire — the Hartmann user record is removed and the entry disappears from the Temp Code sensor. No more 5-minute polling automation needed for cleanup; it just works for hotel/Airbnb-style bookings out of the box. Existing helper automations that delete codes by name still work fine — they’ll just become a redundant safety net.
+
+The scheduler survives Home Assistant restarts: any restored codes whose `end_time` is in the past get cleaned up immediately, and codes still in the future are rescheduled. Updating a code’s `end_time` (e.g., via `update_temp_code` for an extended booking) reschedules the deletion automatically.
+
+If Hartmann is unreachable when a code tries to expire, the integration retries every hour until it succeeds — the entry stays in the sensor until the cleanup actually completes, so nothing gets silently dropped.
+
+### Quieter logs for stale temp codes
+The “No temp user found with PIN …” log line is now DEBUG instead of WARNING. This was just the API layer being chatty about a routine, recoverable case (e.g., the user was deleted out-of-band) — the actual error was already returned in the structured response, and callers handle it appropriately.
+
+---
+
+
 
 ### Fix: WebSocket auto-heals after session expiry
 If the Hartmann session cookie expired while the WebSocket was running, the connection would drop and never recover — every reconnect attempt failed silently because it kept using the stale cookie. The WebSocket client now refreshes its credentials on each reconnect attempt, re-authenticates automatically on 401 errors, and shuts down cleanly when Home Assistant stops (no more “Task was still running” warnings in the logs).
@@ -186,8 +336,10 @@ Revisit any time: **Settings → Devices & Services → Protector.Net → Option
 
 | Service | Description |
 |---------|-------------|
-| `create_temp_code` | Create a temporary PIN code with optional start/end times. Supports random or manual codes, configurable digit count (4–9). |
+| `create_temp_code` | Create a temporary PIN code with optional start/end times. Supports random or manual codes, configurable digit count (4–9). Multi-door: creates one user with the PIN, assigns to each requested door's APG. |
 | `update_temp_code` | Update start/end time of an existing code without changing the PIN. Perfect for extending guest stays. |
+| `add_door_to_temp_code` | Add a door to an existing temp code so the same PIN unlocks one more door. |
+| `remove_door_from_temp_code` | Remove a door from a temp code without deleting the user. PIN keeps working on remaining doors. |
 | `delete_temp_code` | Delete a temp code by PIN value. |
 | `delete_temp_code_by_name` | Delete a temp code by name (for calendar automations). Optional `force_remove` to clean stale sensor entries. |
 | `clear_all_temp_codes` | Remove all temporary codes from a door. |
@@ -337,6 +489,13 @@ Lock/Unlock **status** messages don’t flip the “by” state (that’s what *
 ---
 
 ## Changelog
+
+### 0.2.5
+* New: **Manage Active PINs** panel in the door card — view all active temp codes, add/remove doors per code without changing the PIN, extend expiry, or delete. New card config option `always_show_temp_pin` to skip the show-PIN toggle.
+* New: **`add_door_to_temp_code`** and **`remove_door_from_temp_code`** services — extend an existing temp code's reach to additional doors, or revoke from specific doors, without changing the PIN.
+* Fix: **Multi-door temp codes** — `create_temp_code` now creates one Hartmann user with multiple APG assignments instead of one user per door, fixing the bulk-create rejection caused by Hartmann’s PIN-uniqueness rule. `update_temp_code` and `delete_temp_code` now broadcast changes to every sensor that tracks the same code so they stay in sync.
+* New: **Auto-delete on expiration** — temp codes with an `end_time` now delete themselves automatically (both from Hartmann and from the sensor) the moment they expire. Survives HA restarts; reschedules on `update_temp_code`. Retries every hour if Hartmann is unreachable.
+* Improvement: **Quieter logs** — “No temp user found with PIN …” downgraded from WARNING to DEBUG since the structured response already conveys the result.
 
 ### 0.2.4
 * Fix: **WebSocket auto-reconnect after session expiry** — credentials refresh on each reconnect; negotiate re-authenticates on 401
