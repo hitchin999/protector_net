@@ -13,6 +13,45 @@ from .const import DOMAIN, FRIENDLY_TO_TZ_INDEX, OVERRIDE_MODE_LABEL_TO_TOKEN
 
 _LOGGER = logging.getLogger(f"{DOMAIN}.api")
 
+
+def _is_transient_outage(exc: BaseException) -> bool:
+    """Return True if the exception looks like a server-down/restart event.
+
+    Mirror of the helper in ws.py. Used to downgrade routine connection
+    failures (e.g. nightly Hartmann box reboots) from WARNING to INFO so
+    they don't pollute HA's notification surface.
+    """
+    if isinstance(exc, (TimeoutError, ConnectionError, OSError)):
+        return True
+    # httpx network-class errors (covers Connect*/Read*/Write*/Pool*Timeout
+    # and most NetworkError subclasses across httpx versions).
+    if isinstance(exc, (httpx.TimeoutException, httpx.NetworkError,
+                        httpx.RemoteProtocolError, httpx.TransportError,
+                        httpx.HTTPError)):
+        # HTTPError is broad — only treat as transient if no response was
+        # received (i.e. server didn't answer at all). HTTPStatusError still
+        # has a response and stays at WARNING.
+        if isinstance(exc, httpx.HTTPStatusError):
+            # 502/503/504 from a bouncing server are also transient.
+            try:
+                code = exc.response.status_code
+                if code in (502, 503, 504):
+                    return True
+            except Exception:
+                pass
+            return False
+        return True
+    # Defensive name-based match for anything we missed (different httpx
+    # versions, wrapper exceptions, etc.).
+    cls_name = type(exc).__name__.lower()
+    if any(tok in cls_name for tok in ("timeout", "connect", "disconnect",
+                                       "unreachable", "remoteprotocol")):
+        return True
+    msg = str(exc).lower()
+    if "connection timeout" in msg or "cannot connect to host" in msg:
+        return True
+    return False
+
 # Map API tokens to the controller "timeZone" index
 _TOKEN_TO_INDEX = {
     "Lockdown": 0,
@@ -118,6 +157,35 @@ async def get_all_doors(
     except Exception as e:
         _LOGGER.warning("%s: Error fetching doors: %s", entry_id, e)
         return []
+
+
+async def get_partition_name(hass, entry_id: str) -> str | None:
+    """Look up the current Hartmann name for this entry's partition.
+
+    Used by the post-load name sync to detect partition renames in Hartmann.
+    Falls back to the list endpoint (rather than /api/Partitions/{id}) because
+    the list endpoint is the same one config_flow uses, so we know it's
+    available with the same auth on both Odyssey and Protector.Net.
+    """
+    cfg = hass.data[DOMAIN][entry_id]
+    pid = cfg.get("partition_id")
+    if not pid:
+        return None
+    url = f"{cfg['base_url']}/api/Partitions/ByPrivilege/Manage_Doors"
+    params = {"PageNumber": 1, "PerPage": 500}
+    try:
+        resp = await _request_with_reauth(hass, entry_id, "GET", url, params=params, timeout=10)
+        for p in resp.json().get("Results", []) or []:
+            try:
+                if int(p.get("Id", -1)) == int(pid):
+                    name = p.get("Name")
+                    return str(name) if name else None
+            except (TypeError, ValueError):
+                continue
+        return None
+    except Exception as e:
+        _LOGGER.debug("%s: Error fetching partition name: %s", entry_id, e)
+        return None
 
 async def get_available_readers(hass, entry_id: str) -> list[dict]:
     """Return partition-scoped readers -> doors (fixes Reader 2 / in-out readers)."""
@@ -971,41 +1039,78 @@ def _convert_datetime_for_hartmann(dt_string: Optional[str], hass=None) -> Optio
 async def create_temp_code_user(
     hass,
     entry_id: str,
-    door_id: int,
+    door_ids: list[int],
     code_name: str,
     pin_code: str,
     start_time: Optional[str] = None,
     end_time: Optional[str] = None,
 ) -> dict:
     """
-    Create a temporary user with PIN-only access to a specific door.
-    
+    Create a temporary user with PIN-only access to one or more doors.
+
+    The user is created **once** with a single PIN credential, then assigned to
+    the access privilege group of each requested door. This avoids Hartmann's
+    PIN-uniqueness rejection, which would otherwise block creating N separate
+    users with the same PIN.
+
     Args:
-        start_time: ISO datetime string when the code becomes active (optional)
-        end_time: ISO datetime string when the code expires (optional)
-    
-    Returns {"success": True, "user_id": int} on success,
-    or {"success": False, "error": str} on failure.
+        door_ids: list of Hartmann door IDs to grant access to. Must contain at
+            least one ID.
+        start_time: ISO datetime string when the code becomes active (optional).
+        end_time: ISO datetime string when the code expires (optional).
+
+    Returns:
+        On success::
+
+            {
+                "success": True,
+                "user_id": int,
+                "doors": [
+                    {"door_id": int, "success": bool, "error": Optional[str]},
+                    ...
+                ],
+            }
+
+        On failure (user/credential creation failed)::
+
+            {"success": False, "error": str}
     """
     cfg = hass.data[DOMAIN][entry_id]
     partition_id = cfg.get("partition_id")
-    
-    # Get door info for APG naming
+
+    if not door_ids:
+        return {"success": False, "error": "No doors specified"}
+
+    # Resolve door names for APG naming (one fetch covers all doors)
     doors = await get_all_doors(hass, entry_id)
-    door_name = None
+    door_name_by_id: dict[int, str] = {}
     for d in doors:
-        if d.get("Id") == door_id:
-            door_name = d.get("Name", f"Door {door_id}")
-            break
-    
-    if not door_name:
-        door_name = f"Door {door_id}"
-    
-    # Find or create the APG for this door
-    apg_id = await find_or_create_temp_apg(hass, entry_id, door_id, door_name)
-    if not apg_id:
-        return {"success": False, "error": "Failed to create/find Access Privilege Group for door"}
-    
+        did = d.get("Id")
+        if did is not None:
+            door_name_by_id[int(did)] = d.get("Name") or f"Door {did}"
+
+    # Pre-resolve / create APGs for every requested door BEFORE creating the
+    # user. If any APG can't be obtained, we report it but still proceed for
+    # the doors whose APGs are valid (so a single bad door doesn't block
+    # others).
+    apg_by_door: dict[int, Optional[int]] = {}
+    for did in door_ids:
+        dname = door_name_by_id.get(int(did)) or f"Door {did}"
+        apg_id = await find_or_create_temp_apg(hass, entry_id, int(did), dname)
+        apg_by_door[int(did)] = apg_id
+        if not apg_id:
+            _LOGGER.warning(
+                "%s: Could not find/create APG for door %d (%s)",
+                entry_id, did, dname
+            )
+
+    valid_apg_ids = [a for a in apg_by_door.values() if a]
+    if not valid_apg_ids:
+        return {
+            "success": False,
+            "error": "Failed to create/find Access Privilege Group for any door",
+        }
+
     # Get security levels (use default if not available)
     security_levels = await get_security_levels(hass, entry_id)
     if not security_levels:
@@ -1013,15 +1118,15 @@ async def create_temp_code_user(
         _LOGGER.debug("%s: Using default security level ID 1", entry_id)
     else:
         security_level_id = security_levels[0].get("Id", 1)
-    
+
     # Create unique user name with prefix for easy identification
     first_name = f"HA-{pin_code}"
     last_name = code_name[:60]  # Max 60 chars
-    
+
     # Convert datetime strings to Hartmann format (UTC)
     hartmann_start = _convert_datetime_for_hartmann(start_time, hass)
     hartmann_end = _convert_datetime_for_hartmann(end_time, hass)
-    
+
     # Create the user (AccessGroups is readOnly but still required, send empty array)
     url = f"{cfg['base_url']}/api/Users"
     payload = {
@@ -1037,29 +1142,33 @@ async def create_temp_code_user(
         "HandicapOpener": False,
         "CanTripleSwipe": False,
     }
-    
+
     # Add time restrictions if provided
     if hartmann_start:
         payload["StartedOn"] = hartmann_start
     if hartmann_end:
         payload["ExpiresOn"] = hartmann_end
-    
-    _LOGGER.debug("%s: Creating user with StartedOn=%s, ExpiresOn=%s", entry_id, hartmann_start, hartmann_end)
-    _LOGGER.debug("%s: User creation payload: %s", entry_id, payload)
-    
+
+    _LOGGER.debug(
+        "%s: Creating user with StartedOn=%s, ExpiresOn=%s for %d door(s)",
+        entry_id, hartmann_start, hartmann_end, len(door_ids)
+    )
+
     try:
         resp = await _request_with_reauth(hass, entry_id, "POST", url, json=payload, timeout=15)
         result = resp.json()
         user_id = result.get("Id")
-        
+
         if not user_id:
             _LOGGER.error("%s: User creation returned no ID: %s", entry_id, result)
             return {"success": False, "error": "User creation failed - no ID returned"}
-        
-        _LOGGER.info("%s: Created temp user '%s %s' (ID: %d) valid: %s to %s", 
-                     entry_id, first_name, last_name, user_id,
-                     hartmann_start or "now", hartmann_end or "forever")
-        
+
+        _LOGGER.info(
+            "%s: Created temp user '%s %s' (ID: %d) for %d door(s) valid: %s to %s",
+            entry_id, first_name, last_name, user_id, len(door_ids),
+            hartmann_start or "now", hartmann_end or "forever"
+        )
+
     except httpx.HTTPStatusError as e:
         error_body = ""
         try:
@@ -1071,76 +1180,90 @@ async def create_temp_code_user(
     except Exception as e:
         _LOGGER.error("%s: Error creating temp user: %s", entry_id, e)
         return {"success": False, "error": f"Failed to create user: {e}"}
-    
-    # Assign user to APG via PUT /api/AccessPrivilegeGroups/{Id}/Users/{UserId}
-    apg_user_url = f"{cfg['base_url']}/api/AccessPrivilegeGroups/{apg_id}/Users/{user_id}"
-    try:
-        await _request_with_reauth(hass, entry_id, "PUT", apg_user_url, json={}, timeout=10)
-        _LOGGER.info("%s: Assigned user %d to APG %d", entry_id, user_id, apg_id)
-    except Exception as e:
-        _LOGGER.warning("%s: Failed to assign user %d to APG %d: %s", entry_id, user_id, apg_id, e)
-        # Continue anyway - the APG might already be in user's groups
-    
-    # Add PIN credential to the user
+
+    # Add PIN credential to the user FIRST. If Hartmann rejects the PIN
+    # (e.g., it's already in use by another user), roll back the user and
+    # bail out before touching APGs.
     cred_url = f"{cfg['base_url']}/api/Users/{user_id}/Credentials"
     cred_payload = {
         "Name": f"PIN-{code_name}",
         "CredentialType": "PinOnly",
-        "SiteCode": 0,  # PIN-only doesn't need site code
-        "CardNumber": 0,  # PIN-only doesn't need card number
+        "SiteCode": 0,
+        "CardNumber": 0,
         "PinNumber": int(pin_code),
     }
-    
+
     try:
         await _request_with_reauth(hass, entry_id, "POST", cred_url, json=cred_payload, timeout=10)
         _LOGGER.info("%s: Added PIN credential to user %d", entry_id, user_id)
-        return {"success": True, "user_id": user_id}
-        
     except httpx.HTTPStatusError as e:
-        # Try to extract actual error message from Hartmannn
+        # Try to extract actual error message from Hartmann
         error_detail = str(e)
         try:
             error_body = e.response.text
             if error_body:
-                # Try to parse as JSON for structured error
                 try:
-                    import json
-                    error_json = json.loads(error_body)
+                    import json as _json
+                    error_json = _json.loads(error_body)
                     if isinstance(error_json, dict):
-                        # Look for common error message fields
                         error_detail = (
-                            error_json.get("Message") or 
-                            error_json.get("message") or 
-                            error_json.get("error") or 
-                            error_json.get("Error") or
-                            error_json.get("ResponseStatus", {}).get("Message") or
-                            error_body
+                            error_json.get("Message")
+                            or error_json.get("message")
+                            or error_json.get("error")
+                            or error_json.get("Error")
+                            or error_json.get("ResponseStatus", {}).get("Message")
+                            or error_body
                         )
-                except json.JSONDecodeError:
-                    # Plain text error
+                except _json.JSONDecodeError:
                     error_detail = error_body if len(error_body) < 500 else error_body[:500]
         except Exception:
             pass
-        
+
         _LOGGER.error("%s: Error adding credential to user %d: %s", entry_id, user_id, error_detail)
-        
-        # Try to clean up the user we just created
+        # Roll back the user we just created
         try:
             delete_url = f"{cfg['base_url']}/api/Users/{user_id}"
             await _request_with_reauth(hass, entry_id, "DELETE", delete_url, timeout=10)
         except Exception:
             pass
         return {"success": False, "error": f"PIN rejected: {error_detail}"}
-        
+
     except Exception as e:
         _LOGGER.error("%s: Error adding credential to user %d: %s", entry_id, user_id, e)
-        # Try to clean up the user we just created
         try:
             delete_url = f"{cfg['base_url']}/api/Users/{user_id}"
             await _request_with_reauth(hass, entry_id, "DELETE", delete_url, timeout=10)
         except Exception:
             pass
         return {"success": False, "error": f"Failed to add PIN credential: {e}"}
+
+    # Assign the user to each door's APG. Per-door failures don't roll back the
+    # whole operation — we report which doors got assigned and which didn't.
+    door_results: list[dict] = []
+    for did in door_ids:
+        did_int = int(did)
+        apg_id = apg_by_door.get(did_int)
+        if not apg_id:
+            door_results.append({
+                "door_id": did_int,
+                "success": False,
+                "error": "Could not find/create Access Privilege Group for door",
+            })
+            continue
+
+        apg_user_url = f"{cfg['base_url']}/api/AccessPrivilegeGroups/{apg_id}/Users/{user_id}"
+        try:
+            await _request_with_reauth(hass, entry_id, "PUT", apg_user_url, json={}, timeout=10)
+            _LOGGER.info("%s: Assigned user %d to APG %d (door %d)", entry_id, user_id, apg_id, did_int)
+            door_results.append({"door_id": did_int, "success": True})
+        except Exception as e:
+            _LOGGER.warning(
+                "%s: Failed to assign user %d to APG %d (door %d): %s",
+                entry_id, user_id, apg_id, did_int, e
+            )
+            door_results.append({"door_id": did_int, "success": False, "error": str(e)})
+
+    return {"success": True, "user_id": user_id, "doors": door_results}
 
 
 async def delete_temp_code_user(
@@ -1182,7 +1305,7 @@ async def delete_temp_code_user(
                 break
     
     if not target_user:
-        _LOGGER.warning("%s: No temp user found with PIN %s", entry_id, pin_code)
+        _LOGGER.debug("%s: No temp user found with PIN %s", entry_id, pin_code)
         return {"success": False, "error": f"No temporary user found with PIN {pin_code}"}
     
     user_id = target_user.get("Id")
@@ -1194,8 +1317,35 @@ async def delete_temp_code_user(
         await _request_with_reauth(hass, entry_id, "DELETE", url, timeout=10)
         _LOGGER.info("%s: Deleted temp user %d (PIN: %s)", entry_id, user_id, pin_code)
         return {"success": True}
-        
+
     except Exception as e:
+        # Hartmann sometimes returns 400 from DELETE even when the user record
+        # was successfully removed — typically due to audit-history references
+        # the API can't fully clean up under forceDelete. Verify by re-fetching:
+        # if the user is gone, treat the failed call as success.
+        try:
+            verify_url = f"{cfg['base_url']}/api/Users/{user_id}"
+            verify_resp = await _request_with_reauth(
+                hass, entry_id, "GET", verify_url, timeout=10
+            )
+            # If we got a 200, the user still exists → real failure
+            still_exists = bool(verify_resp.json())
+        except httpx.HTTPStatusError as verify_err:
+            # 404 means the user is gone → treat as success
+            if verify_err.response is not None and verify_err.response.status_code == 404:
+                still_exists = False
+            else:
+                still_exists = True
+        except Exception:
+            still_exists = True
+
+        if not still_exists:
+            _LOGGER.info(
+                "%s: DELETE for user %d returned an error but user is gone — treating as success",
+                entry_id, user_id,
+            )
+            return {"success": True}
+
         _LOGGER.error("%s: Error deleting temp user %d: %s", entry_id, user_id, e)
         return {"success": False, "error": f"Failed to delete user: {e}"}
 
@@ -1251,6 +1401,127 @@ async def update_panels(hass, entry_id: str) -> dict:
     except Exception as e:
         _LOGGER.error("%s: Error sending Update Panels: %s", entry_id, e)
         return {"success": False, "error": f"Failed to update panels: {e}"}
+
+
+async def add_user_to_door_apg(
+    hass,
+    entry_id: str,
+    user_id: int,
+    door_id: int,
+) -> dict:
+    """Assign an existing temp user to an additional door's APG.
+
+    Used by the `add_door_to_temp_code` service to extend an existing temp
+    code's reach to a new door without changing the PIN. Finds (or creates,
+    if it doesn't exist yet) the `HA Temp Access - {door_name}` APG for the
+    given door and PUTs the user into it.
+
+    Returns {"success": True, "apg_id": int} on success,
+    or {"success": False, "error": str} on failure.
+    """
+    cfg = hass.data[DOMAIN][entry_id]
+
+    # Resolve door name
+    doors = await get_all_doors(hass, entry_id)
+    door_name: Optional[str] = None
+    for d in doors:
+        if int(d.get("Id") or 0) == int(door_id):
+            door_name = d.get("Name") or f"Door {door_id}"
+            break
+    if not door_name:
+        return {"success": False, "error": f"Door {door_id} not found"}
+
+    apg_id = await find_or_create_temp_apg(hass, entry_id, int(door_id), door_name)
+    if not apg_id:
+        return {"success": False, "error": "Failed to create/find Access Privilege Group for door"}
+
+    apg_user_url = f"{cfg['base_url']}/api/AccessPrivilegeGroups/{apg_id}/Users/{user_id}"
+    try:
+        await _request_with_reauth(hass, entry_id, "PUT", apg_user_url, json={}, timeout=10)
+        _LOGGER.info(
+            "%s: Assigned user %d to APG %d (door %d / %s)",
+            entry_id, user_id, apg_id, door_id, door_name,
+        )
+        return {"success": True, "apg_id": apg_id}
+    except Exception as e:
+        _LOGGER.error(
+            "%s: Failed to assign user %d to APG %d (door %d): %s",
+            entry_id, user_id, apg_id, door_id, e,
+        )
+        return {"success": False, "error": str(e)}
+
+
+async def remove_user_from_door_apg(
+    hass,
+    entry_id: str,
+    user_id: int,
+    door_id: int,
+) -> dict:
+    """Remove a temp user from a single door's APG.
+
+    Used by the `remove_door_from_temp_code` service. Looks up the APG by
+    its `HA Temp Access - {door_name}` name and DELETEs the user from it.
+    The Hartmann user record is left intact; this only removes one APG
+    assignment.
+
+    Returns {"success": True} on success,
+    or {"success": False, "error": str} on failure.
+    """
+    cfg = hass.data[DOMAIN][entry_id]
+
+    # Resolve door name to find the APG
+    doors = await get_all_doors(hass, entry_id)
+    door_name: Optional[str] = None
+    for d in doors:
+        if int(d.get("Id") or 0) == int(door_id):
+            door_name = d.get("Name") or f"Door {door_id}"
+            break
+    if not door_name:
+        return {"success": False, "error": f"Door {door_id} not found"}
+
+    apg_name = f"HA Temp Access - {door_name}"
+    existing_apgs = await get_access_privilege_groups(hass, entry_id)
+    apg_id: Optional[int] = None
+    for apg in existing_apgs:
+        if apg.get("Name") == apg_name:
+            apg_id = apg.get("Id")
+            break
+
+    if not apg_id:
+        # Already not assigned — treat as success
+        _LOGGER.info(
+            "%s: APG '%s' does not exist; nothing to remove for user %d",
+            entry_id, apg_name, user_id,
+        )
+        return {"success": True, "note": "APG did not exist"}
+
+    apg_user_url = f"{cfg['base_url']}/api/AccessPrivilegeGroups/{apg_id}/Users/{user_id}"
+    try:
+        await _request_with_reauth(hass, entry_id, "DELETE", apg_user_url, timeout=10)
+        _LOGGER.info(
+            "%s: Removed user %d from APG %d (door %d / %s)",
+            entry_id, user_id, apg_id, door_id, door_name,
+        )
+        return {"success": True, "apg_id": apg_id}
+    except httpx.HTTPStatusError as e:
+        # 404 = not in that APG → idempotent success
+        if e.response is not None and e.response.status_code == 404:
+            _LOGGER.info(
+                "%s: User %d was not in APG %d (door %d) — treating as success",
+                entry_id, user_id, apg_id, door_id,
+            )
+            return {"success": True, "note": "User was not assigned to this APG"}
+        _LOGGER.error(
+            "%s: Failed to remove user %d from APG %d (door %d): %s",
+            entry_id, user_id, apg_id, door_id, e,
+        )
+        return {"success": False, "error": str(e)}
+    except Exception as e:
+        _LOGGER.error(
+            "%s: Failed to remove user %d from APG %d (door %d): %s",
+            entry_id, user_id, apg_id, door_id, e,
+        )
+        return {"success": False, "error": str(e)}
 
 
 async def build_statusid_to_doorid_map(hass, entry_id: str) -> Dict[str, int]:
@@ -1513,7 +1784,13 @@ async def get_one_time_runs(
         return schedules
         
     except Exception as e:
-        _LOGGER.warning("%s: Error fetching OneTimeRun schedules: %s", entry_id, e)
+        if _is_transient_outage(e):
+            _LOGGER.info(
+                "%s: OneTimeRun fetch failed (server unreachable, will retry): %s",
+                entry_id, e,
+            )
+        else:
+            _LOGGER.warning("%s: Error fetching OneTimeRun schedules: %s", entry_id, e)
         return []
 
 
@@ -1551,3 +1828,389 @@ async def delete_one_time_run(
     except Exception as e:
         _LOGGER.error("%s: Error deleting OneTimeRun %d: %s", entry_id, schedule_id, e)
         return {"success": False, "error": f"Failed to delete schedule: {e}"}
+
+
+
+# ============================================================================
+# Managed Door Schedules (HA-controlled DoorTimeZones)
+# ============================================================================
+#
+# Goal: let HA flip a door's "default" schedule (DoorTimeZoneId) at runtime so
+# changes survive panel reboots — unlike PanelCommands/OverrideDoor which
+# does not persist across panel restarts.
+#
+# Verified API shapes (Protector.Net + Odyssey share these):
+#
+#   GET  /api/Doors                           -> Paged list of full Door
+#                                                objects (HAS DoorTimeZoneId).
+#                                                The single-door GET returns
+#                                                DoorBase wrapped in {Result},
+#                                                which LACKS DoorTimeZoneId,
+#                                                so we never use it.
+#
+#   PUT  /api/Doors/{Id}                      -> GenericUpdateRequest envelope:
+#                                                {"Properties":[{"Name":..,"Value":..}]}
+#                                                Just the fields you want to
+#                                                change. NOT whole-object.
+#
+#   POST /api/DoorTimeZones                   -> AddDoorTimeZone:
+#                                                {"PartitionIds":[..], "Name":..,
+#                                                 "Description":..,
+#                                                 "TimeSpans":[DoorTimeSpanRequest]}
+#
+#   PUT  /api/DoorTimeZones/{Id}/TimeSpans    -> UpdateDoorTimeSpans:
+#                                                {"Id":.., "TimeSpans":[..]}
+#
+#   DoorTimeSpanRequest fields:
+#     DayOfWeek  : enum string ("Sunday".."Saturday")
+#     StartTime  : int (minutes from midnight, 0..1439)
+#     StopTime   : int (minutes from midnight, 0..1439)
+#     Mode       : enum string (DoorTimeZoneMode)
+
+
+# Day-of-week index -> enum string.
+_DOW_NAMES = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"]
+
+# Mirrored from the swagger DoorTimeZoneMode enum so we can validate locally.
+DoorTimeZoneMode_VALUES = {
+    "Lockdown", "Card", "Pin", "CardOrPin", "CardAndPin",
+    "Unlock", "UnlockWithFirstCardIn", "DualCard",
+}
+
+
+def _ha_tz_description(entry_id: str, door_id: int) -> str:
+    """Description tag we stamp on every HA-created DoorTimeZone.
+
+    Used during cleanup to identify HA-created TZs unambiguously, even if a
+    user manually renames them in the Hartmann UI.
+    """
+    return f"protector_net:{entry_id}:door:{door_id}"
+
+
+def _ha_tz_name(entry_id: str, door_name: str) -> str:
+    """Visible name shown in the Hartmann TimeZones list. Max 60 chars."""
+    short = entry_id[:8]
+    full = f"HA[{short}] {door_name}"
+    return full[:60]
+
+
+def _build_full_week_timespans(mode: str) -> list[dict]:
+    """7 spans, one per weekday, 12:00 AM (0) -> 11:59 PM (1439), all in `mode`."""
+    if mode not in DoorTimeZoneMode_VALUES:
+        raise ValueError(f"Unknown DoorTimeZoneMode: {mode}")
+    return [
+        {"DayOfWeek": _DOW_NAMES[d], "StartTime": 0, "StopTime": 1439, "Mode": mode}
+        for d in range(7)
+    ]
+
+
+# ---------------------------------------------------------------------------
+# Door — read DoorTimeZoneId, change DoorTimeZoneId
+# ---------------------------------------------------------------------------
+
+async def get_door_with_tz(hass, entry_id: str, door_id: int) -> Optional[dict]:
+    """Find a door (full object including DoorTimeZoneId) by Id.
+
+    We use the LIST endpoint because the single-door GET returns DoorBase
+    (no DoorTimeZoneId field). The list endpoint returns the full Door schema.
+    """
+    for d in await get_all_doors(hass, entry_id):
+        try:
+            if int(d.get("Id") or 0) == int(door_id):
+                return d
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+async def get_door_time_zone_id(hass, entry_id: str, door_id: int) -> Optional[int]:
+    """Return the DoorTimeZoneId for a given door, or None if not findable."""
+    door = await get_door_with_tz(hass, entry_id, door_id)
+    if not door:
+        return None
+    tz = door.get("DoorTimeZoneId")
+    try:
+        return int(tz) if tz is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+async def set_door_time_zone_id(
+    hass,
+    entry_id: str,
+    door_id: int,
+    new_tz_id: int,
+) -> bool:
+    """PUT a single-property change to /api/Doors/{Id}.
+
+    Body shape (GenericUpdateRequest):
+        {"Properties": [{"Name": "DoorTimeZoneId", "Value": <int>}]}
+
+    Idempotent at the caller level: managed_schedules checks current_mode
+    and skips no-op flips before reaching here.
+    """
+    cfg = hass.data[DOMAIN][entry_id]
+    url = f"{cfg['base_url']}/api/Doors/{door_id}"
+    payload = {"Properties": [{"Name": "DoorTimeZoneId", "Value": int(new_tz_id)}]}
+    try:
+        await _request_with_reauth(hass, entry_id, "PUT", url, json=payload, timeout=15)
+        _LOGGER.info(
+            "%s: Door %s DoorTimeZoneId -> %s", entry_id, door_id, new_tz_id,
+        )
+        return True
+    except httpx.HTTPStatusError as e:
+        body = ""
+        try:
+            body = e.response.text
+        except Exception:
+            pass
+        _LOGGER.error(
+            "%s: Door %s PUT failed (set DoorTimeZoneId=%s): %s - %s",
+            entry_id, door_id, new_tz_id, e, body,
+        )
+        return False
+    except Exception as e:
+        _LOGGER.error(
+            "%s: Door %s PUT failed (set DoorTimeZoneId=%s): %s",
+            entry_id, door_id, new_tz_id, e,
+        )
+        return False
+
+
+# ---------------------------------------------------------------------------
+# DoorTimeZone CRUD
+# ---------------------------------------------------------------------------
+
+async def list_door_time_zones(hass, entry_id: str) -> list[dict]:
+    """GET /api/DoorTimeZones - list TZs in the partition."""
+    cfg = hass.data[DOMAIN][entry_id]
+    url = f"{cfg['base_url']}/api/DoorTimeZones"
+    params = {"PartitionId": cfg["partition_id"], "PageNumber": 1, "PerPage": 500}
+    try:
+        resp = await _request_with_reauth(hass, entry_id, "GET", url, params=params, timeout=10)
+        data = resp.json() or {}
+        if isinstance(data, list):
+            return data
+        return data.get("Results") or []
+    except Exception as e:
+        _LOGGER.warning("%s: Failed to list DoorTimeZones: %s", entry_id, e)
+        return []
+
+
+async def _create_door_time_zone(
+    hass,
+    entry_id: str,
+    name: str,
+    description: str,
+    time_spans: list[dict],
+) -> Optional[int]:
+    """POST /api/DoorTimeZones (AddDoorTimeZone shape).
+
+    Body:
+        {
+          "PartitionIds": [<partition_id>],
+          "Name": "...",
+          "Description": "...",
+          "TimeSpans": [DoorTimeSpanRequest, ...]
+        }
+
+    Returns new TZ Id on success, or None on failure. Handles Id=0 by
+    re-listing and matching on Name + Description tag.
+    """
+    cfg = hass.data[DOMAIN][entry_id]
+    payload = {
+        "PartitionIds": [int(cfg["partition_id"])],
+        "Name":         name[:60],
+        "Description":  description[:255],
+        "TimeSpans":    time_spans,
+    }
+    url = f"{cfg['base_url']}/api/DoorTimeZones"
+    _LOGGER.debug("%s: POST DoorTimeZone: %s", entry_id, payload)
+
+    try:
+        resp = await _request_with_reauth(hass, entry_id, "POST", url, json=payload, timeout=15)
+        result = resp.json() if resp.content else {}
+        tz_id = result.get("Id") if isinstance(result, dict) else None
+
+        if not tz_id:
+            # Hartmann's "Id=0 means success but you have to refetch" quirk.
+            import asyncio
+            await asyncio.sleep(0.5)
+            for tz in await list_door_time_zones(hass, entry_id):
+                if str(tz.get("Name") or "") == name[:60] \
+                   and str(tz.get("Description") or "") == description[:255]:
+                    tz_id = tz.get("Id")
+                    _LOGGER.debug("%s: Resolved DoorTimeZone Id=%s via re-list", entry_id, tz_id)
+                    break
+
+        if tz_id:
+            _LOGGER.info("%s: Created DoorTimeZone Id=%s name=%r", entry_id, tz_id, name)
+            return int(tz_id)
+        _LOGGER.error("%s: DoorTimeZone POST returned no Id: %s", entry_id, result)
+        return None
+    except httpx.HTTPStatusError as e:
+        body = ""
+        try:
+            body = e.response.text
+        except Exception:
+            pass
+        _LOGGER.error("%s: DoorTimeZone POST failed: %s - %s", entry_id, e, body)
+        return None
+    except Exception as e:
+        _LOGGER.error("%s: DoorTimeZone POST failed: %s", entry_id, e)
+        return None
+
+
+async def _put_door_time_zone_time_spans(
+    hass,
+    entry_id: str,
+    tz_id: int,
+    time_spans: list[dict],
+) -> bool:
+    """PUT /api/DoorTimeZones/{Id}/TimeSpans (UpdateDoorTimeSpans shape).
+
+    Body:
+        {"Id": <tz_id>, "TimeSpans": [DoorTimeSpanRequest, ...]}
+    """
+    cfg = hass.data[DOMAIN][entry_id]
+    url = f"{cfg['base_url']}/api/DoorTimeZones/{tz_id}/TimeSpans"
+    payload = {"Id": int(tz_id), "TimeSpans": time_spans}
+    try:
+        await _request_with_reauth(hass, entry_id, "PUT", url, json=payload, timeout=15)
+        return True
+    except httpx.HTTPStatusError as e:
+        body = ""
+        try:
+            body = e.response.text
+        except Exception:
+            pass
+        _LOGGER.error(
+            "%s: TimeSpans PUT failed for tz %s: %s - %s",
+            entry_id, tz_id, e, body,
+        )
+        return False
+    except Exception as e:
+        _LOGGER.error("%s: TimeSpans PUT failed for tz %s: %s", entry_id, tz_id, e)
+        return False
+
+
+async def _delete_door_time_zone(hass, entry_id: str, tz_id: int) -> bool:
+    """DELETE /api/DoorTimeZones/{Id}.
+
+    Hartmann normally refuses to delete a TZ that's still assigned to a door,
+    so callers must repoint any doors at their original TZ first.
+    """
+    cfg = hass.data[DOMAIN][entry_id]
+    url = f"{cfg['base_url']}/api/DoorTimeZones/{tz_id}"
+    try:
+        await _request_with_reauth(hass, entry_id, "DELETE", url, timeout=10)
+        _LOGGER.info("%s: Deleted DoorTimeZone Id=%s", entry_id, tz_id)
+        return True
+    except httpx.HTTPStatusError as e:
+        body = ""
+        try:
+            body = e.response.text
+        except Exception:
+            pass
+        _LOGGER.warning("%s: DELETE DoorTimeZone %s failed: %s - %s", entry_id, tz_id, e, body)
+        return False
+    except Exception as e:
+        _LOGGER.warning("%s: DELETE DoorTimeZone %s failed: %s", entry_id, tz_id, e)
+        return False
+
+
+# ---------------------------------------------------------------------------
+# High-level helpers used by managed_schedules.py
+# ---------------------------------------------------------------------------
+
+async def provision_managed_tz(
+    hass,
+    entry_id: str,
+    door_id: int,
+    door_name: str,
+    initial_mode: str,
+) -> Optional[dict]:
+    """Create the HA DoorTimeZone for a given door.
+
+    Returns {"id": int, "name": str, "mode": str} on success, None on failure.
+    """
+    name = _ha_tz_name(entry_id, door_name)
+    desc = _ha_tz_description(entry_id, door_id)
+    spans = _build_full_week_timespans(initial_mode)
+    tz_id = await _create_door_time_zone(hass, entry_id, name, desc, spans)
+    if not tz_id:
+        return None
+    return {"id": tz_id, "name": name, "mode": initial_mode}
+
+
+async def set_managed_tz_mode(
+    hass,
+    entry_id: str,
+    tz_id: int,
+    name: str,        # accepted for symmetry; not needed by /TimeSpans endpoint
+    door_id: int,     # ditto
+    mode: str,
+) -> bool:
+    """Replace the HA TZ's TimeSpans with 7 days at the given mode."""
+    spans = _build_full_week_timespans(mode)
+    return await _put_door_time_zone_time_spans(hass, entry_id, tz_id, spans)
+
+
+async def find_orphan_managed_tzs(hass, entry_id: str) -> list[dict]:
+    """Find DoorTimeZones in the partition tagged for THIS entry.
+
+    Used by recovery / cleanup paths to catch HA TZs that ended up orphaned
+    (e.g. options state corrupted, integration deleted then re-added).
+    """
+    tag = f"protector_net:{entry_id}:"
+    out = []
+    for tz in await list_door_time_zones(hass, entry_id):
+        desc = str(tz.get("Description") or "")
+        if desc.startswith(tag):
+            out.append(tz)
+    return out
+
+
+# ============================================================================
+# Panel status (used by the hub-device panels-online sensor)
+# ============================================================================
+
+async def get_panels_online(hass, entry_id: str) -> dict:
+    """GET /api/PanelCommands/PanelsOnline.
+
+    Returns:
+        {"online": ["<mac>",...], "offline": ["<mac>",...]}
+    or {"online": [], "offline": []} on error (logged at debug level).
+    """
+    cfg = hass.data[DOMAIN][entry_id]
+    url = f"{cfg['base_url']}/api/PanelCommands/PanelsOnline"
+    try:
+        resp = await _request_with_reauth(hass, entry_id, "GET", url, timeout=10)
+        data = resp.json() or {}
+        return {
+            "online":  list(data.get("PanelsOnline") or []),
+            "offline": list(data.get("PanelsOffline") or []),
+        }
+    except Exception as e:
+        _LOGGER.debug("%s: Failed to fetch PanelsOnline: %s", entry_id, e)
+        return {"online": [], "offline": []}
+
+
+async def get_panels(hass, entry_id: str) -> list[dict]:
+    """GET /api/Panels (partition-scoped) — full HardwarePanel list.
+
+    Used to build a MAC -> Name (and model) map for the panels-online
+    sensor so its attributes show friendly identifiers, not raw MACs.
+    """
+    cfg = hass.data[DOMAIN][entry_id]
+    url = f"{cfg['base_url']}/api/Panels"
+    params = {"PartitionId": cfg["partition_id"], "PageNumber": 1, "PerPage": 500}
+    try:
+        resp = await _request_with_reauth(hass, entry_id, "GET", url, params=params, timeout=10)
+        data = resp.json() or {}
+        if isinstance(data, list):
+            return data
+        return data.get("Results") or []
+    except Exception as e:
+        _LOGGER.debug("%s: Failed to list Panels: %s", entry_id, e)
+        return []
