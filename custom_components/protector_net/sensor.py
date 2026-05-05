@@ -4,14 +4,16 @@ import asyncio
 import logging
 import re
 from dataclasses import dataclass
+from datetime import timedelta
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from homeassistant.components.sensor import SensorEntity, SensorEntityDescription, SensorDeviceClass
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import STATE_UNKNOWN, STATE_UNAVAILABLE
 from homeassistant.core import HomeAssistant, callback
-from homeassistant.helpers.dispatcher import async_dispatcher_connect
+from homeassistant.helpers.dispatcher import async_dispatcher_connect, async_dispatcher_send
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.helpers.event import async_track_point_in_time, async_call_later
 from homeassistant.helpers.typing import StateType
 from homeassistant.helpers.restore_state import RestoreEntity
 from homeassistant.util import dt as dt_util
@@ -187,10 +189,12 @@ async def async_setup_entry(
     base_url: str = cfg["base_url"]
     host = base_url.split("://", 1)[1]
 
-    # Create hub status sensor immediately so platform returns quickly
+    # Create hub status + panels-online sensors immediately so platform
+    # returns quickly. Both attach to the same hub device.
     hub_ent = ProtectorHubSensor(hass, entry.entry_id, base_url)
-    
-    async_add_entities([hub_ent])
+    panels_ent = ProtectorPanelsOnlineSensor(hass, entry.entry_id, base_url)
+
+    async_add_entities([hub_ent, panels_ent])
 
     # Defer door discovery to a background task (don’t block startup)
     async def _add_doors_later() -> None:
@@ -378,9 +382,175 @@ class ProtectorHubSensor(SensorEntity, RestoreEntity):
 
 
 # ------------------------
-# OTR Schedules sensor - shows OneTimeRun schedules per door
+# Panels Online sensor — polls /api/PanelCommands/PanelsOnline and shows
+# how many of the partition's panels are reachable. Attached to the hub
+# device so it lives next to "Hub Status" in the UI.
 # ------------------------
-from datetime import timedelta
+
+PANELS_ONLINE_UPDATE_INTERVAL = timedelta(seconds=60)
+
+
+class ProtectorPanelsOnlineSensor(SensorEntity, RestoreEntity):
+    """Number of Hartmann panels currently online (per partition).
+
+    State:       integer count of panels online (e.g. 1, 2)
+    Attributes:  online_panels / offline_panels (list of {name, mac, model}),
+                 online_count, offline_count, total_count, all_online (bool),
+                 last_updated (ISO timestamp).
+    """
+
+    _attr_should_poll = False
+    _attr_icon = "mdi:server-network"
+
+    def __init__(self, hass: HomeAssistant, entry_id: str, base_url: str) -> None:
+        self.hass = hass
+        self._entry_id = entry_id
+        self._base_url = base_url
+        host = base_url.split("://", 1)[1]
+
+        entry_data = hass.data[DOMAIN].get(entry_id, {})
+        partition_name = (
+            entry_data.get("partition_name")
+            or (hass.config_entries.async_get_entry(entry_id).title.split("–", 1)[1].strip()
+                if hass.config_entries.async_get_entry(entry_id)
+                and "–" in hass.config_entries.async_get_entry(entry_id).title
+                else str(entry_data.get("partition_id", "Unknown")))
+        )
+        self._partition_name = partition_name
+
+        self._attr_name = f"Panels Online – {partition_name}"
+        self._attr_unique_id = f"{DOMAIN}_{host}_panels_online|{entry_id}"
+        self._attr_native_unit_of_measurement = "panels"
+
+        self._attr_native_value: StateType = None
+        self._online: list[dict] = []   # [{"name":..,"mac":..,"model":..}, ...]
+        self._offline: list[dict] = []
+        self._total: int = 0
+        self._last_updated: Optional[str] = None
+        # MAC -> {"name","model"} so we don't refetch /api/Panels every tick
+        self._mac_meta: dict[str, dict[str, Any]] = {}
+        self._unsub_timer: Optional[Callable[[], None]] = None
+
+    @property
+    def device_info(self):
+        return {
+            "identifiers": {(DOMAIN, f"hub:{self._base_url.split('://',1)[1]}|{self._entry_id}")},
+            "manufacturer": "Yoel Goldstein/Vaayer LLC",
+            "model": "Protector.Net Hub",
+            "name": f"Hub Status – {self._partition_name}",
+            "configuration_url": self._base_url,
+        }
+
+    @property
+    def extra_state_attributes(self) -> Dict[str, Any]:
+        return {
+            "online_panels":  self._online,
+            "offline_panels": self._offline,
+            "online_count":   len(self._online),
+            "offline_count":  len(self._offline),
+            "total_count":    self._total,
+            "all_online":     (len(self._offline) == 0 and self._total > 0),
+            "last_updated":   self._last_updated,
+        }
+
+    async def async_added_to_hass(self) -> None:
+        await super().async_added_to_hass()
+
+        # Restore last numeric state (best-effort) so the UI doesn't flash
+        # "unknown" before the first poll completes.
+        last = await self.async_get_last_state()
+        if last and last.state not in (STATE_UNKNOWN, STATE_UNAVAILABLE, None, ""):
+            try:
+                self._attr_native_value = int(last.state)
+            except (ValueError, TypeError):
+                pass
+        if last:
+            la = last.attributes or {}
+            self._online = la.get("online_panels", []) or []
+            self._offline = la.get("offline_panels", []) or []
+            self._total = int(la.get("total_count", 0) or 0)
+            self._last_updated = la.get("last_updated")
+
+        # First poll, then schedule periodic refresh.
+        await self._async_refresh()
+
+        from homeassistant.helpers.event import async_track_time_interval
+
+        async def _scheduled(_now):
+            await self._async_refresh()
+
+        self._unsub_timer = async_track_time_interval(
+            self.hass, _scheduled, PANELS_ONLINE_UPDATE_INTERVAL,
+        )
+
+    async def async_will_remove_from_hass(self) -> None:
+        if self._unsub_timer:
+            self._unsub_timer()
+            self._unsub_timer = None
+
+    async def async_update(self) -> None:
+        """Manual-refresh hook (HA's "Update entity" button)."""
+        await self._async_refresh()
+
+    async def _async_refresh(self) -> None:
+        """Fetch online/offline MACs and resolve them to friendly names."""
+        from . import api
+        from datetime import datetime
+
+        try:
+            status = await api.get_panels_online(self.hass, self._entry_id)
+        except Exception as e:
+            _LOGGER.debug("[%s] panels-online refresh failed: %s", self._entry_id, e)
+            return
+
+        online_macs  = {str(m).strip() for m in status.get("online", []) if m}
+        offline_macs = {str(m).strip() for m in status.get("offline", []) if m}
+
+        # If we don't know about any of these MACs yet, refresh the meta map.
+        # PanelsOnline only returns MACs, so we GET /api/Panels once to map
+        # MAC -> Name (and model). We refresh the cache only when we see a
+        # MAC we don't recognize, which keeps polling cheap.
+        unknown = (online_macs | offline_macs) - set(self._mac_meta.keys())
+        if unknown or not self._mac_meta:
+            try:
+                panels = await api.get_panels(self.hass, self._entry_id)
+                fresh: dict[str, dict[str, Any]] = {}
+                for p in panels:
+                    mac = str(p.get("PanelMacAddress") or "").strip()
+                    if not mac:
+                        continue
+                    # Prefer the last observed IP (what the panel actually
+                    # used to talk to the server most recently); fall back
+                    # to the configured IP if the panel has never connected.
+                    ip = (
+                        str(p.get("LastKnownIPAddress") or "").strip()
+                        or str(p.get("PanelIPAddress") or "").strip()
+                    )
+                    fresh[mac] = {
+                        "name":  p.get("Name") or f"Panel {p.get('Id')}",
+                        "model": p.get("PanelModel") or "",
+                        "ip":    ip,
+                    }
+                self._mac_meta = fresh
+            except Exception as e:
+                _LOGGER.debug("[%s] panels meta refresh failed: %s", self._entry_id, e)
+
+        def _decorate(mac: str) -> dict[str, Any]:
+            meta = self._mac_meta.get(mac, {})
+            return {
+                "name":  meta.get("name", mac),
+                "mac":   mac,
+                "model": meta.get("model", ""),
+                "ip":    meta.get("ip", ""),
+            }
+
+        self._online  = sorted([_decorate(m) for m in online_macs],  key=lambda x: x["name"])
+        self._offline = sorted([_decorate(m) for m in offline_macs], key=lambda x: x["name"])
+        self._total = len(self._online) + len(self._offline)
+        self._attr_native_value = len(self._online)
+        self._last_updated = datetime.now().isoformat(timespec="seconds")
+
+        self.async_write_ha_state()
 
 OTR_UPDATE_INTERVAL = timedelta(minutes=5)
 
@@ -948,6 +1118,8 @@ class ProtectorDoorTempCodeSensor(SensorEntity, RestoreEntity):
             "door_id": self._door_id,
         }
         self._unsub: Optional[Callable[[], None]] = None
+        # Auto-expiration: maps code_name -> cancel function for scheduled deletion
+        self._expiration_tasks: Dict[str, Callable[[], None]] = {}
 
     @property
     def device_info(self):
@@ -1027,12 +1199,23 @@ class ProtectorDoorTempCodeSensor(SensorEntity, RestoreEntity):
                     "[%s] Door %d: Created temp code '%s': %s",
                     self._entry_id, self._door_id, code_name, code
                 )
+
+                # Schedule auto-expiration if end_time provided
+                if code_name and code and evt.get("end_time"):
+                    self._schedule_expiration(code_name, code, evt.get("end_time"))
                 
             elif action == "delete":
                 code = evt.get("code")
-                
-                # Remove from active codes list
+
+                # Cancel any scheduled expiration(s) for this code BEFORE filtering
                 active_codes = list(self._attrs.get("active_codes", []))
+                for c in active_codes:
+                    if c.get("code") == code:
+                        cn = c.get("code_name")
+                        if cn:
+                            self._cancel_expiration(cn)
+
+                # Remove from active codes list
                 active_codes = [c for c in active_codes if c.get("code") != code]
                 self._attrs["active_codes"] = active_codes
                 
@@ -1050,12 +1233,14 @@ class ProtectorDoorTempCodeSensor(SensorEntity, RestoreEntity):
             elif action == "update":
                 update_name = evt.get("code_name")
                 active_codes = list(self._attrs.get("active_codes", []))
+                updated_code: Optional[str] = None
                 for entry in active_codes:
                     if entry.get("code_name") == update_name:
                         if evt.get("end_time") is not None:
                             entry["end_time"] = evt["end_time"]
                         if evt.get("start_time") is not None:
                             entry["start_time"] = evt["start_time"]
+                        updated_code = entry.get("code")
                         break
                 self._attrs["active_codes"] = active_codes
                 
@@ -1063,12 +1248,200 @@ class ProtectorDoorTempCodeSensor(SensorEntity, RestoreEntity):
                     "[%s] Door %d: Updated temp code '%s'",
                     self._entry_id, self._door_id, update_name
                 )
+
+                # Reschedule expiration if end_time was changed
+                if (
+                    update_name
+                    and updated_code
+                    and evt.get("end_time") is not None
+                ):
+                    self._schedule_expiration(
+                        update_name, updated_code, evt["end_time"]
+                    )
             
             self.async_write_ha_state()
 
         self._unsub = async_dispatcher_connect(self.hass, signal, _handle_temp_code)
 
+        # After restoring state, schedule auto-expiration for any restored codes
+        # with an end_time. Codes already past their end_time will be cleaned up
+        # immediately.
+        for entry in list(self._attrs.get("active_codes", []) or []):
+            cn = entry.get("code_name")
+            cd = entry.get("code")
+            et = entry.get("end_time")
+            if cn and cd and et:
+                self._schedule_expiration(cn, cd, et)
+
     async def async_will_remove_from_hass(self) -> None:
+        # Cancel any pending auto-expiration tasks
+        for unsub in list(self._expiration_tasks.values()):
+            try:
+                unsub()
+            except Exception:  # noqa: BLE001
+                pass
+        self._expiration_tasks.clear()
+
         if self._unsub:
             self._unsub()
             self._unsub = None
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Auto-expiration helpers
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def _parse_end_time(self, end_time_str: Optional[str]):
+        """Parse end_time into a tz-aware datetime. Naive strings are treated as
+        Home Assistant's local time. Returns None if unparseable/empty."""
+        if not end_time_str:
+            return None
+        try:
+            from datetime import datetime
+            s = str(end_time_str).strip()
+            dt = None
+            try:
+                dt = datetime.fromisoformat(s)
+            except ValueError:
+                for fmt in (
+                    "%Y-%m-%dT%H:%M:%S",
+                    "%Y-%m-%d %H:%M:%S",
+                    "%Y-%m-%dT%H:%M",
+                ):
+                    try:
+                        dt = datetime.strptime(s, fmt)
+                        break
+                    except ValueError:
+                        continue
+            if dt is None:
+                return None
+            if dt.tzinfo is None:
+                tz = dt_util.get_time_zone(self.hass.config.time_zone)
+                if tz is None:
+                    tz = dt_util.DEFAULT_TIME_ZONE
+                dt = dt.replace(tzinfo=tz)
+            return dt
+        except Exception as e:  # noqa: BLE001
+            _LOGGER.debug(
+                "[%s] Could not parse end_time '%s': %s",
+                self._entry_id, end_time_str, e
+            )
+            return None
+
+    def _cancel_expiration(self, code_name: str) -> None:
+        """Cancel any scheduled expiration for the given code_name."""
+        unsub = self._expiration_tasks.pop(code_name, None)
+        if unsub:
+            try:
+                unsub()
+            except Exception:  # noqa: BLE001
+                pass
+
+    def _schedule_expiration(
+        self, code_name: str, code: str, end_time_str: Optional[str]
+    ) -> None:
+        """Schedule auto-deletion at end_time. Replaces any prior schedule for
+        this code_name. If end_time is already past, fires immediately."""
+        # Replace any existing schedule
+        self._cancel_expiration(code_name)
+
+        dt = self._parse_end_time(end_time_str)
+        if dt is None:
+            return
+
+        now = dt_util.utcnow()
+        if dt <= now:
+            # Already past — fire immediately
+            self.hass.async_create_task(
+                self._async_expire_code(code_name, code)
+            )
+            return
+
+        @callback
+        def _fire(_now) -> None:
+            self.hass.async_create_task(
+                self._async_expire_code(code_name, code)
+            )
+
+        unsub = async_track_point_in_time(self.hass, _fire, dt)
+        self._expiration_tasks[code_name] = unsub
+        _LOGGER.debug(
+            "[%s] Door %d: Scheduled auto-expire for '%s' at %s",
+            self._entry_id, self._door_id, code_name, dt.isoformat()
+        )
+
+    async def _async_expire_code(self, code_name: str, code: str) -> None:
+        """Fire when a temp code reaches its end_time. Deletes the user from
+        Hartmann and removes the code from this sensor's active_codes. If the
+        Hartmann delete fails, retries every hour until it succeeds."""
+        from . import api
+
+        # Pop tracker — this scheduled task has fired
+        self._expiration_tasks.pop(code_name, None)
+
+        # If the integration has been unloaded for this entry, bail
+        if self._entry_id not in self.hass.data.get(DOMAIN, {}):
+            _LOGGER.debug(
+                "[%s] Auto-expire skipped for '%s': entry no longer loaded",
+                self._entry_id, code_name
+            )
+            return
+
+        _LOGGER.info(
+            "[%s] Door %d: Auto-expiring temp code '%s'",
+            self._entry_id, self._door_id, code_name
+        )
+
+        hartmann_ok = False
+        err_msg: Optional[str] = None
+        try:
+            result = await api.delete_temp_code_user(
+                hass=self.hass,
+                entry_id=self._entry_id,
+                door_id=self._door_id,
+                pin_code=code,
+            )
+            if result.get("success"):
+                hartmann_ok = True
+            else:
+                err_msg = str(result.get("error") or "unknown error")
+                # If the user is already gone, treat as success
+                if "No temporary user found" in err_msg:
+                    _LOGGER.info(
+                        "[%s] Auto-expire: Hartmann user for '%s' already gone — cleaning sensor.",
+                        self._entry_id, code_name
+                    )
+                    hartmann_ok = True
+        except Exception as e:  # noqa: BLE001
+            err_msg = str(e)
+
+        if hartmann_ok:
+            # Dispatch the standard sensor delete event (matches existing flow)
+            async_dispatcher_send(
+                self.hass,
+                f"{DISPATCH_TEMP_CODE}_{self._entry_id}",
+                {
+                    "action": "delete",
+                    "door_id": self._door_id,
+                    "code": code,
+                }
+            )
+            return
+
+        # Hartmann failed — keep entry in sensor and retry in 1 hour. We
+        # log at INFO since retry is the normal recovery path and we don't
+        # want to spam the HA logs panel with custom-integration warnings
+        # that the user can't action on directly.
+        _LOGGER.info(
+            "[%s] Auto-expire: Hartmann delete failed for '%s' (%s). "
+            "Retrying in 1 hour. Code remains in sensor until success.",
+            self._entry_id, code_name, err_msg or "unknown",
+        )
+
+        @callback
+        def _retry(_now) -> None:
+            self.hass.async_create_task(
+                self._async_expire_code(code_name, code)
+            )
+
+        unsub = async_call_later(self.hass, 3600, _retry)
+        self._expiration_tasks[code_name] = unsub
