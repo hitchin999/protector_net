@@ -28,6 +28,33 @@ DISPATCH_HUB  = f"{DOMAIN}_hub_event"
 DISPATCH_LOG  = f"{DOMAIN}_door_log"          # Last Door Log sensor
 
 
+def _is_transient_outage(exc: BaseException) -> bool:
+    """Return True if the exception looks like a server-down/restart event.
+
+    These happen routinely (e.g. nightly reboots of the Hartmann box) and
+    aren't actionable for the user — we don't want them surfacing as WARNING
+    in HA's notifications. Real protocol errors (parse failure, auth, etc.)
+    still get logged at WARNING.
+    """
+    if isinstance(exc, (asyncio.TimeoutError, ConnectionError, OSError)):
+        return True
+    # aiohttp's ClientError covers ClientConnectorError, ServerDisconnectedError,
+    # ClientOSError, ServerTimeoutError, etc. — all reboot-class signals.
+    if isinstance(exc, ClientError):
+        return True
+    # Defensive name-based match — covers httpx exceptions that bubble up
+    # from api.py calls and any wrapper exceptions across library versions.
+    cls_name = type(exc).__name__.lower()
+    if any(tok in cls_name for tok in ("timeout", "connect", "disconnect",
+                                       "unreachable", "remoteprotocol",
+                                       "networkerror", "transporterror")):
+        return True
+    msg = str(exc).lower()
+    if "connection timeout" in msg or "cannot connect to host" in msg:
+        return True
+    return False
+
+
 def _mk_ssl_context(verify: bool) -> Optional[ssl.SSLContext]:
     """Return SSL context (None = default verify)."""
     if verify:
@@ -213,7 +240,16 @@ class SignalRClient:
         try:
             ov = await api.get_system_overview(self.hass, self.entry_id)
         except Exception as e:
-            _LOGGER.warning("[%s] Failed to fetch system overview (will retry): %s", self.entry_id, e)
+            if _is_transient_outage(e):
+                _LOGGER.info(
+                    "[%s] System overview fetch failed (server unreachable, will retry): %s",
+                    self.entry_id, e,
+                )
+            else:
+                _LOGGER.warning(
+                    "[%s] Failed to fetch system overview (will retry) [%s]: %s",
+                    self.entry_id, type(e).__name__, e,
+                )
             self._door_map = {}
             self._reader_by_id = {}
             self._reader_by_name = {}
@@ -680,7 +716,20 @@ class SignalRClient:
                         self.connected = False
                         self.phase = "error"
                         self.last_error = str(e)
-                        _LOGGER.warning("[%s] WS error (will retry): %s", self.entry_id, e)
+                        # Server reboots / unreachable network are routine and
+                        # not actionable. Log them at INFO so they don't
+                        # clutter the WARNING surface; real errors stay at
+                        # WARNING.
+                        if _is_transient_outage(e):
+                            _LOGGER.info(
+                                "[%s] WS connection lost (server unreachable, will retry): %s",
+                                self.entry_id, e,
+                            )
+                        else:
+                            _LOGGER.warning(
+                                "[%s] WS error (will retry) [%s]: %s",
+                                self.entry_id, type(e).__name__, e,
+                            )
                         self._push_hub_state()
 
                         # stop periodic sync if running
