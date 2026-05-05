@@ -134,6 +134,21 @@ action:
            | map(attribute='name') | join(', ') }}
 ```
 
+### Partition + door names sync from Hartmann
+Renaming a partition or a door in Hartmann is now picked up by HA automatically — no need to delete and re-add the integration, or even reload it.
+
+The integration syncs names on every load and re-checks every hour in the background:
+
+- The hub device picks up new partition names (which also updates the integration entry title and the card's partition section header)
+- Door devices get their new names, with entities re-labeled to match
+- Worst-case lag between a Hartmann rename and HA picking it up is about an hour
+
+**Custom names you've set in HA are preserved.** If you renamed a door in HA's UI (Settings → Devices → click the door → pencil icon), HA records that as `name_by_user` and the sync skips that device — your custom name wins forever, even when the Hartmann name changes.
+
+This is useful when the Hartmann admin names doors one way (say, internal codes like "Main 4") and you want different labels in HA ("Lobby Door"). Mix and match per-door — let some sync from Hartmann, override others.
+
+**Entity IDs never change** regardless of renames — automations referencing entities by entity_id keep working unconditionally.
+
 ### Manage Active PINs view (Hartman Door Lock Card)
 A new "Manage Active PINs" panel in the bulk actions area lets you see every active temp code at a glance — name, expiry, how many doors it unlocks, and the PIN itself (hidden behind a "show" toggle by default; flip the new `always_show_temp_pin: true` card option if you'd rather see them all). Clicking a code expands it inline so you can:
 
