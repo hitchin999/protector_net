@@ -157,6 +157,58 @@ update_panels:
   name: Update Panels
   description: Push current configuration to all connected panels. Use after creating/updating temp codes or OTR schedules for immediate effect.
 
+add_door_to_temp_code:
+  name: Add Door to Temp Code
+  description: Add an additional door to an existing temporary code. The same Hartmann user (and PIN) is assigned to the new door's APG, so the same code unlocks one more door.
+  fields:
+    door_device_id:
+      name: Door(s) to add
+      description: The door(s) to grant the existing temp code access to
+      required: true
+      selector:
+        device:
+          multiple: true
+          filter:
+            - integration: protector_net
+    code:
+      name: Code (PIN)
+      description: PIN value of the existing temp code (preferred — uniquely identifies the code)
+      required: false
+      selector:
+        text:
+    code_name:
+      name: Code Name
+      description: Name of the existing temp code (used if Code is not provided)
+      required: false
+      selector:
+        text:
+
+remove_door_from_temp_code:
+  name: Remove Door from Temp Code
+  description: Remove a door from an existing temporary code. The Hartmann user is left intact — only the user-to-APG link for that door is removed. Other doors keep working with the same PIN.
+  fields:
+    door_device_id:
+      name: Door(s) to remove
+      description: The door(s) to remove from the temp code
+      required: true
+      selector:
+        device:
+          multiple: true
+          filter:
+            - integration: protector_net
+    code:
+      name: Code (PIN)
+      description: PIN value of the existing temp code (preferred — uniquely identifies the code)
+      required: false
+      selector:
+        text:
+    code_name:
+      name: Code Name
+      description: Name of the existing temp code (used if Code is not provided)
+      required: false
+      selector:
+        text:
+
 create_otr_schedule:
   name: Create OTR Schedule
   description: Schedule a future door override (unlock, lockdown, etc.) using Hartmann's OneTimeRun feature. The override is stored in the panel and executes even if Home Assistant is offline.
@@ -324,3 +376,48 @@ resume_door:
           multiple: true
           filter:
             - integration: protector_net
+
+set_door_schedule_mode:
+  name: Set Door Schedule Mode (HA-managed)
+  description: >
+    Change the schedule mode for HA-managed doors. Unlike override_door, this
+    rewrites the door's actual schedule in Hartmann, so the change persists
+    across panel reboots. The door must first be added to "Managed doors" via
+    integration options.
+  fields:
+    door_device_id:
+      name: Door(s)
+      description: The door(s) to update. Must be HA-managed.
+      required: true
+      selector:
+        device:
+          multiple: true
+          filter:
+            - integration: protector_net
+    mode:
+      name: Mode
+      description: >
+        Schedule mode for the entire week, 24/7. If the door is currently
+        Active (using its HA TZ), an Update Panels is fired automatically.
+        If the door is only Provisioned (not yet Active), the new mode is
+        staged and takes effect when you activate it via integration options.
+      required: true
+      selector:
+        select:
+          options:
+            - label: "Lockdown"
+              value: "Lockdown"
+            - label: "Card Only"
+              value: "Card"
+            - label: "Pin Only"
+              value: "Pin"
+            - label: "Card or Pin"
+              value: "CardOrPin"
+            - label: "Card and Pin"
+              value: "CardAndPin"
+            - label: "Unlock"
+              value: "Unlock"
+            - label: "First Credential In"
+              value: "UnlockWithFirstCardIn"
+            - label: "Dual"
+              value: "DualCard"
