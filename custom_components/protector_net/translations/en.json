@@ -19,13 +19,14 @@
       },
       "plans": {
         "title": "Protector.Net Action Plans",
+        "description": "Select which trigger plans to clone (as System) and expose as Action Plan buttons.",
         "data": {
           "plans": "Select Action Plans to Import (If There Is Any)"
         }
       },
       "entity_selection": {
         "title": "Door Entities (Optional)",
-        "description": "These legacy button entities are optional and only needed for backwards compatibility. You can leave this empty.",
+        "description": "⚠️ These legacy button entities are optional and only needed for backwards compatibility. You can leave this empty — the new Override switch/selects provide the same functionality. Pulse Unlock is always added automatically.",
         "data": {
           "entities": "Select What Door Entities to Enable (Leave Empty If Not Needed)"
         }
@@ -36,11 +37,60 @@
     "step": {
       "init": {
         "title": "Protector.Net Options",
+        "menu_options": {
+          "basic_settings":   "Basic Settings",
+          "door_time_zones":  "Door Time Zones (HA-controlled schedules)"
+        }
+      },
+      "basic_settings": {
+        "title": "Basic Settings",
+        "description": "Adjust Action Plan buttons, override duration, and temp code settings. Pulse Unlock is always included automatically.",
         "data": {
-          "override_minutes": "Default Override Minutes",
-          "pin_digits":       "Default PIN Code Digits (4-9)",
-          "entities":         "Select Door Entities to Enable",
-          "plan_ids":         "Select Action Plans to Enable (If There Is Any)"
+          "override_minutes":  "Default Override Minutes",
+          "pin_digits":        "Default PIN Code Digits (4-9)",
+          "plan_ids":          "Select Action Plans to Enable (If There Is Any)"
+        },
+        "sections": {
+          "legacy_entities_section": {
+            "name": "Legacy Door Buttons (optional)",
+            "description": "⚠️ These legacy button entities are optional and only needed for backwards compatibility. You can leave this empty — the new Override switch/selects provide the same functionality. Pulse Unlock is always added automatically.",
+            "data": {
+              "entities": "Select Door Entities to Enable"
+            }
+          }
+        }
+      },
+      "door_time_zones": {
+        "title": "Door Time Zones",
+        "data": {
+          "auto_add_new_doors": "Auto-add new doors found in Hartmann"
+        },
+        "data_description": {
+          "auto_add_new_doors": "When ticked, new doors that appear in Hartmann after this point will be automatically managed AND activated by HA on the next hourly sync. They get a 24/7 'CardOrPin' Door Time Zone created and start following the HA schedule immediately. Existing doors are never touched by this. Leave off if you want to opt in each new door manually."
+        },
+        "sections": {
+          "managed_doors_section": {
+            "name": "Create Door Time Zones (HA-controlled schedules)",
+            "description": "Doors that HA will create a dedicated Door Time Zone for in Hartmann (named like 'HA[abc1234] Front Door' — an HA prefix with a short id, plus the door's name).\n\nCreating the Door Time Zone alone does NOT change door behavior — the door keeps following its existing Hartmann schedule until you also tick it under 'Activate Door Time Zones' below.\n\nNothing on this page does anything until you tick the 'Apply changes' checkbox below — opening this page is safe.\n\nUnticking a door later (with Apply ticked) rolls its schedule back to original and deletes the HA Door Time Zone.",
+            "data": {
+              "apply_managed_changes": "Apply changes to managed doors on submit",
+              "managed_doors_select":  "Pick doors"
+            },
+            "data_description": {
+              "apply_managed_changes": "Required to make any changes here. If unticked, the door list below is ignored on submit and your existing managed doors stay as they are."
+            }
+          },
+          "active_doors_section": {
+            "name": "Activate Door Time Zones (switch to HA schedules now)",
+            "description": "Subset of the doors above whose schedule HA actually controls right now. Ticking a door here flips its DoorTimeZoneId to the HA Door Time Zone we created above and pushes the change to panels.\n\nFrom there, use the 'set_door_schedule_mode' service to set the door's access mode (Lockdown, Card, Pin, CardOrPin, Unlock, etc.) — the service rewrites the HA Door Time Zone for the whole week and the panels pick up the change automatically.\n\nNothing on this page does anything until you tick the 'Apply changes' checkbox below — opening this page is safe.\n\nUnticking a door later (with Apply ticked) rolls the door back to its original schedule without removing the HA Door Time Zone.",
+            "data": {
+              "apply_active_changes": "Apply changes to active doors on submit",
+              "active_doors_select":  "Pick doors"
+            },
+            "data_description": {
+              "apply_active_changes": "Required to make any changes here. If unticked, the door list below is ignored on submit and your existing active doors stay as they are."
+            }
+          }
         }
       }
     }
@@ -141,6 +191,20 @@
         "door_device_id": {
           "name": "Door(s)",
           "description": "The door(s) to resume"
+        }
+      }
+    },
+    "set_door_schedule_mode": {
+      "name": "Set Door Schedule Mode (HA-managed)",
+      "description": "Change the schedule mode for HA-managed doors. Persists across panel reboots.",
+      "fields": {
+        "door_device_id": {
+          "name": "Door(s)",
+          "description": "The door(s) to update. Must be HA-managed (added under integration options)."
+        },
+        "mode": {
+          "name": "Mode",
+          "description": "Schedule mode for the entire week, 24/7."
         }
       }
     }
