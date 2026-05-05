@@ -4,9 +4,10 @@ import voluptuous as vol
 from urllib.parse import urlparse, urlsplit
 
 from homeassistant import config_entries
+from homeassistant.data_entry_flow import section
 from homeassistant.helpers import config_validation as cv
 
-from .const import DOMAIN, DEFAULT_OVERRIDE_MINUTES, DEFAULT_PIN_DIGITS, KEY_PLAN_IDS
+from .const import DOMAIN, DEFAULT_OVERRIDE_MINUTES, DEFAULT_PIN_DIGITS, KEY_PLAN_IDS, KEY_AUTO_ADD_NEW_DOORS
 from . import api
 
 _LOGGER = logging.getLogger(__name__)
@@ -187,9 +188,6 @@ class ProtectorNetConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 vol.Required("plans", default=list(self._plans.keys())):
                     cv.multi_select(self._plans),
             }),
-            description_placeholders={
-                "info": "Select which trigger plans to clone (as System) and expose as Action Plan buttons."
-            },
             errors=errors,
         )
 
@@ -219,11 +217,6 @@ class ProtectorNetConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             data_schema=vol.Schema({
                 vol.Required("entities", default=[]): cv.multi_select(ENTITY_CHOICES_OPTIONAL),
             }),
-            description_placeholders={
-                "info": "⚠️ These legacy button entities are optional and only needed for backwards compatibility. "
-                        "You can leave this empty - the new Override switch/selects provide the same functionality. "
-                        "Pulse Unlock is always added automatically."
-            },
         )
 
     @staticmethod
@@ -233,16 +226,35 @@ class ProtectorNetConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
 
 class ProtectorNetOptionsFlow(config_entries.OptionsFlow):
-    """Allow editing override_minutes, optional legacy door buttons, and action-plan selection."""
+    """Multi-step options flow:
+       - menu: pick basic settings or door time zones
+       - basic_settings: override minutes / pin digits / entities / action plans
+       - door_time_zones: provision + activate HA Door Time Zones
+                          (with explicit enable gates so opening the page
+                          can't accidentally trigger a reconcile)
+    """
 
     def __init__(self, entry):
         self.entry = entry
         self._plan_choices = {}
+        self._door_choices: dict[str, str] = {}  # {door_id_str: "Name (current TZ)"}
+        self._door_names: dict[int, str] = {}    # {door_id: "Name"}
 
+    # ------------------------------------------------------------------
+    # Entry point: menu
+    # ------------------------------------------------------------------
     async def async_step_init(self, user_input=None):
-        # Use the runtime (reauth-aware) fetch, not the config-flow GET
-        raw = await api.get_action_plans(self.hass, self.entry.entry_id)
+        return self.async_show_menu(
+            step_id="init",
+            menu_options=["basic_settings", "door_time_zones"],
+        )
 
+    # ------------------------------------------------------------------
+    # Step 1: basic settings (the original options form, minus schedules)
+    # ------------------------------------------------------------------
+    async def async_step_basic_settings(self, user_input=None):
+        # Action plans are needed to render the picker.
+        raw = await api.get_action_plans(self.hass, self.entry.entry_id)
         triggers = [
             p for p in raw
             if p.get("PlanType") == "Trigger"
@@ -251,26 +263,35 @@ class ProtectorNetOptionsFlow(config_entries.OptionsFlow):
         self._plan_choices = {str(p["Id"]): p["Name"] for p in triggers}
 
         if user_input is not None:
+            # The entities field is wrapped in a section() — the frontend
+            # nests its value under the section key, so dig in to extract.
+            entities_section = user_input.pop("legacy_entities_section", None) or {}
+            picked_raw = entities_section.get("entities", [])
+
             # Force Pulse Unlock to remain present; keep only valid optional picks
-            picked_optional = [e for e in user_input.get("entities", []) if e in ENTITY_CHOICES_OPTIONAL]
+            picked_optional = [e for e in picked_raw if e in ENTITY_CHOICES_OPTIONAL]
             user_input["entities"] = ["_pulse_unlock", *picked_optional]
+
+            # Preserve schedule-related options that aren't on this page —
+            # async_create_entry replaces the entire options dict, so we
+            # have to merge.
+            preserved_keys = ("managed_doors", KEY_AUTO_ADD_NEW_DOORS)
+            for k in preserved_keys:
+                if k in self.entry.options:
+                    user_input[k] = self.entry.options[k]
+
             return self.async_create_entry(title="", data=user_input)
 
         default_override = self.entry.options.get(
             "override_minutes", DEFAULT_OVERRIDE_MINUTES
         )
-        
         default_pin_digits = self.entry.options.get(
             "pin_digits", DEFAULT_PIN_DIGITS
         )
-
         saved_entities = self.entry.options.get(
             "entities", self.entry.data.get("entities", [])
         ) or []
-
-        # Show only optional ones in the picker (Pulse Unlock is implicit)
         default_entities_optional = [e for e in saved_entities if e in ENTITY_CHOICES_OPTIONAL]
-
         default_plans = [
             str(x)
             for x in self.entry.options.get(
@@ -280,17 +301,159 @@ class ProtectorNetOptionsFlow(config_entries.OptionsFlow):
         ]
 
         return self.async_show_form(
-            step_id="init",
+            step_id="basic_settings",
             data_schema=vol.Schema({
                 vol.Optional("override_minutes", default=default_override): int,
                 vol.Optional("pin_digits", default=default_pin_digits): int,
-                vol.Required("entities", default=default_entities_optional):
-                    cv.multi_select(ENTITY_CHOICES_OPTIONAL),
                 vol.Required(KEY_PLAN_IDS, default=default_plans):
                     cv.multi_select(self._plan_choices),
+                # Wrap the legacy entities multi-select in a section() so the
+                # warning description renders reliably above it. cv.multi_select
+                # has a frontend bug (#16594) that suppresses data_description
+                # rendering when the field renders as a checkbox-list, so the
+                # only way to get the warning visible is via a section()'s own
+                # description (which renders correctly).
+                vol.Required("legacy_entities_section"): section(
+                    vol.Schema({
+                        vol.Required("entities", default=default_entities_optional):
+                            cv.multi_select(ENTITY_CHOICES_OPTIONAL),
+                    }),
+                    {"collapsed": True},
+                ),
             }),
-            description_placeholders={
-                "info": "Adjust Action Plan buttons, override duration, and temp code settings. "
-                        "Pulse Unlock is always included automatically."
-            },
+        )
+
+    # ------------------------------------------------------------------
+    # Step 2: door time zones (provision + activate, with enable gates)
+    # ------------------------------------------------------------------
+    async def async_step_door_time_zones(self, user_input=None):
+        # Fetch doors so we can offer them in the managed/active multi-selects.
+        doors = await api.get_all_doors(self.hass, self.entry.entry_id)
+        self._door_choices = {}
+        self._door_names = {}
+        managed_now = self.entry.options.get("managed_doors") or {}
+        for d in doors:
+            did = int(d.get("Id") or 0)
+            if not did:
+                continue
+            name = str(d.get("Name") or f"Door {did}")
+            self._door_names[did] = name
+
+            # Annotate with current state for clarity in the picker.
+            tag = ""
+            info = managed_now.get(str(did)) or {}
+            if info.get("active"):
+                tag = " — active (HA-managed)"
+            elif info:
+                tag = " — provisioned (not yet active)"
+            self._door_choices[str(did)] = f"{name}{tag}"
+
+        if user_input is not None:
+            managed_section = user_input.get("managed_doors_section") or {}
+            active_section  = user_input.get("active_doors_section")  or {}
+
+            # Enable gates: if a section's checkbox isn't ticked, that side
+            # is left untouched. This preserves the existing managed_doors
+            # state for whichever side the user didn't explicitly enable.
+            apply_managed = bool(managed_section.get("apply_managed_changes", False))
+            apply_active  = bool(active_section.get("apply_active_changes", False))
+
+            # Compute the effective desired sets for reconcile():
+            #  - If "apply" is on, use the new selection from this submit
+            #  - If "apply" is off, use the current state (no change)
+            current_managed_ids = [int(k) for k in managed_now.keys()]
+            current_active_ids  = [int(k) for k, v in managed_now.items() if v.get("active")]
+
+            if apply_managed:
+                raw_managed = managed_section.get("managed_doors_select", []) or []
+                desired_managed = [int(x) for x in raw_managed]
+            else:
+                desired_managed = current_managed_ids
+
+            if apply_active:
+                raw_active = active_section.get("active_doors_select", []) or []
+                desired_active = [int(x) for x in raw_active]
+            else:
+                desired_active = current_active_ids
+
+            # Active must be a subset of managed.
+            desired_active = [d for d in desired_active if d in desired_managed]
+
+            # Auto-add toggle (a separate top-level field, not inside a section).
+            auto_add = bool(user_input.get(KEY_AUTO_ADD_NEW_DOORS, False))
+
+            # Only run reconcile if at least one side was explicitly applied.
+            # Otherwise we just persist the auto-add preference and exit.
+            new_options = dict(self.entry.options)
+
+            if apply_managed or apply_active:
+                from . import managed_schedules
+                summary = await managed_schedules.reconcile(
+                    self.hass,
+                    self.entry,
+                    desired_managed_door_ids=desired_managed,
+                    desired_active_door_ids=desired_active,
+                    door_names=self._door_names,
+                )
+                _LOGGER.info(
+                    "[%s] Door schedule reconcile: provisioned=%s activated=%s "
+                    "deactivated=%s unprovisioned=%s failed=%s",
+                    self.entry.entry_id,
+                    summary.get("provisioned"), summary.get("activated"),
+                    summary.get("deactivated"), summary.get("unprovisioned"),
+                    summary.get("failed"),
+                )
+                new_options["managed_doors"] = summary.get("managed_doors", {})
+            else:
+                # No schedule changes requested — keep existing managed_doors.
+                _LOGGER.debug(
+                    "[%s] Door Time Zones page submitted with no enable "
+                    "checkbox ticked; preserving managed_doors state",
+                    self.entry.entry_id,
+                )
+
+            new_options[KEY_AUTO_ADD_NEW_DOORS] = auto_add
+
+            return self.async_create_entry(title="", data=new_options)
+
+        # Form defaults:
+        # - Both "apply" gates default OFF (page can be opened safely without
+        #   triggering anything).
+        # - Both selects default to ALL doors pre-ticked. This is the bulk
+        #   behavior the user wants: tick "apply" + submit = manage/activate
+        #   everything; or untick the doors you don't want first.
+        all_door_ids = list(self._door_choices.keys())
+
+        # If the user already has managed doors saved, default the dropdown to
+        # show their existing choices instead — they're editing, not bulk-adding.
+        if managed_now:
+            default_managed = [str(k) for k in managed_now.keys()]
+            default_active  = [str(k) for k, v in managed_now.items() if v.get("active")]
+        else:
+            default_managed = all_door_ids
+            default_active  = all_door_ids
+
+        default_auto_add = bool(self.entry.options.get(KEY_AUTO_ADD_NEW_DOORS, False))
+
+        return self.async_show_form(
+            step_id="door_time_zones",
+            data_schema=vol.Schema({
+                vol.Required("managed_doors_section"): section(
+                    vol.Schema({
+                        vol.Optional("apply_managed_changes", default=False): bool,
+                        vol.Optional("managed_doors_select", default=default_managed):
+                            cv.multi_select(self._door_choices),
+                    }),
+                    {"collapsed": False},
+                ),
+                vol.Required("active_doors_section"): section(
+                    vol.Schema({
+                        vol.Optional("apply_active_changes", default=False): bool,
+                        vol.Optional("active_doors_select", default=default_active):
+                            cv.multi_select(self._door_choices),
+                    }),
+                    {"collapsed": False},
+                ),
+                vol.Optional(KEY_AUTO_ADD_NEW_DOORS, default=default_auto_add): bool,
+            }),
         )
