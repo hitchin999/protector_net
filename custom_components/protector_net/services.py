@@ -11,7 +11,7 @@ import logging
 import random
 import string
 from datetime import datetime
-from typing import Any
+from typing import Any, Optional
 
 import voluptuous as vol
 
@@ -19,7 +19,7 @@ from homeassistant.core import HomeAssistant, ServiceCall, ServiceResponse, Supp
 from homeassistant.helpers import config_validation as cv, entity_registry as er
 from homeassistant.helpers.dispatcher import async_dispatcher_send
 
-from .const import DOMAIN, UI_STATE
+from .const import DOMAIN, UI_STATE, SCHEDULE_MODES
 
 _LOGGER = logging.getLogger(f"{DOMAIN}.services")
 
@@ -79,6 +79,30 @@ SERVICE_CLEAR_ALL_TEMP_CODES_SCHEMA = vol.Schema(
     }
 )
 
+# Service names for managing which doors a temp code applies to
+SERVICE_ADD_DOOR_TO_TEMP_CODE = "add_door_to_temp_code"
+SERVICE_REMOVE_DOOR_FROM_TEMP_CODE = "remove_door_from_temp_code"
+
+# Schema for add/remove_door_to_temp_code services
+# Either `code` (PIN value) or `code_name` must be provided to identify the
+# target temp code; `code` is preferred since it's unique per Hartmann user.
+def _require_code_identifier(data):
+    if not (data.get("code") or data.get("code_name")):
+        raise vol.Invalid("Either 'code' or 'code_name' must be provided")
+    return data
+
+
+SERVICE_DOOR_FOR_TEMP_CODE_SCHEMA = vol.All(
+    vol.Schema(
+        {
+            vol.Required("door_device_id"): DEVICE_ID_SCHEMA,
+            vol.Optional("code"): cv.string,
+            vol.Optional("code_name"): cv.string,
+        }
+    ),
+    _require_code_identifier,
+)
+
 # OTR (One Time Run) schedule service names
 SERVICE_CREATE_OTR_SCHEDULE = "create_otr_schedule"
 SERVICE_DELETE_OTR_SCHEDULE = "delete_otr_schedule"
@@ -136,6 +160,16 @@ SERVICE_GET_OTR_SCHEDULES_SCHEMA = vol.Schema(
 # Override door service names
 SERVICE_OVERRIDE_DOOR = "override_door"
 SERVICE_RESUME_DOOR = "resume_door"
+
+# Managed door schedules
+SERVICE_SET_DOOR_SCHEDULE_MODE = "set_door_schedule_mode"
+
+SERVICE_SET_DOOR_SCHEDULE_MODE_SCHEMA = vol.Schema(
+    {
+        vol.Required("door_device_id"): DEVICE_ID_SCHEMA,
+        vol.Required("mode"): vol.In(SCHEDULE_MODES),
+    }
+)
 
 # Valid override types
 OVERRIDE_TYPES = ["until_resumed", "for_time", "until_schedule"]
@@ -281,11 +315,103 @@ def _normalize_device_ids(device_ids: str | list[str]) -> list[str]:
     return list(device_ids)
 
 
+def _find_doors_with_code_in_entry(
+    hass: HomeAssistant,
+    entry_id: str,
+    *,
+    code: Optional[str] = None,
+    code_name: Optional[str] = None,
+) -> list[int]:
+    """Return the door_ids of all temp_code sensors under entry_id whose
+    active_codes contains the given code (PIN value) or code_name.
+
+    Used to broadcast delete/update events to every door's sensor when a
+    Hartmann user spans multiple APGs (the post-0.2.5 multi-door model).
+    """
+    affected: list[int] = []
+    seen: set[int] = set()
+    ent_reg = er.async_get(hass)
+
+    for entity_id in hass.states.async_entity_ids("sensor"):
+        if not entity_id.endswith("_temp_code"):
+            continue
+        ent_entry = ent_reg.async_get(entity_id)
+        if not ent_entry or ent_entry.config_entry_id != entry_id:
+            continue
+        st = hass.states.get(entity_id)
+        if not st:
+            continue
+        attrs = st.attributes or {}
+        door_id = attrs.get("door_id")
+        if door_id is None:
+            continue
+        try:
+            did = int(door_id)
+        except (TypeError, ValueError):
+            continue
+        if did in seen:
+            continue
+        for c in attrs.get("active_codes", []) or []:
+            if code is not None and c.get("code") == code:
+                affected.append(did)
+                seen.add(did)
+                break
+            if code_name is not None and c.get("code_name") == code_name:
+                affected.append(did)
+                seen.add(did)
+                break
+    return affected
+
+
+def _broadcast_delete(
+    hass: HomeAssistant, entry_id: str, code: str, door_ids: list[int]
+) -> None:
+    """Dispatch a delete event to each given door's temp_code sensor."""
+    for did in door_ids:
+        async_dispatcher_send(
+            hass,
+            f"{DISPATCH_TEMP_CODE}_{entry_id}",
+            {"action": "delete", "door_id": did, "code": code},
+        )
+
+
+def _broadcast_update(
+    hass: HomeAssistant,
+    entry_id: str,
+    code_name: str,
+    door_ids: list[int],
+    *,
+    end_time: Optional[str] = None,
+    start_time: Optional[str] = None,
+) -> None:
+    """Dispatch an update event to each given door's temp_code sensor."""
+    for did in door_ids:
+        async_dispatcher_send(
+            hass,
+            f"{DISPATCH_TEMP_CODE}_{entry_id}",
+            {
+                "action": "update",
+                "door_id": did,
+                "code_name": code_name,
+                "end_time": end_time,
+                "start_time": start_time,
+                "timestamp": datetime.now().isoformat(),
+            },
+        )
+
+
 async def async_setup_services(hass: HomeAssistant) -> None:
     """Set up Hartmann Control Temp Code services."""
     
     async def handle_create_temp_code(call: ServiceCall) -> dict[str, Any]:
-        """Handle the create_temp_code service call."""
+        """Handle the create_temp_code service call.
+
+        With multiple doors selected, this creates **one** Hartmann user with
+        a single PIN credential and assigns that user to each door's APG.
+        Hartmann's PIN-uniqueness rule rejects duplicate PINs across separate
+        users, so the older "one user per door" model could only ever succeed
+        for the first door of a multi-door bulk request.
+        """
         from . import api
         from .const import DEFAULT_PIN_DIGITS
         
@@ -322,274 +448,349 @@ async def async_setup_services(hass: HomeAssistant) -> None:
             if not pin_code.isdigit():
                 _LOGGER.error("Manual code must be numeric")
                 return {"success": False, "error": "Code must be numeric"}
-        
-        # Process all devices
-        results = []
-        all_success = True
-        
+
+        # Group doors by entry_id (in case the user has multiple Hartmann
+        # servers configured, each entry needs its own user). We preserve
+        # input order for stable result reporting.
+        groups: dict[str, dict[str, Any]] = {}
+        device_failures: list[dict[str, Any]] = []
+        ordered_devices: list[tuple[str, int, str]] = []  # (device_id, door_id, entry_id)
+
         for device_id in device_ids:
             entry_id, door_id = _get_door_id_from_device(hass, device_id)
             if entry_id is None or door_id is None:
                 _LOGGER.error("Could not determine door from device %s", device_id)
-                results.append({"device_id": device_id, "success": False, "error": "Invalid door"})
-                all_success = False
+                device_failures.append({"device_id": device_id, "success": False, "error": "Invalid door"})
                 continue
-            
+
             if entry_id not in hass.data.get(DOMAIN, {}):
                 _LOGGER.error("Entry %s not found in domain data", entry_id)
-                results.append({"device_id": device_id, "success": False, "error": "Integration not configured"})
-                all_success = False
+                device_failures.append({"device_id": device_id, "success": False, "error": "Integration not configured"})
                 continue
-            
+
+            grp = groups.setdefault(entry_id, {"door_ids": [], "device_by_door": {}})
+            if door_id not in grp["door_ids"]:
+                grp["door_ids"].append(door_id)
+                grp["device_by_door"][door_id] = device_id
+            ordered_devices.append((device_id, door_id, entry_id))
+
+        results: list[dict[str, Any]] = list(device_failures)
+        all_success = len(device_failures) == 0
+        primary_user_id: Optional[int] = None
+
+        for entry_id, grp in groups.items():
+            entry_door_ids: list[int] = grp["door_ids"]
+            device_by_door: dict[int, str] = grp["device_by_door"]
+
             try:
                 result = await api.create_temp_code_user(
                     hass=hass,
                     entry_id=entry_id,
-                    door_id=door_id,
+                    door_ids=entry_door_ids,
                     code_name=code_name,
                     pin_code=pin_code,
                     start_time=start_time,
                     end_time=end_time,
                 )
-                
-                if result.get("success"):
+            except Exception as e:
+                _LOGGER.exception(
+                    "Error creating temp code for entry %s (doors=%s): %s",
+                    entry_id, entry_door_ids, e
+                )
+                all_success = False
+                for did in entry_door_ids:
+                    results.append({
+                        "device_id": device_by_door[did],
+                        "door_id": did,
+                        "success": False,
+                        "error": str(e),
+                    })
+                continue
+
+            if not result.get("success"):
+                err = result.get("error", "Unknown error")
+                _LOGGER.error(
+                    "Failed to create temp code for entry %s (doors=%s): %s",
+                    entry_id, entry_door_ids, err
+                )
+                all_success = False
+                for did in entry_door_ids:
+                    results.append({
+                        "device_id": device_by_door[did],
+                        "door_id": did,
+                        "success": False,
+                        "error": err,
+                    })
+                continue
+
+            user_id = result.get("user_id")
+            if primary_user_id is None:
+                primary_user_id = user_id
+
+            per_door = result.get("doors") or [{"door_id": d, "success": True} for d in entry_door_ids]
+
+            # Dispatch a create event PER successful door so each door's
+            # temp_code sensor picks up the new entry and schedules its own
+            # auto-expiration.
+            for door_result in per_door:
+                did = int(door_result.get("door_id"))
+                ok = bool(door_result.get("success"))
+                device_id = device_by_door.get(did, "")
+
+                if ok:
                     _LOGGER.info(
-                        "Created temp code '%s' for door %d: %s (valid: %s to %s)",
-                        code_name, door_id, pin_code, start_time or "now", end_time or "forever"
+                        "Created temp code '%s' for door %d (user %d): %s (valid: %s to %s)",
+                        code_name, did, user_id, pin_code, start_time or "now", end_time or "forever"
                     )
-                    
+
                     async_dispatcher_send(
                         hass,
                         f"{DISPATCH_TEMP_CODE}_{entry_id}",
                         {
                             "action": "create",
-                            "door_id": door_id,
+                            "door_id": did,
                             "code_name": code_name,
                             "code": pin_code,
-                            "user_id": result.get("user_id"),
+                            "user_id": user_id,
                             "start_time": start_time,
                             "end_time": end_time,
                             "timestamp": datetime.now().isoformat(),
                         }
                     )
-                    
+
                     results.append({
                         "device_id": device_id,
                         "success": True,
-                        "door_id": door_id,
-                        "user_id": result.get("user_id"),
+                        "door_id": did,
+                        "user_id": user_id,
                     })
                 else:
-                    _LOGGER.error("Failed to create temp code for door %d: %s", door_id, result.get("error"))
-                    results.append({"device_id": device_id, "success": False, "error": result.get("error", "Unknown error")})
+                    err = door_result.get("error", "Unknown error")
+                    _LOGGER.warning(
+                        "Temp code created (user %d) but door %d APG assignment failed: %s",
+                        user_id, did, err
+                    )
                     all_success = False
-                    
-            except Exception as e:
-                _LOGGER.exception("Error creating temp code for device %s: %s", device_id, e)
-                results.append({"device_id": device_id, "success": False, "error": str(e)})
-                all_success = False
-        
+                    results.append({
+                        "device_id": device_id,
+                        "door_id": did,
+                        "success": False,
+                        "error": err,
+                    })
+
         # Return single-device format for backwards compatibility if only one device
         if len(device_ids) == 1:
-            if all_success:
+            r0 = results[0] if results else {"success": False, "error": "No results"}
+            if r0.get("success"):
                 return {
                     "success": True,
                     "code": pin_code,
                     "code_name": code_name,
-                    "door_id": results[0].get("door_id"),
-                    "user_id": results[0].get("user_id"),
+                    "door_id": r0.get("door_id"),
+                    "user_id": r0.get("user_id"),
                     "start_time": start_time,
                     "end_time": end_time,
                 }
             else:
-                return {"success": False, "error": results[0].get("error", "Unknown error")}
+                return {"success": False, "error": r0.get("error", "Unknown error")}
         
         # Multi-device response
         return {
             "success": all_success,
             "code": pin_code,
             "code_name": code_name,
+            "user_id": primary_user_id,
             "start_time": start_time,
             "end_time": end_time,
             "results": results,
         }
     
     async def handle_delete_temp_code(call: ServiceCall) -> dict[str, Any]:
-        """Handle the delete_temp_code service call."""
+        """Handle the delete_temp_code service call.
+
+        Deletes the Hartmann user holding the given PIN. Since one user may be
+        assigned to multiple doors' APGs (the multi-door model), this dedupes
+        per entry and broadcasts the resulting cleanup to every sensor under
+        that entry that was tracking the same PIN.
+        """
         from . import api
-        
+
         device_ids = _normalize_device_ids(call.data["door_device_id"])
         code = call.data["code"]
-        
-        results = []
-        all_success = True
-        
+
+        # Group device_ids by entry_id; one delete call per entry suffices.
+        entry_to_devices: dict[str, list[tuple[str, int]]] = {}
+        device_failures: list[dict[str, Any]] = []
         for device_id in device_ids:
             entry_id, door_id = _get_door_id_from_device(hass, device_id)
             if entry_id is None or door_id is None:
                 _LOGGER.error("Could not determine door from device %s", device_id)
-                results.append({"device_id": device_id, "success": False, "error": "Invalid door"})
-                all_success = False
+                device_failures.append({"device_id": device_id, "success": False, "error": "Invalid door"})
                 continue
-            
             if entry_id not in hass.data.get(DOMAIN, {}):
                 _LOGGER.error("Entry %s not found in domain data", entry_id)
-                results.append({"device_id": device_id, "success": False, "error": "Integration not configured"})
-                all_success = False
+                device_failures.append({"device_id": device_id, "success": False, "error": "Integration not configured"})
                 continue
-            
+            entry_to_devices.setdefault(entry_id, []).append((device_id, door_id))
+
+        results: list[dict[str, Any]] = list(device_failures)
+        all_success = len(device_failures) == 0
+
+        for entry_id, dev_door_pairs in entry_to_devices.items():
+            # Find every door under this entry whose sensor knows about this
+            # code, so we can clean them all up after the user is deleted.
+            affected_doors = _find_doors_with_code_in_entry(hass, entry_id, code=code)
+            primary_door_id = dev_door_pairs[0][1]
+
             try:
                 result = await api.delete_temp_code_user(
                     hass=hass,
                     entry_id=entry_id,
-                    door_id=door_id,
+                    door_id=primary_door_id,
                     pin_code=code,
                 )
-                
+
                 if result.get("success"):
-                    _LOGGER.info("Deleted temp code for door %d: %s", door_id, code)
-                    
-                    async_dispatcher_send(
-                        hass,
-                        f"{DISPATCH_TEMP_CODE}_{entry_id}",
-                        {
-                            "action": "delete",
-                            "door_id": door_id,
-                            "code": code,
-                        }
+                    _LOGGER.info(
+                        "Deleted temp code (PIN %s) for entry %s; broadcasting to %d door(s)",
+                        code, entry_id, len(affected_doors),
                     )
-                    
-                    results.append({"device_id": device_id, "door_id": door_id, "success": True})
+                    _broadcast_delete(hass, entry_id, code, affected_doors)
+                    for device_id, door_id in dev_door_pairs:
+                        results.append({"device_id": device_id, "door_id": door_id, "success": True})
                 else:
-                    _LOGGER.error("Failed to delete temp code: %s", result.get("error"))
-                    results.append({"device_id": device_id, "door_id": door_id, "success": False, "error": result.get("error", "Unknown error")})
+                    err = result.get("error", "Unknown error")
+                    _LOGGER.error("Failed to delete temp code: %s", err)
                     all_success = False
-                    
+                    for device_id, door_id in dev_door_pairs:
+                        results.append({"device_id": device_id, "door_id": door_id, "success": False, "error": err})
             except Exception as e:
                 _LOGGER.exception("Error deleting temp code: %s", e)
-                results.append({"device_id": device_id, "success": False, "error": str(e)})
                 all_success = False
-        
+                for device_id, door_id in dev_door_pairs:
+                    results.append({"device_id": device_id, "door_id": door_id, "success": False, "error": str(e)})
+
         # Single device backward compatibility
         if len(device_ids) == 1:
-            if all_success:
-                return {"success": True, "code": code, "door_id": results[0].get("door_id")}
+            r0 = results[0] if results else {"success": False, "error": "No results"}
+            if r0.get("success"):
+                return {"success": True, "code": code, "door_id": r0.get("door_id")}
             else:
-                return {"success": False, "error": results[0].get("error", "Unknown error")}
-        
+                return {"success": False, "error": r0.get("error", "Unknown error")}
+
         return {"success": all_success, "code": code, "results": results}
     
     async def handle_delete_temp_code_by_name(call: ServiceCall) -> dict[str, Any]:
         """Handle the delete_temp_code_by_name service call - finds code by name from sensor."""
         from . import api
-        
+
         device_ids = _normalize_device_ids(call.data["door_device_id"])
         code_name = call.data["code_name"]
         force_remove = call.data.get("force_remove", False)
-        
-        results = []
-        all_success = True
-        
+
+        # Group device_ids by entry. We resolve each entry's PIN-by-name once.
+        entry_to_devices: dict[str, list[tuple[str, int]]] = {}
+        device_failures: list[dict[str, Any]] = []
         for device_id in device_ids:
             entry_id, door_id = _get_door_id_from_device(hass, device_id)
             if entry_id is None or door_id is None:
                 _LOGGER.error("Could not determine door from device %s", device_id)
-                results.append({"device_id": device_id, "success": False, "error": "Invalid door"})
-                all_success = False
+                device_failures.append({"device_id": device_id, "success": False, "error": "Invalid door"})
                 continue
-            
             if entry_id not in hass.data.get(DOMAIN, {}):
                 _LOGGER.error("Entry %s not found in domain data", entry_id)
-                results.append({"device_id": device_id, "success": False, "error": "Integration not configured"})
-                all_success = False
+                device_failures.append({"device_id": device_id, "success": False, "error": "Integration not configured"})
                 continue
-            
-            # Find the temp code sensor for this door to look up the code by name
-            code = None
+            entry_to_devices.setdefault(entry_id, []).append((device_id, door_id))
+
+        results: list[dict[str, Any]] = list(device_failures)
+        all_success = len(device_failures) == 0
+
+        for entry_id, dev_door_pairs in entry_to_devices.items():
+            # Look up the PIN for this code_name from any sensor under entry_id
+            code: Optional[str] = None
             for state in hass.states.async_all():
                 if not state.entity_id.endswith("_temp_code"):
                     continue
-                
-                attrs = state.attributes or {}
-                if attrs.get("door_id") != door_id:
+                ent = er.async_get(hass).async_get(state.entity_id)
+                if not ent or ent.config_entry_id != entry_id:
                     continue
-                
-                active_codes = attrs.get("active_codes", [])
-                for code_entry in active_codes:
+                for code_entry in (state.attributes or {}).get("active_codes", []) or []:
                     if code_entry.get("code_name") == code_name:
                         code = code_entry.get("code")
                         break
-                break
-            
+                if code:
+                    break
+
             if not code:
-                _LOGGER.warning("No code found with name '%s' for door %d", code_name, door_id)
-                results.append({"device_id": device_id, "door_id": door_id, "success": False, "error": f"No code found with name '{code_name}'"})
-                # Don't mark as failure if force_remove - just skip this door
+                _LOGGER.warning("No code found with name '%s' under entry %s", code_name, entry_id)
+                for device_id, door_id in dev_door_pairs:
+                    results.append({
+                        "device_id": device_id,
+                        "door_id": door_id,
+                        "success": False,
+                        "error": f"No code found with name '{code_name}'",
+                    })
                 if not force_remove:
                     all_success = False
                 continue
-            
+
+            affected_doors = _find_doors_with_code_in_entry(hass, entry_id, code=code)
+            primary_door_id = dev_door_pairs[0][1]
+
             try:
                 result = await api.delete_temp_code_user(
                     hass=hass,
                     entry_id=entry_id,
-                    door_id=door_id,
+                    door_id=primary_door_id,
                     pin_code=code,
                 )
-                
+
                 if result.get("success"):
-                    _LOGGER.info("Deleted temp code '%s' for door %d: %s", code_name, door_id, code)
-                    
-                    async_dispatcher_send(
-                        hass,
-                        f"{DISPATCH_TEMP_CODE}_{entry_id}",
-                        {
-                            "action": "delete",
-                            "door_id": door_id,
-                            "code": code,
-                        }
+                    _LOGGER.info(
+                        "Deleted temp code '%s' (PIN %s) for entry %s; broadcasting to %d door(s)",
+                        code_name, code, entry_id, len(affected_doors),
                     )
-                    
-                    results.append({"device_id": device_id, "door_id": door_id, "code": code, "success": True})
+                    _broadcast_delete(hass, entry_id, code, affected_doors)
+                    for device_id, door_id in dev_door_pairs:
+                        results.append({"device_id": device_id, "door_id": door_id, "code": code, "success": True})
                 else:
                     error_msg = result.get("error", "Unknown error")
                     _LOGGER.warning("Hartmann deletion failed for '%s': %s", code_name, error_msg)
-                    
                     if force_remove:
-                        _LOGGER.info("Force removing '%s' from sensor despite Hartmann error", code_name)
-                        async_dispatcher_send(
-                            hass,
-                            f"{DISPATCH_TEMP_CODE}_{entry_id}",
-                            {
-                                "action": "delete",
+                        _LOGGER.info("Force removing '%s' from sensors despite Hartmann error", code_name)
+                        _broadcast_delete(hass, entry_id, code, affected_doors)
+                        for device_id, door_id in dev_door_pairs:
+                            results.append({
+                                "device_id": device_id,
                                 "door_id": door_id,
                                 "code": code,
-                            }
-                        )
-                        results.append({"device_id": device_id, "door_id": door_id, "code": code, "success": True, "warning": f"Removed from sensor but Hartmann failed: {error_msg}"})
+                                "success": True,
+                                "warning": f"Removed from sensor but Hartmann failed: {error_msg}",
+                            })
                     else:
-                        results.append({"device_id": device_id, "door_id": door_id, "success": False, "error": error_msg})
                         all_success = False
-                    
+                        for device_id, door_id in dev_door_pairs:
+                            results.append({"device_id": device_id, "door_id": door_id, "success": False, "error": error_msg})
+
             except Exception as e:
                 _LOGGER.exception("Error deleting temp code by name: %s", e)
-                
-                if force_remove and code:
-                    _LOGGER.info("Force removing '%s' from sensor despite error", code_name)
-                    async_dispatcher_send(
-                        hass,
-                        f"{DISPATCH_TEMP_CODE}_{entry_id}",
-                        {
-                            "action": "delete",
+                if force_remove:
+                    _LOGGER.info("Force removing '%s' from sensors despite error", code_name)
+                    _broadcast_delete(hass, entry_id, code, affected_doors)
+                    for device_id, door_id in dev_door_pairs:
+                        results.append({
+                            "device_id": device_id,
                             "door_id": door_id,
                             "code": code,
-                        }
-                    )
-                    results.append({"device_id": device_id, "door_id": door_id, "code": code, "success": True, "warning": f"Removed from sensor but error occurred: {e}"})
+                            "success": True,
+                            "warning": f"Removed from sensor but error occurred: {e}",
+                        })
                 else:
-                    results.append({"device_id": device_id, "success": False, "error": str(e)})
                     all_success = False
-        
+                    for device_id, door_id in dev_door_pairs:
+                        results.append({"device_id": device_id, "door_id": door_id, "success": False, "error": str(e)})
+
         # Single device backward compatibility
         if len(device_ids) == 1:
             r = results[0] if results else {"success": False, "error": "No results"}
@@ -597,53 +798,68 @@ async def async_setup_services(hass: HomeAssistant) -> None:
                 return {"success": True, "code": r.get("code"), "code_name": code_name, "door_id": r.get("door_id"), "warning": r.get("warning")}
             else:
                 return {"success": False, "error": r.get("error", "Unknown error")}
-        
+
         return {"success": all_success, "code_name": code_name, "results": results}
     
     async def handle_clear_all_temp_codes(call: ServiceCall) -> dict[str, Any]:
-        """Handle the clear_all_temp_codes service call - removes all codes from sensor."""
+        """Handle the clear_all_temp_codes service call - removes all codes
+        from the requested door(s).
+
+        Note: in the multi-door model, deleting a Hartmann user removes them
+        from every APG they belong to. Clearing one door's codes therefore
+        also clears any sister-doors' sensors that were tracking the same
+        PIN. We dedupe PINs per entry to avoid double-deleting the same user.
+        """
         from . import api
-        
+
         device_ids = _normalize_device_ids(call.data["door_device_id"])
-        
-        results = []
+
+        results: list[dict[str, Any]] = []
         total_cleared = 0
-        
+        # Track PINs we've already deleted per entry to avoid duplicate API calls
+        cleared_pins_by_entry: dict[str, set[str]] = {}
+
         for device_id in device_ids:
             entry_id, door_id = _get_door_id_from_device(hass, device_id)
             if entry_id is None or door_id is None:
                 _LOGGER.error("Could not determine door from device %s", device_id)
                 results.append({"device_id": device_id, "success": False, "error": "Invalid door", "cleared": 0})
                 continue
-            
+
             # Find the temp code sensor for this door
-            active_codes = []
+            active_codes: list[dict[str, Any]] = []
             for state in hass.states.async_all():
                 if not state.entity_id.endswith("_temp_code"):
                     continue
-                
                 attrs = state.attributes or {}
                 if attrs.get("door_id") != door_id:
                     continue
-                
-                active_codes = attrs.get("active_codes", [])
+                active_codes = list(attrs.get("active_codes", []) or [])
                 break
-            
+
             if not active_codes:
                 _LOGGER.info("No active codes to clear for door %d", door_id)
                 results.append({"device_id": device_id, "door_id": door_id, "success": True, "cleared": 0})
                 continue
-            
+
             cleared_count = 0
-            errors = []
-            
+            errors: list[str] = []
+            entry_cleared_pins = cleared_pins_by_entry.setdefault(entry_id, set())
+
             for code_entry in active_codes:
                 code = code_entry.get("code")
                 code_name = code_entry.get("code_name", "Unknown")
-                
                 if not code:
                     continue
-                
+
+                if code in entry_cleared_pins:
+                    # Already deleted as part of clearing another door — just
+                    # let the broadcast (already sent) clean this sensor up.
+                    cleared_count += 1
+                    continue
+
+                affected_doors = _find_doors_with_code_in_entry(hass, entry_id, code=code)
+
                 try:
                     result = await api.delete_temp_code_user(
                         hass=hass,
@@ -651,41 +867,34 @@ async def async_setup_services(hass: HomeAssistant) -> None:
                         door_id=door_id,
                         pin_code=code,
                     )
-                    
                     if result.get("success"):
-                        _LOGGER.info("Deleted temp code '%s' from Hartmann", code_name)
+                        _LOGGER.info("Deleted temp code '%s' (PIN %s) from Hartmann", code_name, code)
                     else:
                         _LOGGER.warning("Hartmann deletion failed for '%s': %s", code_name, result.get("error"))
-                    
                 except Exception as e:
                     _LOGGER.warning("Error deleting '%s' from Hartmann: %s", code_name, e)
                     errors.append(f"{code_name}: {e}")
-                
-                # Always remove from sensor regardless of Hartmann result
-                async_dispatcher_send(
-                    hass,
-                    f"{DISPATCH_TEMP_CODE}_{entry_id}",
-                    {
-                        "action": "delete",
-                        "door_id": door_id,
-                        "code": code,
-                    }
-                )
+
+                # Always broadcast removal across all sensors that knew about
+                # this PIN (force-remove style — Hartmann may already be out
+                # of sync).
+                _broadcast_delete(hass, entry_id, code, affected_doors)
+                entry_cleared_pins.add(code)
                 cleared_count += 1
-            
+
             _LOGGER.info("Cleared %d temp codes for door %d", cleared_count, door_id)
             total_cleared += cleared_count
-            
-            r = {"device_id": device_id, "door_id": door_id, "success": True, "cleared": cleared_count}
+
+            r: dict[str, Any] = {"device_id": device_id, "door_id": door_id, "success": True, "cleared": cleared_count}
             if errors:
                 r["warnings"] = errors
             results.append(r)
-        
+
         # Single device backward compatibility
         if len(device_ids) == 1:
             r = results[0] if results else {"success": True, "cleared": 0}
             return {"success": True, "cleared": r.get("cleared", 0), "door_id": r.get("door_id"), "warnings": r.get("warnings")}
-        
+
         return {"success": True, "total_cleared": total_cleared, "results": results}
     
     # ─────────────────────────────────────────────────────────────────────────
@@ -693,31 +902,38 @@ async def async_setup_services(hass: HomeAssistant) -> None:
     # ─────────────────────────────────────────────────────────────────────────
     
     async def handle_update_temp_code(call: ServiceCall) -> dict[str, Any]:
-        """Handle the update_temp_code service call - update ExpiresOn/StartedOn."""
+        """Handle the update_temp_code service call - update ExpiresOn/StartedOn.
+
+        With one user spanning multiple doors, the Hartmann update needs to
+        happen exactly once, but the resulting end_time/start_time change must
+        be reflected in every door's sensor so each one can reschedule its
+        auto-expiration.
+        """
         from . import api
-        
+
         device_ids = _normalize_device_ids(call.data["door_device_id"])
         code_name = call.data["code_name"]
         new_end_time = call.data.get("end_time")
         new_start_time = call.data.get("start_time")
-        
+
         if not new_end_time and not new_start_time:
             return {"success": False, "error": "Must provide at least one of start_time or end_time"}
-        
+
         # Find user_id from any temp_code sensor's active_codes
-        user_id = None
-        target_entry_id = None
-        target_door_id = None
-        
+        user_id: Optional[int] = None
+        target_entry_id: Optional[str] = None
+
         for device_id in device_ids:
-            entry_id, door_id = _get_door_id_from_device(hass, device_id)
-            if entry_id is None or door_id is None:
+            entry_id, _ = _get_door_id_from_device(hass, device_id)
+            if entry_id is None:
                 continue
             target_entry_id = entry_id
-            target_door_id = door_id
-            
+
             for entity_id in hass.states.async_entity_ids("sensor"):
                 if not entity_id.endswith("_temp_code"):
+                    continue
+                ent = er.async_get(hass).async_get(entity_id)
+                if not ent or ent.config_entry_id != entry_id:
                     continue
                 st = hass.states.get(entity_id)
                 if not st or not st.attributes.get("active_codes"):
@@ -730,33 +946,30 @@ async def async_setup_services(hass: HomeAssistant) -> None:
                     break
             if user_id:
                 break
-        
+
         if not user_id or not target_entry_id:
             return {"success": False, "error": f"No active code found with name '{code_name}'"}
-        
+
         result = await api.update_temp_code_user(
             hass, target_entry_id, user_id,
             end_time=new_end_time,
             start_time=new_start_time,
         )
-        
+
         if result.get("success"):
             _LOGGER.info("Updated temp code '%s' (user %d)", code_name, user_id)
-            
-            # Update sensor's stored end_time/start_time
-            async_dispatcher_send(
-                hass,
-                f"{DISPATCH_TEMP_CODE}_{target_entry_id}",
-                {
-                    "action": "update",
-                    "door_id": target_door_id,
-                    "code_name": code_name,
-                    "end_time": new_end_time,
-                    "start_time": new_start_time,
-                    "timestamp": datetime.now().isoformat(),
-                }
+
+            # Broadcast update to every door whose sensor knows about this
+            # code_name so each one can update stored times and reschedule
+            # its auto-expiration.
+            affected_doors = _find_doors_with_code_in_entry(
+                hass, target_entry_id, code_name=code_name,
             )
-            
+            _broadcast_update(
+                hass, target_entry_id, code_name, affected_doors,
+                end_time=new_end_time, start_time=new_start_time,
+            )
+
             return {
                 "success": True,
                 "code_name": code_name,
@@ -764,9 +977,290 @@ async def async_setup_services(hass: HomeAssistant) -> None:
                 "end_time": new_end_time,
                 "start_time": new_start_time,
             }
-        
+
         return result
     
+    # ─────────────────────────────────────────────────────────────────────────
+    # Add / Remove Door for Temp Code Handlers
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def _find_temp_code_in_entry(
+        entry_id: str,
+        *,
+        code: Optional[str] = None,
+        code_name: Optional[str] = None,
+    ) -> Optional[dict[str, Any]]:
+        """Look up a temp code entry from any sensor under entry_id.
+
+        Returns the first matching active_codes dict (with code, code_name,
+        user_id, start_time, end_time) or None if no match is found.
+        """
+        ent_reg = er.async_get(hass)
+        for entity_id in hass.states.async_entity_ids("sensor"):
+            if not entity_id.endswith("_temp_code"):
+                continue
+            ent = ent_reg.async_get(entity_id)
+            if not ent or ent.config_entry_id != entry_id:
+                continue
+            st = hass.states.get(entity_id)
+            if not st:
+                continue
+            for c in (st.attributes or {}).get("active_codes", []) or []:
+                if code is not None and c.get("code") == code:
+                    return dict(c)
+                if code_name is not None and c.get("code_name") == code_name:
+                    return dict(c)
+        return None
+
+    async def handle_add_door_to_temp_code(call: ServiceCall) -> dict[str, Any]:
+        """Handle the add_door_to_temp_code service call.
+
+        Adds an existing temp code (identified by `code` or `code_name`) to
+        one or more additional doors by assigning the underlying Hartmann
+        user to each door's APG. Each door's temp_code sensor receives a
+        create event so it picks up the new entry.
+        """
+        from . import api
+
+        device_ids = _normalize_device_ids(call.data["door_device_id"])
+        code = call.data.get("code")
+        code_name = call.data.get("code_name")
+
+        # Group device_ids by entry_id; the temp code is scoped to one entry.
+        entry_to_devices: dict[str, list[tuple[str, int]]] = {}
+        device_failures: list[dict[str, Any]] = []
+        for device_id in device_ids:
+            entry_id, door_id = _get_door_id_from_device(hass, device_id)
+            if entry_id is None or door_id is None:
+                _LOGGER.error("Could not determine door from device %s", device_id)
+                device_failures.append({"device_id": device_id, "success": False, "error": "Invalid door"})
+                continue
+            if entry_id not in hass.data.get(DOMAIN, {}):
+                _LOGGER.error("Entry %s not found in domain data", entry_id)
+                device_failures.append({"device_id": device_id, "success": False, "error": "Integration not configured"})
+                continue
+            entry_to_devices.setdefault(entry_id, []).append((device_id, door_id))
+
+        results: list[dict[str, Any]] = list(device_failures)
+        all_success = len(device_failures) == 0
+
+        for entry_id, dev_door_pairs in entry_to_devices.items():
+            existing = _find_temp_code_in_entry(entry_id, code=code, code_name=code_name)
+            if not existing:
+                identifier = code or code_name
+                err = f"No active temp code found matching '{identifier}' under this integration"
+                _LOGGER.warning(err)
+                all_success = False
+                for device_id, door_id in dev_door_pairs:
+                    results.append({"device_id": device_id, "door_id": door_id, "success": False, "error": err})
+                continue
+
+            existing_code = existing.get("code")
+            existing_name = existing.get("code_name")
+            user_id = existing.get("user_id")
+            start_time = existing.get("start_time")
+            end_time = existing.get("end_time")
+
+            if not user_id:
+                err = "Existing temp code has no user_id (created on a pre-0.2.5 version?)"
+                _LOGGER.error(err)
+                all_success = False
+                for device_id, door_id in dev_door_pairs:
+                    results.append({"device_id": device_id, "door_id": door_id, "success": False, "error": err})
+                continue
+
+            for device_id, door_id in dev_door_pairs:
+                # Skip if this door's sensor already has the code
+                already_has = False
+                ent_reg = er.async_get(hass)
+                for entity_id in hass.states.async_entity_ids("sensor"):
+                    if not entity_id.endswith("_temp_code"):
+                        continue
+                    ent = ent_reg.async_get(entity_id)
+                    if not ent or ent.config_entry_id != entry_id:
+                        continue
+                    st = hass.states.get(entity_id)
+                    if not st or st.attributes.get("door_id") != door_id:
+                        continue
+                    for c in (st.attributes or {}).get("active_codes", []) or []:
+                        if c.get("code") == existing_code:
+                            already_has = True
+                            break
+                    break
+
+                if already_has:
+                    _LOGGER.info(
+                        "Door %d already has temp code '%s' — skipping",
+                        door_id, existing_name,
+                    )
+                    results.append({
+                        "device_id": device_id,
+                        "door_id": door_id,
+                        "success": True,
+                        "note": "Door already had this code",
+                    })
+                    continue
+
+                try:
+                    api_result = await api.add_user_to_door_apg(
+                        hass=hass,
+                        entry_id=entry_id,
+                        user_id=int(user_id),
+                        door_id=door_id,
+                    )
+                except Exception as e:
+                    _LOGGER.exception("Error adding door %d to temp code: %s", door_id, e)
+                    all_success = False
+                    results.append({"device_id": device_id, "door_id": door_id, "success": False, "error": str(e)})
+                    continue
+
+                if api_result.get("success"):
+                    _LOGGER.info(
+                        "Added door %d to temp code '%s' (user %d)",
+                        door_id, existing_name, user_id,
+                    )
+                    # Dispatch a create event to JUST this door's sensor so
+                    # it adds the entry to its active_codes list.
+                    async_dispatcher_send(
+                        hass,
+                        f"{DISPATCH_TEMP_CODE}_{entry_id}",
+                        {
+                            "action": "create",
+                            "door_id": door_id,
+                            "code_name": existing_name,
+                            "code": existing_code,
+                            "user_id": user_id,
+                            "start_time": start_time,
+                            "end_time": end_time,
+                            "timestamp": datetime.now().isoformat(),
+                        },
+                    )
+                    results.append({"device_id": device_id, "door_id": door_id, "success": True})
+                else:
+                    err = api_result.get("error", "Unknown error")
+                    _LOGGER.error("Failed to add door %d to temp code: %s", door_id, err)
+                    all_success = False
+                    results.append({"device_id": device_id, "door_id": door_id, "success": False, "error": err})
+
+        if len(device_ids) == 1:
+            r0 = results[0] if results else {"success": False, "error": "No results"}
+            if r0.get("success"):
+                return {"success": True, "code_name": code_name, "code": code, "door_id": r0.get("door_id")}
+            return {"success": False, "error": r0.get("error", "Unknown error")}
+
+        return {
+            "success": all_success,
+            "code": code,
+            "code_name": code_name,
+            "results": results,
+        }
+
+    async def handle_remove_door_from_temp_code(call: ServiceCall) -> dict[str, Any]:
+        """Handle the remove_door_from_temp_code service call.
+
+        Removes a temp code's access from one or more specific doors by
+        DELETE-ing the underlying Hartmann user from each door's APG. The
+        Hartmann user record itself is left alone — even if every door is
+        removed, the user persists and can be re-added or deleted manually.
+        Each affected door's temp_code sensor receives a delete event for
+        only its own entry; sister doors keep their entries.
+        """
+        from . import api
+
+        device_ids = _normalize_device_ids(call.data["door_device_id"])
+        code = call.data.get("code")
+        code_name = call.data.get("code_name")
+
+        entry_to_devices: dict[str, list[tuple[str, int]]] = {}
+        device_failures: list[dict[str, Any]] = []
+        for device_id in device_ids:
+            entry_id, door_id = _get_door_id_from_device(hass, device_id)
+            if entry_id is None or door_id is None:
+                _LOGGER.error("Could not determine door from device %s", device_id)
+                device_failures.append({"device_id": device_id, "success": False, "error": "Invalid door"})
+                continue
+            if entry_id not in hass.data.get(DOMAIN, {}):
+                _LOGGER.error("Entry %s not found in domain data", entry_id)
+                device_failures.append({"device_id": device_id, "success": False, "error": "Integration not configured"})
+                continue
+            entry_to_devices.setdefault(entry_id, []).append((device_id, door_id))
+
+        results: list[dict[str, Any]] = list(device_failures)
+        all_success = len(device_failures) == 0
+
+        for entry_id, dev_door_pairs in entry_to_devices.items():
+            existing = _find_temp_code_in_entry(entry_id, code=code, code_name=code_name)
+            if not existing:
+                identifier = code or code_name
+                err = f"No active temp code found matching '{identifier}' under this integration"
+                _LOGGER.warning(err)
+                all_success = False
+                for device_id, door_id in dev_door_pairs:
+                    results.append({"device_id": device_id, "door_id": door_id, "success": False, "error": err})
+                continue
+
+            existing_code = existing.get("code")
+            existing_name = existing.get("code_name")
+            user_id = existing.get("user_id")
+
+            if not user_id:
+                err = "Existing temp code has no user_id"
+                _LOGGER.error(err)
+                all_success = False
+                for device_id, door_id in dev_door_pairs:
+                    results.append({"device_id": device_id, "door_id": door_id, "success": False, "error": err})
+                continue
+
+            for device_id, door_id in dev_door_pairs:
+                try:
+                    api_result = await api.remove_user_from_door_apg(
+                        hass=hass,
+                        entry_id=entry_id,
+                        user_id=int(user_id),
+                        door_id=door_id,
+                    )
+                except Exception as e:
+                    _LOGGER.exception("Error removing door %d from temp code: %s", door_id, e)
+                    all_success = False
+                    results.append({"device_id": device_id, "door_id": door_id, "success": False, "error": str(e)})
+                    continue
+
+                if api_result.get("success"):
+                    _LOGGER.info(
+                        "Removed door %d from temp code '%s' (user %d)",
+                        door_id, existing_name, user_id,
+                    )
+                    # Dispatch delete to JUST this door's sensor — other
+                    # doors keep their entries.
+                    async_dispatcher_send(
+                        hass,
+                        f"{DISPATCH_TEMP_CODE}_{entry_id}",
+                        {
+                            "action": "delete",
+                            "door_id": door_id,
+                            "code": existing_code,
+                        },
+                    )
+                    results.append({"device_id": device_id, "door_id": door_id, "success": True})
+                else:
+                    err = api_result.get("error", "Unknown error")
+                    _LOGGER.error("Failed to remove door %d from temp code: %s", door_id, err)
+                    all_success = False
+                    results.append({"device_id": device_id, "door_id": door_id, "success": False, "error": err})
+
+        if len(device_ids) == 1:
+            r0 = results[0] if results else {"success": False, "error": "No results"}
+            if r0.get("success"):
+                return {"success": True, "code_name": code_name, "code": code, "door_id": r0.get("door_id")}
+            return {"success": False, "error": r0.get("error", "Unknown error")}
+
+        return {
+            "success": all_success,
+            "code": code,
+            "code_name": code_name,
+            "results": results,
+        }
+
     # ─────────────────────────────────────────────────────────────────────────
     # Update Panels Handler
     # ─────────────────────────────────────────────────────────────────────────
@@ -1164,6 +1658,111 @@ async def async_setup_services(hass: HomeAssistant) -> None:
         
         return {"success": all_success, "results": results}
     
+    async def handle_set_door_schedule_mode(call: ServiceCall) -> dict[str, Any]:
+        """Handle the set_door_schedule_mode service call.
+
+        Updates the HA-managed DoorTimeZone for the given door(s). If a door
+        is currently Active (using the HA TZ), an Update Panels is fired so
+        the change reaches the panel hardware. If a door is only Provisioned
+        (not yet Active), the HA TZ is updated but no panel push happens —
+        the new mode takes effect when the user activates the door.
+
+        Refuses doors that aren't in the managed set; in that case the user
+        should add them via integration reconfigure first.
+        """
+        from . import api, managed_schedules
+
+        device_ids = _normalize_device_ids(call.data["door_device_id"])
+        mode = call.data["mode"]
+
+        # Group doors by entry_id so we can fire Update Panels at most once
+        # per entry across the whole batch.
+        per_entry: dict[str, list[int]] = {}
+        unmanaged: list[int] = []
+        invalid: list[str] = []
+        for device_id in device_ids:
+            entry_id, door_id = _get_door_id_from_device(hass, device_id)
+            if entry_id is None or door_id is None:
+                invalid.append(device_id)
+                continue
+            entry = hass.config_entries.async_get_entry(entry_id)
+            if entry is None or not managed_schedules.is_managed(entry, door_id):
+                unmanaged.append(door_id)
+                continue
+            per_entry.setdefault(entry_id, []).append(door_id)
+
+        if not per_entry:
+            return {
+                "success": False,
+                "error": (
+                    "No managed doors selected. Add the door(s) under "
+                    "integration options -> Door Schedule Management first."
+                ),
+                "unmanaged_door_ids": unmanaged,
+                "invalid_devices":    invalid,
+            }
+
+        results: list[dict[str, Any]] = []
+        all_success = True
+
+        for entry_id, door_ids in per_entry.items():
+            entry = hass.config_entries.async_get_entry(entry_id)
+            if entry is None:
+                continue
+
+            any_active_changed = False
+            updated_managed = dict(entry.options.get("managed_doors") or {})
+
+            for door_id in door_ids:
+                res = await managed_schedules.set_mode(hass, entry, door_id, mode)
+                if res.get("success"):
+                    if res.get("changed"):
+                        # Mirror the mode into our local copy of options.
+                        info = dict(updated_managed.get(str(door_id)) or {})
+                        info["current_mode"] = mode
+                        updated_managed[str(door_id)] = info
+                        if res.get("active"):
+                            any_active_changed = True
+                    results.append({
+                        "entry_id": entry_id,
+                        "door_id":  door_id,
+                        "mode":     mode,
+                        "success":  True,
+                        "changed":  bool(res.get("changed")),
+                        "active":   bool(res.get("active")),
+                    })
+                else:
+                    all_success = False
+                    results.append({
+                        "entry_id": entry_id,
+                        "door_id":  door_id,
+                        "mode":     mode,
+                        "success":  False,
+                        "error":    res.get("error"),
+                    })
+
+            # Persist the updated current_mode values for this entry.
+            new_options = {**entry.options, "managed_doors": updated_managed}
+            hass.config_entries.async_update_entry(entry, options=new_options)
+
+            # Fire Update Panels once per entry if any active door's TZ
+            # actually changed.
+            if any_active_changed:
+                try:
+                    await api.update_panels(hass, entry_id)
+                except Exception as e:
+                    _LOGGER.warning(
+                        "%s: Update Panels after set_door_schedule_mode failed: %s",
+                        entry_id, e,
+                    )
+
+        if unmanaged:
+            results.append({"unmanaged_door_ids": unmanaged})
+        if invalid:
+            results.append({"invalid_devices": invalid})
+
+        return {"success": all_success, "mode": mode, "results": results}
+
     # Register services with response support
     hass.services.async_register(
         DOMAIN,
@@ -1202,6 +1801,22 @@ async def async_setup_services(hass: HomeAssistant) -> None:
         SERVICE_UPDATE_TEMP_CODE,
         handle_update_temp_code,
         schema=SERVICE_UPDATE_TEMP_CODE_SCHEMA,
+        supports_response=SupportsResponse.OPTIONAL,
+    )
+
+    hass.services.async_register(
+        DOMAIN,
+        SERVICE_ADD_DOOR_TO_TEMP_CODE,
+        handle_add_door_to_temp_code,
+        schema=SERVICE_DOOR_FOR_TEMP_CODE_SCHEMA,
+        supports_response=SupportsResponse.OPTIONAL,
+    )
+
+    hass.services.async_register(
+        DOMAIN,
+        SERVICE_REMOVE_DOOR_FROM_TEMP_CODE,
+        handle_remove_door_from_temp_code,
+        schema=SERVICE_DOOR_FOR_TEMP_CODE_SCHEMA,
         supports_response=SupportsResponse.OPTIONAL,
     )
     
@@ -1254,8 +1869,16 @@ async def async_setup_services(hass: HomeAssistant) -> None:
         schema=SERVICE_RESUME_DOOR_SCHEMA,
         supports_response=SupportsResponse.OPTIONAL,
     )
-    
-    _LOGGER.info("Registered Hartmann Control services (temp codes + OTR schedules + override/resume)")
+
+    hass.services.async_register(
+        DOMAIN,
+        SERVICE_SET_DOOR_SCHEDULE_MODE,
+        handle_set_door_schedule_mode,
+        schema=SERVICE_SET_DOOR_SCHEDULE_MODE_SCHEMA,
+        supports_response=SupportsResponse.OPTIONAL,
+    )
+
+    _LOGGER.info("Registered Hartmann Control services (temp codes + OTR schedules + override/resume + managed schedules)")
 
 
 async def async_unload_services(hass: HomeAssistant) -> None:
@@ -1266,9 +1889,12 @@ async def async_unload_services(hass: HomeAssistant) -> None:
     hass.services.async_remove(DOMAIN, SERVICE_CLEAR_ALL_TEMP_CODES)
     hass.services.async_remove(DOMAIN, SERVICE_UPDATE_TEMP_CODE)
     hass.services.async_remove(DOMAIN, SERVICE_UPDATE_PANELS)
+    hass.services.async_remove(DOMAIN, SERVICE_ADD_DOOR_TO_TEMP_CODE)
+    hass.services.async_remove(DOMAIN, SERVICE_REMOVE_DOOR_FROM_TEMP_CODE)
     hass.services.async_remove(DOMAIN, SERVICE_CREATE_OTR_SCHEDULE)
     hass.services.async_remove(DOMAIN, SERVICE_DELETE_OTR_SCHEDULE)
     hass.services.async_remove(DOMAIN, SERVICE_GET_OTR_SCHEDULES)
     hass.services.async_remove(DOMAIN, SERVICE_OVERRIDE_DOOR)
     hass.services.async_remove(DOMAIN, SERVICE_RESUME_DOOR)
+    hass.services.async_remove(DOMAIN, SERVICE_SET_DOOR_SCHEDULE_MODE)
     _LOGGER.info("Unregistered Hartmann Control services")
