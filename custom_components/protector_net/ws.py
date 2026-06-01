@@ -15,10 +15,25 @@ from homeassistant.const import EVENT_HOMEASSISTANT_STOP
 from homeassistant.helpers.dispatcher import async_dispatcher_send
 
 try:
-    from .const import DOMAIN, FRIENDLY_TO_TZ_INDEX  # map REST TimeZone strings → index
+    from .const import (
+        DOMAIN,
+        FRIENDLY_TO_TZ_INDEX,  # map REST TimeZone strings → index
+        KEY_DOOR_CONTACT_MAP,
+        KEY_INPUT_STATE_CACHE,
+        KEY_DOOR_CONTACT_STATE_CACHE,
+        KEY_LAST_DOOR_STATUS,
+        KEY_DOOR_HELD_OPEN_THRESHOLDS,
+        DEFAULT_HELD_OPEN_THRESHOLD_MS,
+    )
 except Exception:
     from .const import DOMAIN
     FRIENDLY_TO_TZ_INDEX = {}
+    KEY_DOOR_CONTACT_MAP = "door_contact_map"
+    KEY_INPUT_STATE_CACHE = "input_state_cache"
+    KEY_DOOR_CONTACT_STATE_CACHE = "door_contact_state_cache"
+    KEY_LAST_DOOR_STATUS = "last_door_status"
+    KEY_DOOR_HELD_OPEN_THRESHOLDS = "door_held_open_thresholds"
+    DEFAULT_HELD_OPEN_THRESHOLD_MS = 30000
 
 _LOGGER = logging.getLogger(f"{DOMAIN}.ws")
 
@@ -26,6 +41,7 @@ SIGNALR_RS = "\x1e"  # record separator
 DISPATCH_DOOR = f"{DOMAIN}_door_event"        # sensors/switch/select listen on f"{...}_{entry_id}"
 DISPATCH_HUB  = f"{DOMAIN}_hub_event"
 DISPATCH_LOG  = f"{DOMAIN}_door_log"          # Last Door Log sensor
+DISPATCH_DOOR_CONTACT = f"{DOMAIN}_door_contact"   # Door open/closed binary_sensor
 
 
 def _is_transient_outage(exc: BaseException) -> bool:
@@ -115,6 +131,20 @@ class SignalRClient:
         self._sync_task: Optional[asyncio.Task] = None
         self._unsub_stop: Optional[Any] = None
 
+        # --- Held-open synthesis (Protector.Net workaround) ---------------
+        # Per-door asyncio.Task that fires AllowedHeldOpenTime ms after a
+        # door opens, dispatching a synthesized HELD_OPEN event to the
+        # binary_sensor. Necessary because Protector.Net (legacy) doesn't
+        # emit a DOOR_CONTACT_STATE | HELD_OPEN notification — its web UI
+        # derives the "Held Open" badge purely client-side from contact
+        # on-time. Odyssey panels DO emit a real HELD_OPEN notification,
+        # so on those servers our synthesized dispatch is just defensive
+        # backup (the real notif arrives first and the timer is moot).
+        #
+        # Keyed by Hartmann door_id. Cancelled on close, on stop, and on
+        # WS reconnect (a stale task must not survive a bouncing connection).
+        self._held_open_timers: Dict[int, asyncio.Task] = {}
+
     # Public -----------------------------------------------------------------
 
     def async_start(self) -> None:
@@ -148,6 +178,11 @@ class SignalRClient:
             with contextlib.suppress(asyncio.CancelledError):
                 await self._sync_task
         self._sync_task = None
+
+        # Cancel any in-flight held-open timers. If we don't, an HA reload
+        # that lands inside the held-open window would fire the dispatch
+        # against the new entry's entities, double-counting state.
+        self._cancel_all_held_open_timers()
 
         # Proactively close the websocket/session so the recv loop breaks now
         try:
@@ -394,6 +429,126 @@ class SignalRClient:
             "streamIds": [],
         }
         await ws.send_str(json.dumps(frame) + SIGNALR_RS)
+
+    # ---------- Held-open synthesis (Protector.Net workaround) ----------
+
+    def _resolve_held_open_threshold_ms(self, door_id: int) -> int:
+        """Look up the door's held-open threshold in milliseconds.
+
+        Reads the cache populated by `api.build_door_held_open_thresholds`
+        on load and on the hourly sync. Falls back to
+        DEFAULT_HELD_OPEN_THRESHOLD_MS when the cache hasn't been built
+        yet (first WS connect can race the post-setup sync) or when the
+        door isn't in the cache (added in Hartmann mid-session, before the
+        next hourly tick rebuilds the map). Default is 30s — matches
+        Hartmann's factory AllowedHeldOpenTime.
+        """
+        cache = (self.hass.data.get(DOMAIN, {})
+                 .get(self.entry_id, {})
+                 .get(KEY_DOOR_HELD_OPEN_THRESHOLDS) or {})
+        val = cache.get(door_id)
+        if isinstance(val, int) and val > 0:
+            return val
+        return DEFAULT_HELD_OPEN_THRESHOLD_MS
+
+    def _cancel_held_open_timer(self, door_id: int) -> None:
+        """Cancel any pending held-open timer for this door.
+
+        Called on every door-close transition and on WS shutdown/reconnect.
+        Cancellation is idempotent: a finished or never-started timer is a
+        silent no-op.
+        """
+        task = self._held_open_timers.pop(door_id, None)
+        if task and not task.done():
+            task.cancel()
+
+    def _cancel_all_held_open_timers(self) -> None:
+        """Cancel every pending held-open timer.
+
+        Called on hub stop and on WS reconnect. The reconnect cancellation
+        is critical: the Hartmann panel will resend a fresh DOOR_CONTACT
+        baseline after reconnect, so any stale timer from before the drop
+        would race against the re-baseline and could fire even if the door
+        already closed during the outage.
+        """
+        for task in list(self._held_open_timers.values()):
+            if task and not task.done():
+                task.cancel()
+        self._held_open_timers.clear()
+
+    def _start_held_open_timer(self, door_id: int, ts: Optional[str]) -> None:
+        """Schedule a held-open dispatch for `door_id`.
+
+        Cancels any existing timer for this door first (so a rapid
+        open→close→open cycle resets the clock, matching Hartmann's UI
+        behavior). The dispatched payload uses `synthesized=True` so
+        consumers can distinguish a derived held-open from a real Odyssey
+        HELD_OPEN notification — useful for diagnostics.
+        """
+        self._cancel_held_open_timer(door_id)
+
+        threshold_ms = self._resolve_held_open_threshold_ms(door_id)
+        if threshold_ms <= 0:
+            return
+
+        _LOGGER.debug(
+            "[%s] Held-open timer armed for door_id=%s (fires in %dms)",
+            self.entry_id, door_id, threshold_ms,
+        )
+
+        async def _runner() -> None:
+            try:
+                await asyncio.sleep(threshold_ms / 1000.0)
+            except asyncio.CancelledError:
+                return
+
+            # Defensive: if the contact-state cache says the door is no
+            # longer open (a CLOSED notif arrived but cancellation racing
+            # past us), don't fire. Prevents a stale held-open spike.
+            cfg_bucket = (self.hass.data.get(DOMAIN, {})
+                          .get(self.entry_id, {}))
+            ds_cache = cfg_bucket.get(KEY_DOOR_CONTACT_STATE_CACHE) or {}
+            current = ds_cache.get(door_id)
+            if isinstance(current, dict) and not current.get("is_open", True):
+                _LOGGER.debug(
+                    "[%s] Held-open timer fired for door_id=%s but cache "
+                    "shows closed; suppressing synth",
+                    self.entry_id, door_id,
+                )
+                return
+
+            _LOGGER.debug(
+                "[%s] Synthesizing HELD_OPEN for door_id=%s (threshold=%dms)",
+                self.entry_id, door_id, threshold_ms,
+            )
+
+            # Update the cache so a freshly-restored entity that comes up
+            # mid-held-open seeds itself correctly without waiting for the
+            # next state change.
+            if isinstance(ds_cache, dict):
+                prev = ds_cache.get(door_id, {}) or {}
+                ds_cache[door_id] = {
+                    "is_open":      True,
+                    "held_open":    True,
+                    "ts":           ts or prev.get("ts"),
+                    "state_values": "HELD_OPEN",
+                }
+
+            async_dispatcher_send(
+                self.hass,
+                f"{DISPATCH_DOOR_CONTACT}_{self.entry_id}",
+                {
+                    "source":       "notification",
+                    "door_id":      door_id,
+                    "is_open":      True,
+                    "held_open":    True,
+                    "state_values": "HELD_OPEN",
+                    "ts":           ts,
+                    "synthesized":  True,
+                },
+            )
+
+        self._held_open_timers[door_id] = self.hass.async_create_task(_runner())
 
     # ---------- Notification/Name helpers ----------
 
@@ -716,6 +871,16 @@ class SignalRClient:
                         self.connected = False
                         self.phase = "error"
                         self.last_error = str(e)
+
+                        # Cancel any in-flight held-open timers — they were
+                        # scheduled against the old WS session's view of
+                        # state. After reconnect Hartmann sends a fresh
+                        # baseline (current door states), so we'll restart
+                        # any needed timers from those frames. Letting the
+                        # old timers run risks firing held-open against a
+                        # door that closed during the outage but whose
+                        # CLOSED notification was lost in the drop.
+                        self._cancel_all_held_open_timers()
                         # Server reboots / unreachable network are routine and
                         # not actionable. Log them at INFO so they don't
                         # clutter the WARNING surface; real errors stay at
@@ -850,12 +1015,98 @@ class SignalRClient:
                     _LOGGER.debug("[%s] Door frame -> door_id=%s name=%s payload=%s",
                                   self.entry_id, door_id, door_name, compact)
 
+                    # Cache last-seen status, merging non-None fields with
+                    # any prior cached values. This way a partial frame
+                    # (e.g., {strike: None, opener: None, overridden: False,
+                    # timeZone: 1}) doesn't wipe a previously-cached
+                    # strike/opener — exactly the pattern Hartmann uses
+                    # when sending a multi-frame burst per door at startup.
+                    # The post-setup re-dispatch in __init__.py reads from
+                    # this cache to seed entities that may have subscribed
+                    # after the WS burst already arrived.
+                    try:
+                        cache = (self.hass.data.get(DOMAIN, {})
+                                 .get(self.entry_id, {})
+                                 .get(KEY_LAST_DOOR_STATUS))
+                        if isinstance(cache, dict):
+                            prev = cache.get(door_id, {})
+                            merged = dict(prev)
+                            for k in ("strike", "opener", "overridden", "timeZone"):
+                                v = st.get(k)
+                                if v is not None:
+                                    merged[k] = v
+                            if merged != prev:
+                                cache[door_id] = merged
+                    except Exception:
+                        pass
+
                     async_dispatcher_send(
                         self.hass,
                         f"{DISPATCH_DOOR}_{self.entry_id}",
                         {"door_id": door_id, "status": st},
                     )
                     self._push_hub_state()
+                elif stype == "Input":
+                    # Door-contact inputs come through as a separate status
+                    # frame (not embedded in Door frames). statusId format is
+                    # "<MAC>::Input::<idx>" and `enabled` is 0 or 1.
+                    #
+                    # Look up (mac, idx) in the contact map built at startup
+                    # and on the hourly sync. If found, route to the
+                    # binary_sensor; otherwise drop silently (most inputs are
+                    # not door contacts — REX, motion, aux, disabled, etc.).
+                    self.non_door_events_seen += 1
+                    self._push_hub_state()
+
+                    sid_str = str(sid or "")
+                    parts = sid_str.split("::", 2)
+                    if len(parts) != 3 or parts[1] != "Input":
+                        continue
+                    mac = parts[0]
+                    try:
+                        input_idx = int(parts[2])
+                    except (TypeError, ValueError):
+                        continue
+
+                    enabled_raw = st.get("enabled")
+                    # Normalize: WS sends 0/1, also tolerate booleans/strings.
+                    if isinstance(enabled_raw, bool):
+                        enabled = enabled_raw
+                    elif isinstance(enabled_raw, (int, float)):
+                        enabled = bool(int(enabled_raw))
+                    elif isinstance(enabled_raw, str):
+                        enabled = enabled_raw.strip().lower() in ("1", "true", "on", "yes")
+                    else:
+                        continue
+
+                    # Cache the raw value in case the binary_sensor entity is
+                    # added after this frame (e.g., entity restart, options
+                    # reload). It'll read this on async_added_to_hass.
+                    cfg_bucket = self.hass.data.get(DOMAIN, {}).get(self.entry_id, {})
+                    cache = cfg_bucket.get(KEY_INPUT_STATE_CACHE)
+                    if isinstance(cache, dict):
+                        cache[(mac, input_idx)] = enabled
+
+                    # Route to binary_sensor only if this input is a known
+                    # door contact for this entry. Other inputs (REX, motion,
+                    # etc.) are intentionally ignored — exposing them would
+                    # widen the integration's surface area without a use case.
+                    contact_map = cfg_bucket.get(KEY_DOOR_CONTACT_MAP) or {}
+                    info = contact_map.get((mac, input_idx))
+                    if not info:
+                        continue
+
+                    async_dispatcher_send(
+                        self.hass,
+                        f"{DISPATCH_DOOR_CONTACT}_{self.entry_id}",
+                        {
+                            "door_id":    info["door_id"],
+                            "panel_mac":  mac,
+                            "input_idx":  input_idx,
+                            "enabled":    enabled,
+                            "is_inverted": bool(info.get("is_inverted")),
+                        },
+                    )
                 else:
                     self.non_door_events_seen += 1
                     self._push_hub_state()
@@ -1003,6 +1254,160 @@ class SignalRClient:
                             _emit_status({"strike": True, "opener": True})
                         elif "locked" in msg_l:
                             _emit_status({"strike": False, "opener": False})
+
+                    # --- DOOR_CONTACT_STATE: physical door open/closed/held-open ---
+                    # Hartmann sends one of:
+                    #   StateValues = "OPEN"            "is Now Open"
+                    #   StateValues = "CLOSED"          "is Now Closed"
+                    #   StateValues = "HELD_OPEN"       "Is Being Held Open"   (Odyssey only)
+                    #   StateValues = "FORCED_OPEN"     opened without auth    (Odyssey only)
+                    #   StateValues = "FORCED_OPEN_ENDED"   forced state cleared (Odyssey only)
+                    #
+                    # Polarity is already applied by Hartmann — we use the value
+                    # directly. This is the SOLE state source on panels that
+                    # don't push raw `Input` status frames for the contact, so
+                    # we drive the binary_sensor from here in addition to (or
+                    # in place of) the input-status path above.
+                    #
+                    # Protector.Net legacy quirk: it does NOT emit HELD_OPEN
+                    # over SignalR. Its web UI derives the "Held Open" badge
+                    # purely client-side from contact on-time vs. the door's
+                    # AllowedHeldOpenTime config. To match parity, on every
+                    # OPEN we start a per-door timer (see _start_held_open_timer)
+                    # that synthesizes a HELD_OPEN dispatch when the threshold
+                    # elapses. On CLOSED we cancel it. On a real HELD_OPEN
+                    # notif (Odyssey) we cancel the timer too — the panel
+                    # already told us, no need to synthesize.
+                    if ntype == "DOOR_CONTACT_STATE":
+                        sv_raw = note.get("StateValues")
+                        sv = (str(sv_raw or "").strip().upper()
+                              .replace(" ", "_").replace("-", "_"))
+                        # Some panels send "HELDOPEN" with no underscore; normalize.
+                        if sv == "HELDOPEN":
+                            sv = "HELD_OPEN"
+                        if sv == "FORCEDOPEN":
+                            sv = "FORCED_OPEN"
+                        if sv in ("FORCED_OPEN_ENDED", "FORCEDOPENENDED"):
+                            sv = "FORCED_OPEN_ENDED"
+
+                        # Treat FORCED_OPEN like HELD_OPEN/OPEN for is_open
+                        # purposes — the door is physically open in both
+                        # cases. We expose the raw state in `state_values`
+                        # so automations can branch on the security event.
+                        # FORCED_OPEN_ENDED means the security alarm cleared
+                        # (door was closed); treat as a CLOSED transition
+                        # for is_open, but don't lie about state_values.
+                        if sv in ("OPEN", "CLOSED", "HELD_OPEN",
+                                  "FORCED_OPEN", "FORCED_OPEN_ENDED"):
+                            is_open = sv in ("OPEN", "HELD_OPEN", "FORCED_OPEN")
+                            held_open = (sv == "HELD_OPEN")
+
+                            # Cache so a freshly-added/restored entity can
+                            # seed itself without waiting for the next event.
+                            cfg_bucket = (self.hass.data.get(DOMAIN, {})
+                                          .get(self.entry_id, {}))
+                            ds_cache = cfg_bucket.get(KEY_DOOR_CONTACT_STATE_CACHE)
+                            if isinstance(ds_cache, dict):
+                                ds_cache[did] = {
+                                    "is_open":    is_open,
+                                    "held_open":  held_open,
+                                    "ts":         note.get("Date"),
+                                    "state_values": sv,
+                                }
+
+                            # Manage the held-open timer based on transition.
+                            # OPEN → start (so Protector.Net fires synth at threshold)
+                            # CLOSED / FORCED_OPEN_ENDED → cancel (door closed)
+                            # HELD_OPEN → cancel (panel beat us to it; don't double-fire)
+                            # FORCED_OPEN → leave timer alone (door is open and
+                            #   may still cross the held-open threshold; Hartmann
+                            #   reports forced-open and held-open as orthogonal)
+                            if sv == "OPEN":
+                                self._start_held_open_timer(did, note.get("Date"))
+                            elif sv in ("CLOSED", "FORCED_OPEN_ENDED", "HELD_OPEN"):
+                                self._cancel_held_open_timer(did)
+
+                            async_dispatcher_send(
+                                self.hass,
+                                f"{DISPATCH_DOOR_CONTACT}_{self.entry_id}",
+                                {
+                                    "source":       "notification",
+                                    "door_id":      did,
+                                    "is_open":      is_open,
+                                    "held_open":    held_open,
+                                    "state_values": sv,
+                                    "ts":           note.get("Date"),
+                                },
+                            )
+
+                    # --- DOOR_CONTACT_INPUT_STATE: raw contact input ON/OFF ---
+                    # Protector.Net (legacy) emits this notification alongside
+                    # DOOR_CONTACT_STATE on every contact transition:
+                    #   StateValues = "ON"   Message: "Door <name> Door Contact is On"
+                    #   StateValues = "OFF"  Message: "Door <name> Door Contact is Off"
+                    #
+                    # In observed deployments contact-on==door-open (Hartmann
+                    # has already applied the input's IsInverted polarity, so
+                    # ON/OFF is the *logical* state, same convention as
+                    # DOOR_CONTACT_STATE OPEN/CLOSED). We use it as a defensive
+                    # backup signal — if a transient SignalR drop loses the
+                    # DOOR_CONTACT_STATE frame but DOOR_CONTACT_INPUT_STATE
+                    # still arrives (or vice versa), the binary_sensor still
+                    # tracks reality. Held-open timer is also driven from here
+                    # so the workaround stays robust if Protector.Net ever
+                    # stops emitting DOOR_CONTACT_STATE for some panel rev.
+                    #
+                    # Odyssey panels we've seen don't emit this notification,
+                    # so this branch is effectively a no-op there.
+                    elif ntype == "DOOR_CONTACT_INPUT_STATE":
+                        sv_raw = note.get("StateValues")
+                        sv = str(sv_raw or "").strip().upper()
+                        if sv in ("ON", "OFF"):
+                            is_open = (sv == "ON")
+                            cfg_bucket = (self.hass.data.get(DOMAIN, {})
+                                          .get(self.entry_id, {}))
+                            ds_cache = cfg_bucket.get(KEY_DOOR_CONTACT_STATE_CACHE)
+
+                            # Preserve held_open across an INPUT_STATE-only
+                            # transition: if the door was already in held_open
+                            # state, an OFF→ON wouldn't (and shouldn't) clear
+                            # it. Closing always clears.
+                            prev = (ds_cache.get(did) if isinstance(ds_cache, dict)
+                                    else None) or {}
+                            held_open = bool(prev.get("held_open")) if is_open else False
+
+                            if isinstance(ds_cache, dict):
+                                ds_cache[did] = {
+                                    "is_open":     is_open,
+                                    "held_open":   held_open,
+                                    "ts":          note.get("Date"),
+                                    "state_values": sv,
+                                }
+
+                            # Mirror the timer logic from DOOR_CONTACT_STATE
+                            # so this branch alone is sufficient on panels
+                            # that emit only INPUT_STATE.
+                            if is_open:
+                                # Only (re)start the timer if not already
+                                # held — otherwise we'd push a held door
+                                # back to "merely open" for the duration.
+                                if not held_open:
+                                    self._start_held_open_timer(did, note.get("Date"))
+                            else:
+                                self._cancel_held_open_timer(did)
+
+                            async_dispatcher_send(
+                                self.hass,
+                                f"{DISPATCH_DOOR_CONTACT}_{self.entry_id}",
+                                {
+                                    "source":       "notification",
+                                    "door_id":      did,
+                                    "is_open":      is_open,
+                                    "held_open":    held_open,
+                                    "state_values": sv,
+                                    "ts":           note.get("Date"),
+                                },
+                            )
 
                     _LOGGER.debug("[%s] Routed notification to door_id=%s: %s",
                                   self.entry_id, did, msg)
