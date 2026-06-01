@@ -95,6 +95,18 @@ Caveat: if you turn this on, then later untick a door from "Create Door Time Zon
 
 The existing `override_door` service is **unchanged**. Keep using it for ad-hoc unlocks and the JS card. The two systems coexist cleanly: an active panel override still wins until cleared, regardless of which schedule sits underneath. Once the override is resumed, the door falls back to whichever schedule it's pointing at — original or HA-managed.
 
+### Door contact sensors
+Each door now exposes a `binary_sensor` with `device_class=door`, auto-discovered from Hartmann. The integration reads each panel's inputs (`/api/Panels/{id}/Inputs`), finds those configured as `Door_Contact` or `Monitored_Door_Contact`, and maps them to the right door — so the sensor's name is just the door name and HA's logbook/history shows clean **Open / Closed** transitions.
+
+State is driven live off the SignalR/WebSocket feed (`DOOR_CONTACT_STATE` / `DOOR_CONTACT_INPUT_STATE`, already polarity-corrected by Hartmann), so it tracks the physical door in real time. Both Protector.Net and Odyssey are supported from the same path.
+
+Two attributes to automate on:
+
+- **`contact_configured`** — `true` only once a real contact is confirmed wired (discovered in the Hartmann config, or proven by a live notification). Doors without a contact input default to **Closed** and report `contact_configured: false`, so automations can branch on this instead of trusting a hardcoded state.
+- **`held_open`** — flags a door propped/held open past its threshold (Odyssey reports this directly; Protector.Net derives it from the contact-state stream).
+
+State and `held_open` survive HA restarts, with the next live notification re-syncing to ground truth.
+
 ### Panels Online sensor
 Each integration entry now exposes a `sensor.panels_online_<partition>` entity on its Hub device. State is the integer count of panels currently online; attributes give the breakdown:
 
@@ -148,6 +160,13 @@ The integration syncs names on every load and re-checks every hour in the backgr
 This is useful when the Hartmann admin names doors one way (say, internal codes like "Main 4") and you want different labels in HA ("Lobby Door"). Mix and match per-door — let some sync from Hartmann, override others.
 
 **Entity IDs never change** regardless of renames — automations referencing entities by entity_id keep working unconditionally.
+
+### Reconfigure and re-authentication (no more delete-and-re-add)
+You can now fix credentials in place. The integration's **Reconfigure** flow (Settings → Devices & Services → Protector.Net → ⋮ → Reconfigure) updates the **Protector.Net URL, username, and password** without removing the integration — all entities, options, and HA-managed door schedules are preserved. Point it at a new host and the entry's unique ID and title update automatically; it refuses the change if it would collide with another configured entry/partition.
+
+And when the server rejects the stored credentials (e.g. the Hartmann account password was changed), the integration raises a proper **re-authentication** prompt asking you to re-enter the username and password — instead of failing quietly in the background. Both flows reload the entry cleanly on success.
+
+> Note: this is distinct from the WebSocket session re-auth, which silently refreshes the `ss-id` cookie on reconnect. That handles *expired* sessions; this handles *wrong* credentials.
 
 ### Manage Active PINs view (Hartman Door Lock Card)
 A new "Manage Active PINs" panel in the bulk actions area lets you see every active temp code at a glance — name, expiry, how many doors it unlocks, and the PIN itself (hidden behind a "show" toggle by default; flip the new `always_show_temp_pin: true` card option if you'd rather see them all). Clicking a code expands it inline so you can:
@@ -316,6 +335,7 @@ Revisit any time: **Settings → Devices & Services → Protector.Net → Option
 * **Last Door Log by** — highlights the last actor with timestamp (e.g., “John Smith granted access @ 1:06 PM”); attributes include the last **reader/action** message/time and the last **door** message.
 * **Temp Code** — state is `None` or the active code name. Attributes: list of all temp codes with `code_name`, `code`, `user_id`, `start_time`, `end_time` per entry.
 * **OTR Schedules** — state is the count of schedules for this door. Attributes: `active_schedules` (currently running), `upcoming_schedules` (future), and `all_schedules` with id, name, mode, start, and stop times. Refreshes every 5 minutes and immediately after create/delete.
+* **Door Contact** *(binary_sensor, `device_class=door`)* — live **Open** / **Closed** state from the panel's door-contact input. Attributes: `contact_configured` (whether a contact input is actually wired) and `held_open` (door propped past its threshold). Doors without a contact input default to **Closed** with `contact_configured: false`.
 
 **Controls**
 
@@ -373,6 +393,7 @@ Revisit any time: **Settings → Devices & Services → Protector.Net → Option
 |---------|-------------|
 | `override_door` | Apply an override to door(s) in a single call. Supports `mode`, `override_type`, `minutes`, and `until` (datetime — auto-computes minutes). |
 | `resume_door` | Resume normal schedule for door(s). |
+| `set_door_schedule_mode` | Set an **HA-managed** door's schedule mode (Lockdown / Card / Pin / Card or Pin / Card and Pin / Unlock / First Credential In / Dual) for the whole week, 24/7. Persists across panel reboots. Door must first be added under **Options → Door Time Zones**. |
 | `update_panels` | Push current configuration to all connected panels immediately. |
 
 All services accept **multiple doors** via the device picker.
@@ -506,11 +527,20 @@ Lock/Unlock **status** messages don’t flip the “by” state (that’s what *
 ## Changelog
 
 ### 0.2.5
-* New: **Manage Active PINs** panel in the door card — view all active temp codes, add/remove doors per code without changing the PIN, extend expiry, or delete. New card config option `always_show_temp_pin` to skip the show-PIN toggle.
-* New: **`add_door_to_temp_code`** and **`remove_door_from_temp_code`** services — extend an existing temp code's reach to additional doors, or revoke from specific doors, without changing the PIN.
-* Fix: **Multi-door temp codes** — `create_temp_code` now creates one Hartmann user with multiple APG assignments instead of one user per door, fixing the bulk-create rejection caused by Hartmann’s PIN-uniqueness rule. `update_temp_code` and `delete_temp_code` now broadcast changes to every sensor that tracks the same code so they stay in sync.
-* New: **Auto-delete on expiration** — temp codes with an `end_time` now delete themselves automatically (both from Hartmann and from the sensor) the moment they expire. Survives HA restarts; reschedules on `update_temp_code`. Retries every hour if Hartmann is unreachable.
-* Improvement: **Quieter logs** — “No temp user found with PIN …” downgraded from WARNING to DEBUG since the structured response already conveys the result.
+* New: **HA-managed door schedules** — opt-in per door under **Options → Door Time Zones**. Creates a dedicated Door Time Zone in Hartmann and (optionally) repoints the door to it, so schedule changes survive panel reboots. Rolls back cleanly on untick or integration removal.
+* New: **`set_door_schedule_mode`** service — rewrite an HA-managed door's mode (Lockdown/Card/Pin/Card or Pin/Card and Pin/Unlock/First Credential In/Dual) 24/7; auto-pushes to panels. Idempotent.
+* New: **Auto-add new doors** toggle — optionally enroll and activate newly-discovered Hartmann doors automatically on the hourly sync (off by default).
+* New: **Door contact sensors** — per-door `binary_sensor` (`device_class=door`) auto-discovered from `Door_Contact` / `Monitored_Door_Contact` inputs, with `contact_configured` and `held_open` attributes. Live updates over SignalR; Protector.Net + Odyssey.
+* New: **Panels Online sensor** — `sensor.panels_online_<partition>` on the Hub device, with online/offline panel breakdown attributes. Polled every 60s.
+* New: **Reconfigure flow** — edit the Protector.Net URL, username, and password in place without removing the integration; entities, options, and schedules preserved. Plus a proper **re-authentication** prompt when the server rejects stored credentials.
+* New: **Partition + door name sync** — renames in Hartmann flow through to HA on load and hourly; manually-customized names preserved; entity IDs never change.
+* New: **Options menu split** — **Basic Settings** and **Door Time Zones** are now separate pages.
+* New: **Manage Active PINs** panel in the door card — view all active temp codes, add/remove doors per code without changing the PIN, extend expiry, or delete. New card config option `always_show_temp_pin`.
+* New: **`add_door_to_temp_code`** and **`remove_door_from_temp_code`** services — extend or revoke a temp code's door reach without changing the PIN.
+* Fix: **Multi-door temp codes** — `create_temp_code` now creates one Hartmann user with multiple APG assignments instead of one user per door, fixing the bulk-create rejection from Hartmann’s PIN-uniqueness rule. `update_temp_code` / `delete_temp_code` broadcast to every sensor tracking the same code.
+* New: **Auto-delete on expiration** — temp codes with an `end_time` delete themselves (Hartmann + sensor) when they expire. Survives HA restarts; reschedules on `update_temp_code`; retries hourly if Hartmann is unreachable.
+* Improvement: **More resilient deletion** — a 400 from the user-delete endpoint is verified against actual user existence and treated as success if the user is already gone, killing spurious retry loops.
+* Improvement: **Quieter logs** — stale-PIN lookups downgraded to DEBUG; auto-expire retry downgraded to INFO; removed the noisy job-listener `list.remove(x)` traceback on options reload.
 
 ### 0.2.4
 * Fix: **WebSocket auto-reconnect after session expiry** — credentials refresh on each reconnect; negotiate re-authenticates on 401
