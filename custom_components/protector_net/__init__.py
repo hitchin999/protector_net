@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from datetime import timedelta
 from typing import Any
@@ -10,9 +11,14 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.const import EVENT_HOMEASSISTANT_STARTED
 from homeassistant.helpers.event import async_track_time_interval
+from homeassistant.helpers.dispatcher import async_dispatcher_send
 from homeassistant.helpers.typing import ConfigType
 
-from .const import DOMAIN, UI_STATE, KEY_AUTO_ADD_NEW_DOORS
+from .const import (
+    DOMAIN, UI_STATE, KEY_AUTO_ADD_NEW_DOORS,
+    KEY_DOOR_CONTACT_MAP, KEY_INPUT_STATE_CACHE, KEY_LAST_DOOR_STATUS,
+    KEY_DOOR_CONTACT_STATE_CACHE, KEY_DOOR_HELD_OPEN_THRESHOLDS,
+)
 from .ws import SignalRClient
 from . import api
 from .services import async_setup_services, async_unload_services
@@ -26,7 +32,54 @@ NAME_SYNC_INTERVAL = timedelta(hours=1)
 
 # Platforms we expose
 # (Old per-action buttons are going away except Pulse Unlock; new controls live in select/number/switch.)
-PLATFORMS: list[str] = ["button", "sensor", "select", "number", "switch", "datetime"]
+PLATFORMS: list[str] = ["button", "sensor", "binary_sensor", "select", "number", "switch", "datetime"]
+
+
+async def _sync_partition_title_only(hass: HomeAssistant, entry: ConfigEntry) -> None:
+    """Fast pre-platforms sync: only updates the entry title from Hartmann's
+    partition name. One API call, ~1-2s.
+
+    This MUST run before async_forward_entry_setups because the partition
+    name is parsed out of entry.title at platform-setup time to populate
+    device_info on the hub device. Anything heavier than this single call
+    has to wait until after platforms are set up — otherwise the WS client
+    (which started in parallel) finishes its initial-state burst and
+    dispatches state events with no entities yet listening, leaving every
+    sensor at "Unknown" until the next physical transition.
+    """
+    from homeassistant.helpers import device_registry as dr
+
+    entry_id = entry.entry_id
+    cfg = hass.data[DOMAIN][entry_id]
+    base_url = cfg.get("base_url", "")
+    host = base_url.split("://", 1)[1] if "://" in base_url else base_url
+
+    try:
+        part_name = await api.get_partition_name(hass, entry_id)
+        if not part_name:
+            return
+        new_title = f"{host} – {part_name}"
+        if entry.title == new_title:
+            return
+        _LOGGER.info(
+            "[%s] Partition renamed in Hartmann: %r → %r",
+            entry_id, entry.title, new_title,
+        )
+        hass.config_entries.async_update_entry(entry, title=new_title)
+        # Also patch hub device name on later loads (first load: device
+        # doesn't exist yet — platforms create it with the right name).
+        try:
+            device_reg = dr.async_get(hass)
+            hub_ident = (DOMAIN, cfg.get("hub_identifier") or f"hub:{host}|{entry_id}")
+            hub_device = device_reg.async_get_device(identifiers={hub_ident})
+            if hub_device and not hub_device.name_by_user:
+                new_hub_name = f"Hub Status – {part_name}"
+                if hub_device.name != new_hub_name:
+                    device_reg.async_update_device(hub_device.id, name=new_hub_name)
+        except Exception as e:
+            _LOGGER.debug("[%s] Hub device name update skipped: %s", entry_id, e)
+    except Exception as e:
+        _LOGGER.debug("[%s] partition-name sync skipped: %s", entry_id, e)
 
 
 async def _sync_names_from_hartmann(
@@ -48,6 +101,11 @@ async def _sync_names_from_hartmann(
     False during initial deferred-start to avoid an options write triggering
     a reload that races with in-flight platform setup; the first hourly tick
     runs with the flag True instead.
+
+    Note: the partition-title rename was extracted into _sync_partition_title_only
+    so it can run synchronously before forward_entry_setups (entry.title feeds
+    hub device_info). On the hourly tick we still call it here as a redundant
+    safety net.
     """
     from homeassistant.helpers import device_registry as dr
 
@@ -56,40 +114,9 @@ async def _sync_names_from_hartmann(
     base_url = cfg.get("base_url", "")
     host = base_url.split("://", 1)[1] if "://" in base_url else base_url
 
-    # --- Partition name → entry title -------------------------------------
-    # Entry title format is "{host} – {partition_name}"; downstream entities
-    # parse the partition name out of entry.title at platform-setup time, so
-    # updating the title BEFORE async_forward_entry_setups makes the freshly
-    # constructed hub device pick up the new name automatically.
-    try:
-        part_name = await api.get_partition_name(hass, entry_id)
-        if part_name:
-            new_title = f"{host} – {part_name}"
-            if entry.title != new_title:
-                _LOGGER.info(
-                    "[%s] Partition renamed in Hartmann: %r → %r",
-                    entry_id, entry.title, new_title,
-                )
-                hass.config_entries.async_update_entry(entry, title=new_title)
-
-                # Also patch the hub device's display name in the registry.
-                # On the very first load, the hub device doesn't exist yet —
-                # platforms will create it shortly with the right name from
-                # the just-updated title. On later loads, the device exists
-                # and needs an explicit registry update because we suppress
-                # reloads for title-only changes (see _async_update_listener).
-                try:
-                    device_reg = dr.async_get(hass)
-                    hub_ident = (DOMAIN, cfg.get("hub_identifier") or f"hub:{host}|{entry_id}")
-                    hub_device = device_reg.async_get_device(identifiers={hub_ident})
-                    if hub_device and not hub_device.name_by_user:
-                        new_hub_name = f"Hub Status – {part_name}"
-                        if hub_device.name != new_hub_name:
-                            device_reg.async_update_device(hub_device.id, name=new_hub_name)
-                except Exception as e:
-                    _LOGGER.debug("[%s] Hub device name update skipped: %s", entry_id, e)
-    except Exception as e:
-        _LOGGER.debug("[%s] partition-name sync skipped: %s", entry_id, e)
+    # --- Partition title (redundant safety net; primary path is the
+    #     pre-platform-setup _sync_partition_title_only call). -------------
+    await _sync_partition_title_only(hass, entry)
 
     # --- Door names → device registry -------------------------------------
     # On the first integration load, no door devices exist yet — platforms
@@ -200,6 +227,35 @@ async def _sync_names_from_hartmann(
     except Exception as e:
         _LOGGER.debug("[%s] door-name sync skipped: %s", entry_id, e)
 
+    # --- Door contact map → hass.data ------------------------------------
+    # Built fresh on every load and on every hourly sync. The binary_sensor
+    # platform reads it on async_added_to_hass to know which (panel_mac,
+    # input_idx) corresponds to its door, and ws.py reads it to route Input
+    # status frames. A failure here is not fatal — door-contact entities
+    # that can't find a mapping just stay Unknown.
+    try:
+        contact_map = await api.build_door_contact_map(hass, entry_id)
+        hass.data[DOMAIN][entry_id][KEY_DOOR_CONTACT_MAP] = contact_map
+        # Tell anyone listening (the binary_sensor platform) to re-evaluate.
+        async_dispatcher_send(
+            hass, f"{DOMAIN}_contact_map_updated_{entry_id}", contact_map,
+        )
+    except Exception as e:
+        _LOGGER.debug("[%s] door-contact map refresh skipped: %s", entry_id, e)
+
+    # --- Per-door held-open thresholds → hass.data -----------------------
+    # Same cadence as the contact map: refreshed on load and on the hourly
+    # sync. Used by ws.py to start a held-open timer when a door opens.
+    # On Protector.Net this is the SOLE source of held-open detection (the
+    # server never emits HELD_OPEN over SignalR); on Odyssey it's defensive
+    # — the timer gets pre-empted by the real HELD_OPEN notification.
+    # Failure here is not fatal: the timer just falls back to a default.
+    try:
+        thresholds = await api.build_door_held_open_thresholds(hass, entry_id)
+        hass.data[DOMAIN][entry_id][KEY_DOOR_HELD_OPEN_THRESHOLDS] = thresholds
+    except Exception as e:
+        _LOGGER.debug("[%s] held-open thresholds refresh skipped: %s", entry_id, e)
+
 
 async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
     """Set up the integration (domain) once."""
@@ -235,6 +291,29 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         # New: cached legend for DoorTimeZoneMode to sync Override Mode select from WS
         "tz_index_to_name": {},   # {int: "Card or Pin", ...} (normalized by us)
         "tz_name_to_index": {},   # {"card or pin": 3, ...}   (normalized key)
+        # Door contact discovery: (panel_mac, input_idx) -> {door_id, panel_id, is_inverted, input_name}
+        KEY_DOOR_CONTACT_MAP: {},
+        # Latest raw `enabled` value seen on each contact-mapped input.
+        # Lets a freshly-restored entity skip the "Unknown until next WS
+        # transition" gap.
+        KEY_INPUT_STATE_CACHE: {},
+        # Latest open/closed/held-open state from DOOR_CONTACT_STATE
+        # notifications. Some Hartmann panels never emit raw `Input` status
+        # frames for the door contact and only report state via
+        # notifications; this cache keeps that path's snapshot.
+        #   {door_id: {"is_open": bool, "held_open": bool, "ts": str|None}}
+        KEY_DOOR_CONTACT_STATE_CACHE: {},
+        # Per-door held-open threshold (ms) read from /api/Doors
+        # `AllowedHeldOpenTime`. Populated by build_door_held_open_thresholds
+        # at deferred-start and on the hourly name-sync. Used by ws.py to
+        # synthesize a HELD_OPEN dispatch on Protector.Net (which doesn't
+        # emit one natively). Value is None for doors with
+        # DisableHeldOpen=true — see KEY_DOOR_HELD_OPEN_THRESHOLDS docstring.
+        KEY_DOOR_HELD_OPEN_THRESHOLDS: {},
+        # Last-seen merged door status payload per door. Populated by ws.py
+        # on every door frame, read by post-setup re-dispatch to defeat the
+        # WS-burst-vs-entity-subscribe timing race.
+        KEY_LAST_DOOR_STATUS: {},
         # Snapshot of options at load time. The update listener compares
         # against this to decide whether an entry update is a real options
         # change (reload needed) or just a title rename (no reload — would
@@ -281,14 +360,62 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         hub.async_start()
         _LOGGER.debug("[%s] Hub started for %s", entry.entry_id, host)
 
-        # Pull current partition + door names from Hartmann before platforms
-        # build entities. The entry title is the source of truth for the
-        # partition name in entity device_info, so updating it here means
-        # the hub device gets the right name immediately (no second reload).
-        # `allow_state_changes=False` here: auto-add can write options, and
-        # that would trigger a reload race with forward_entry_setups below.
-        # First hourly tick runs the full sync (auto-add included).
-        await _sync_names_from_hartmann(hass, entry, allow_state_changes=False)
+        # Fast partition-title sync only (one API call). The hub device's
+        # display name is read from entry.title at platform-setup time, so
+        # this needs to happen before forward_entry_setups. Heavier work
+        # (door renames, auto-add, contact map) is deferred to after
+        # platforms are up so it doesn't delay entity creation past the
+        # WS client's initial-state burst.
+        await _sync_partition_title_only(hass, entry)
+
+        # Now set up platforms (these return quickly; our platforms offload I/O)
+        await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+        _LOGGER.debug("[%s] Platforms set up: %s", entry.entry_id, ", ".join(PLATFORMS))
+
+        # Heavy post-setup work — door-name sync, contact-map build, and
+        # (on hourly ticks) auto-add. Plus a one-shot state re-dispatch that
+        # defeats the WS-burst-vs-entity-subscribe timing race: the WS hub
+        # caches every door frame in KEY_LAST_DOOR_STATUS as it arrives,
+        # and once entities have had a moment to subscribe, we replay those
+        # cached states so any entity that came up after the burst still
+        # gets seeded. Without this, on Protector.Net (no Odyssey-style REST
+        # snapshot fallback), missed-burst entities sit at "Unknown" until
+        # someone physically operates the door.
+        async def _post_setup_sync() -> None:
+            # Give entities a moment to finish async_added_to_hass and
+            # register their dispatcher subscriptions. 2s is generous —
+            # forward_entry_setups returns once each platform's
+            # async_setup_entry resolves, but entities' async_added_to_hass
+            # runs as separate tasks scheduled by the platform.
+            await asyncio.sleep(2)
+
+            # Re-dispatch cached states. Reads-only — safe to run even if
+            # the WS hasn't connected yet (cache will be empty, no-op).
+            try:
+                cache = (hass.data.get(DOMAIN, {})
+                         .get(entry.entry_id, {})
+                         .get(KEY_LAST_DOOR_STATUS) or {})
+                if cache:
+                    _LOGGER.debug(
+                        "[%s] Re-dispatching cached state for %d door(s) post-setup",
+                        entry.entry_id, len(cache),
+                    )
+                    for door_id, status in cache.items():
+                        async_dispatcher_send(
+                            hass,
+                            f"{DOMAIN}_door_event_{entry.entry_id}",
+                            {"door_id": int(door_id), "status": dict(status)},
+                        )
+            except Exception as e:
+                _LOGGER.debug(
+                    "[%s] post-setup state re-dispatch skipped: %s",
+                    entry.entry_id, e,
+                )
+
+            # Now do the actual heavy work: name sync + contact map build.
+            await _sync_names_from_hartmann(hass, entry, allow_state_changes=False)
+
+        hass.async_create_task(_post_setup_sync())
 
         # Schedule a recurring background sync so renames in Hartmann reach
         # HA without a manual reload. Cadence is intentionally low — names
@@ -301,10 +428,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             hass, _periodic_name_sync, NAME_SYNC_INTERVAL
         )
         entry.async_on_unload(cancel_sync)
-
-        # Now set up platforms (these return quickly; our platforms offload I/O)
-        await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
-        _LOGGER.debug("[%s] Platforms set up: %s", entry.entry_id, ", ".join(PLATFORMS))
 
     # If HA already running (entry added later), start immediately; otherwise wait for STARTED.
     if hass.is_running:
