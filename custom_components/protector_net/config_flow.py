@@ -219,6 +219,124 @@ class ProtectorNetConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             }),
         )
 
+    # ------------------------------------------------------------------
+    # Reconfigure flow (HA 2024.4+)
+    # Lets the user update base_url / username / password without
+    # removing and re-adding the entry. Preserves entry_id, options,
+    # managed_doors state, and all entity/device registry IDs.
+    # ------------------------------------------------------------------
+    async def async_step_reconfigure(self, user_input=None):
+        entry = self._get_reconfigure_entry()
+        errors: dict[str, str] = {}
+
+        if user_input is not None:
+            new_base_url = user_input["base_url"].rstrip("/")
+            new_username = user_input["username"]
+            new_password = user_input["password"]
+
+            try:
+                new_cookie = await api.login(
+                    self.hass, new_base_url, new_username, new_password
+                )
+            except Exception as err:
+                _LOGGER.debug("Reconfigure login failed: %s", err)
+                errors["base"] = "cannot_connect"
+
+            if not errors:
+                # Recompute unique_id in case the host portion of base_url changed.
+                split = urlsplit(new_base_url)
+                host_for_uid = split.netloc or split.path
+                partition_id = entry.data["partition_id"]
+                new_unique_id = f"{host_for_uid}|partition:{partition_id}"
+
+                # Prevent collision with a DIFFERENT existing entry (e.g. user
+                # accidentally points this entry at another already-configured host).
+                if new_unique_id != entry.unique_id:
+                    for other in self._async_current_entries():
+                        if (
+                            other.entry_id != entry.entry_id
+                            and other.unique_id == new_unique_id
+                        ):
+                            return self.async_abort(reason="already_configured")
+
+                # Refresh title host portion if the host changed; keep partition label.
+                old_host = urlparse(entry.data["base_url"]).netloc
+                new_host = urlparse(new_base_url).netloc
+                if old_host and old_host != new_host and " – " in (entry.title or ""):
+                    _, partition_label = entry.title.split(" – ", 1)
+                    new_title = f"{new_host} – {partition_label}"
+                else:
+                    new_title = entry.title
+
+                return self.async_update_reload_and_abort(
+                    entry,
+                    unique_id=new_unique_id,
+                    title=new_title,
+                    data_updates={
+                        "base_url":       new_base_url,
+                        "username":       new_username,
+                        "password":       new_password,
+                        "session_cookie": new_cookie,
+                    },
+                )
+
+        return self.async_show_form(
+            step_id="reconfigure",
+            data_schema=vol.Schema({
+                vol.Required("base_url", default=entry.data["base_url"]): str,
+                vol.Required("username", default=entry.data["username"]): str,
+                vol.Required("password"): str,
+            }),
+            errors=errors,
+            description_placeholders={"name": entry.title or ""},
+        )
+
+    # ------------------------------------------------------------------
+    # Reauth flow
+    # Triggered when api._request_with_reauth raises ConfigEntryAuthFailed
+    # (i.e. the stored credentials are actually rejected by the server,
+    # not just a routine session-cookie expiry).
+    # ------------------------------------------------------------------
+    async def async_step_reauth(self, entry_data):
+        """Entrypoint called by HA when the integration raises ConfigEntryAuthFailed."""
+        return await self.async_step_reauth_confirm()
+
+    async def async_step_reauth_confirm(self, user_input=None):
+        entry = self._get_reauth_entry()
+        errors: dict[str, str] = {}
+
+        if user_input is not None:
+            try:
+                new_cookie = await api.login(
+                    self.hass,
+                    entry.data["base_url"],
+                    user_input["username"],
+                    user_input["password"],
+                )
+            except Exception as err:
+                _LOGGER.debug("Reauth login failed: %s", err)
+                errors["base"] = "invalid_auth"
+
+            if not errors:
+                return self.async_update_reload_and_abort(
+                    entry,
+                    data_updates={
+                        "username":       user_input["username"],
+                        "password":       user_input["password"],
+                        "session_cookie": new_cookie,
+                    },
+                )
+
+        return self.async_show_form(
+            step_id="reauth_confirm",
+            data_schema=vol.Schema({
+                vol.Required("username", default=entry.data["username"]): str,
+                vol.Required("password"): str,
+            }),
+            errors=errors,
+            description_placeholders={"name": entry.title or ""},
+        )
+
     @staticmethod
     @config_entries.callback
     def async_get_options_flow(config_entry):
@@ -263,13 +381,13 @@ class ProtectorNetOptionsFlow(config_entries.OptionsFlow):
         self._plan_choices = {str(p["Id"]): p["Name"] for p in triggers}
 
         if user_input is not None:
-            # The entities field is wrapped in a section() — the frontend
-            # nests its value under the section key, so dig in to extract.
-            entities_section = user_input.pop("legacy_entities_section", None) or {}
-            picked_raw = entities_section.get("entities", [])
-
+            # entities now live inside the collapsible legacy section; flatten
+            # back to a top-level "entities" key so stored options keep their
+            # existing shape (backward compatible with prior entries).
+            legacy_section = user_input.pop("legacy_entities_section", None) or {}
+            raw_entities = legacy_section.get("entities", [])
             # Force Pulse Unlock to remain present; keep only valid optional picks
-            picked_optional = [e for e in picked_raw if e in ENTITY_CHOICES_OPTIONAL]
+            picked_optional = [e for e in raw_entities if e in ENTITY_CHOICES_OPTIONAL]
             user_input["entities"] = ["_pulse_unlock", *picked_optional]
 
             # Preserve schedule-related options that aren't on this page —
@@ -305,21 +423,15 @@ class ProtectorNetOptionsFlow(config_entries.OptionsFlow):
             data_schema=vol.Schema({
                 vol.Optional("override_minutes", default=default_override): int,
                 vol.Optional("pin_digits", default=default_pin_digits): int,
-                vol.Required(KEY_PLAN_IDS, default=default_plans):
-                    cv.multi_select(self._plan_choices),
-                # Wrap the legacy entities multi-select in a section() so the
-                # warning description renders reliably above it. cv.multi_select
-                # has a frontend bug (#16594) that suppresses data_description
-                # rendering when the field renders as a checkbox-list, so the
-                # only way to get the warning visible is via a section()'s own
-                # description (which renders correctly).
                 vol.Required("legacy_entities_section"): section(
                     vol.Schema({
-                        vol.Required("entities", default=default_entities_optional):
+                        vol.Optional("entities", default=default_entities_optional):
                             cv.multi_select(ENTITY_CHOICES_OPTIONAL),
                     }),
                     {"collapsed": True},
                 ),
+                vol.Required(KEY_PLAN_IDS, default=default_plans):
+                    cv.multi_select(self._plan_choices),
             }),
         )
 
