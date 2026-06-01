@@ -7,6 +7,8 @@ import logging
 import json
 from typing import Iterable, Optional, Dict, Any, List
 
+from homeassistant.exceptions import ConfigEntryAuthFailed
+
 _LOGGER = logging.getLogger(__name__)
 
 from .const import DOMAIN, FRIENDLY_TO_TZ_INDEX, OVERRIDE_MODE_LABEL_TO_TOKEN
@@ -107,15 +109,43 @@ async def _request_with_reauth(
 
         # Session expired → re-authenticate
         _LOGGER.debug("%s: session expired, re-authenticating", entry_id)
-        new_cookie = await login(
-            hass,
-            cfg["base_url"],
-            cfg["username"],
-            cfg["password"],
-        )
+        try:
+            new_cookie = await login(
+                hass,
+                cfg["base_url"],
+                cfg["username"],
+                cfg["password"],
+            )
+        except httpx.HTTPStatusError as err:
+            # The /auth call itself was rejected. If it's 401/403, the stored
+            # credentials are no longer valid — surface as ConfigEntryAuthFailed
+            # so HA shows a "Reauthenticate" repair notification instead of a
+            # noisy stack trace. Other status codes (5xx, etc.) propagate.
+            if err.response.status_code in (401, 403):
+                _LOGGER.warning(
+                    "%s: stored credentials rejected by server (HTTP %s) — "
+                    "prompting user to reauthenticate",
+                    entry_id, err.response.status_code,
+                )
+                raise ConfigEntryAuthFailed(
+                    "Stored Protector.Net/Odyssey credentials were rejected"
+                ) from err
+            raise
+
         cfg["session_cookie"] = new_cookie
         headers["Cookie"] = f"ss-id={new_cookie}"
         resp = await client.request(method, url, headers=headers, **kwargs)
+        # Belt-and-suspenders: if the brand-new cookie still yields 401, the
+        # account most likely lacks permission or was disabled. Treat as auth
+        # failure rather than retrying forever.
+        if resp.status_code == 401:
+            _LOGGER.warning(
+                "%s: request still 401 after fresh login — credentials likely invalid",
+                entry_id,
+            )
+            raise ConfigEntryAuthFailed(
+                "Re-login succeeded but request still returned 401"
+            )
         resp.raise_for_status()
         return resp
 
@@ -2214,3 +2244,190 @@ async def get_panels(hass, entry_id: str) -> list[dict]:
     except Exception as e:
         _LOGGER.debug("%s: Failed to list Panels: %s", entry_id, e)
         return []
+
+
+# ============================================================================
+# Panel inputs (used by the per-door door-contact binary_sensor)
+# ============================================================================
+
+async def get_panel_inputs(hass, entry_id: str, panel_id: int) -> list[dict]:
+    """GET /api/Panels/{panel_id}/Inputs — list inputs (PanelInputConfiguration).
+
+    Response shape on Protector.Net is a flat array; on Odyssey it's wrapped
+    in {"Results": [...]}. Both shapes handled.
+
+    Each item has at least: Id, Name, IndexOnPanel, InputUsage (string),
+    InputUsageVal (int), IsInverted, DoorIndex, ParentPanelId.
+    Returns [] on any error (logged at debug — not actionable for the user).
+    """
+    cfg = hass.data[DOMAIN][entry_id]
+    url = f"{cfg['base_url']}/api/Panels/{int(panel_id)}/Inputs"
+    try:
+        resp = await _request_with_reauth(hass, entry_id, "GET", url, timeout=10)
+        data = resp.json() or []
+        if isinstance(data, list):
+            return data
+        return data.get("Results") or []
+    except Exception as e:
+        _LOGGER.debug("%s: Failed to list inputs for panel %s: %s",
+                      entry_id, panel_id, e)
+        return []
+
+
+async def build_door_contact_map(hass, entry_id: str) -> dict[tuple[str, int], dict]:
+    """Discover the (panel_mac, input_index) -> door-contact map for this entry.
+
+    Walks every panel in the partition, lists its inputs, keeps only those
+    with InputUsage in DOOR_CONTACT_USAGES, and resolves DoorIndex (the input's
+    door-on-this-panel position 0-15) to the corresponding Hartmann door_id by
+    matching against Door.IndexOnPanel.
+
+    Returns:
+        {(panel_mac, input_index_on_panel): {
+            "door_id":     int,
+            "panel_id":    int,
+            "is_inverted": bool,
+            "input_name":  str,
+        }}
+
+    Empty dict on any failure or if no door-contact inputs exist. Not raising:
+    the binary_sensor platform falls back to "Unknown" gracefully when the
+    map is empty, so a transient API error just means contacts won't update
+    until the next hourly sync rebuilds the map.
+    """
+    from .const import DOOR_CONTACT_USAGES  # local to keep top-of-file imports tidy
+
+    contact_map: dict[tuple[str, int], dict] = {}
+
+    panels = await get_panels(hass, entry_id)
+    if not panels:
+        return contact_map
+
+    # Doors are partition-scoped; one fetch covers all panels.
+    doors = await get_all_doors(hass, entry_id)
+    if not doors:
+        return contact_map
+
+    # Build (parent_panel_id, index_on_panel) -> door_id.
+    door_by_panel_index: dict[tuple[int, int], int] = {}
+    for d in doors:
+        try:
+            ppid = int(d.get("ParentPanelId"))
+            iop  = int(d.get("IndexOnPanel"))
+            did  = int(d.get("Id"))
+        except (TypeError, ValueError):
+            continue
+        door_by_panel_index[(ppid, iop)] = did
+
+    for panel in panels:
+        try:
+            panel_id = int(panel.get("Id"))
+        except (TypeError, ValueError):
+            continue
+        mac = (panel.get("PanelMacAddress") or "").strip()
+        if not mac:
+            continue
+
+        inputs = await get_panel_inputs(hass, entry_id, panel_id)
+        for inp in inputs:
+            usage = str(inp.get("InputUsage") or "")
+            if usage not in DOOR_CONTACT_USAGES:
+                continue
+            try:
+                idx = int(inp.get("IndexOnPanel"))
+                door_idx = int(inp.get("DoorIndex"))
+            except (TypeError, ValueError):
+                continue
+
+            door_id = door_by_panel_index.get((panel_id, door_idx))
+            if door_id is None:
+                # Input is configured as a contact but its DoorIndex doesn't
+                # resolve to any door we know about. Skip — surfacing this
+                # as an entity would be confusing.
+                _LOGGER.debug(
+                    "%s: Door_Contact input on panel %s idx=%s targets "
+                    "DoorIndex=%s but no door has that IndexOnPanel; skipping",
+                    entry_id, panel_id, idx, door_idx,
+                )
+                continue
+
+            contact_map[(mac, idx)] = {
+                "door_id":     door_id,
+                "panel_id":    panel_id,
+                "is_inverted": bool(inp.get("IsInverted")),
+                "input_name":  str(inp.get("Name") or f"Input {idx}"),
+            }
+
+    if contact_map:
+        _LOGGER.debug(
+            "%s: Built door-contact map: %d input(s) across %d door(s)",
+            entry_id, len(contact_map),
+            len({v["door_id"] for v in contact_map.values()}),
+        )
+    return contact_map
+
+
+async def build_door_held_open_thresholds(
+    hass, entry_id: str
+) -> dict[int, int | None]:
+    """Discover the per-door held-open threshold (milliseconds) for this entry.
+
+    Returns:
+        {door_id: ms_int | None}
+
+    Where the value is:
+        * `int` — `AllowedHeldOpenTime` from /api/Doors (in ms). Used by ws.py
+          to start a per-door timer that synthesizes a held-open dispatch
+          when the contact has stayed open longer than this threshold.
+
+    Why this exists: Protector.Net (legacy) does NOT emit a
+    `DOOR_CONTACT_STATE | HELD_OPEN` SignalR notification — its own web UI
+    derives the "Held Open" badge purely client-side from the contact's
+    on-time vs. this threshold. Odyssey, by contrast, DOES emit a real
+    HELD_OPEN notification, so on those panels the timer's synthesized
+    dispatch is just defensive (it gets pre-empted by the real notification).
+
+    Note on `DisableHeldOpen`:
+        Hartmann's door config has a `DisableHeldOpen` flag, but observed
+        behavior on Protector.Net is that the WEB UI still shows the
+        "Held Open" badge for doors with that flag set — it appears to
+        only suppress the buzzer/audit alarm, not the visual state. We
+        therefore intentionally do NOT special-case that flag here; if
+        AllowedHeldOpenTime is > 0 we honor it. Users who genuinely don't
+        want held-open events in HA can disable the binary_sensor's
+        held_open attribute via templates, or set AllowedHeldOpenTime to
+        0 in the door config.
+
+    Empty dict on any failure — the binary_sensor's `held_open` attribute
+    just stays False until the next hourly sync rebuilds the cache. Not
+    raising: a missing threshold is far less damaging than blocking entity
+    setup.
+    """
+    out: dict[int, int] = {}
+    doors = await get_all_doors(hass, entry_id)
+    if not doors:
+        return out
+    for d in doors:
+        try:
+            did = int(d.get("Id"))
+        except (TypeError, ValueError):
+            continue
+        t = d.get("AllowedHeldOpenTime")
+        # Hartmann sometimes returns the value as a string (varies by panel
+        # firmware / API version). Tolerate both.
+        if isinstance(t, bool):
+            # Defensive: bool is an int subclass in Python; treat it as
+            # "missing" rather than 0 or 1 ms (which would be nonsensical).
+            continue
+        try:
+            t_int = int(t)
+        except (TypeError, ValueError):
+            continue
+        if t_int > 0:
+            out[did] = t_int
+    if out:
+        _LOGGER.debug(
+            "%s: Built door-held-open thresholds: %d door(s)",
+            entry_id, len(out),
+        )
+    return out
