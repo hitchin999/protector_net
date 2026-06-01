@@ -164,9 +164,24 @@ SERVICE_RESUME_DOOR = "resume_door"
 # Managed door schedules
 SERVICE_SET_DOOR_SCHEDULE_MODE = "set_door_schedule_mode"
 
+# Helper validator: a service that accepts EITHER door_entity OR door_device_id
+# (or both) must have at least one populated. Used by override_door / resume_door.
+def _require_door_target(data):
+    if not (data.get("door_entity") or data.get("door_device_id")):
+        raise vol.Invalid(
+            "Either 'door_entity' or 'door_device_id' must be provided"
+        )
+    return data
+
+
+# Reusable selector for either field accepting str or list[str]
+DOOR_ENTITY_SCHEMA = vol.Any(cv.string, vol.All(cv.ensure_list, [cv.string]))
+
+
 SERVICE_SET_DOOR_SCHEDULE_MODE_SCHEMA = vol.Schema(
     {
-        vol.Required("door_device_id"): DEVICE_ID_SCHEMA,
+        # Entity-only — this service is unreleased so no legacy field needed.
+        vol.Required("door_entity"): DOOR_ENTITY_SCHEMA,
         vol.Required("mode"): vol.In(SCHEDULE_MODES),
     }
 )
@@ -187,21 +202,30 @@ OVERRIDE_DOOR_MODES = [
 ]
 
 # Schema for override_door service
-SERVICE_OVERRIDE_DOOR_SCHEMA = vol.Schema(
-    {
-        vol.Required("door_device_id"): DEVICE_ID_SCHEMA,
-        vol.Optional("mode", default="Unlock"): vol.In(OVERRIDE_DOOR_MODES),
-        vol.Optional("override_type", default="until_resumed"): vol.In(OVERRIDE_TYPES),
-        vol.Optional("minutes"): vol.All(vol.Coerce(int), vol.Range(min=1)),
-        vol.Optional("until"): cv.string,  # ISO datetime — auto-computes minutes
-    }
+SERVICE_OVERRIDE_DOOR_SCHEMA = vol.All(
+    vol.Schema(
+        {
+            # Either field is acceptable; resolver de-dupes and combines.
+            vol.Optional("door_entity"): DOOR_ENTITY_SCHEMA,
+            vol.Optional("door_device_id"): DEVICE_ID_SCHEMA,
+            vol.Optional("mode", default="Unlock"): vol.In(OVERRIDE_DOOR_MODES),
+            vol.Optional("override_type", default="until_resumed"): vol.In(OVERRIDE_TYPES),
+            vol.Optional("minutes"): vol.All(vol.Coerce(int), vol.Range(min=1)),
+            vol.Optional("until"): cv.string,  # ISO datetime — auto-computes minutes
+        }
+    ),
+    _require_door_target,
 )
 
 # Schema for resume_door service
-SERVICE_RESUME_DOOR_SCHEMA = vol.Schema(
-    {
-        vol.Required("door_device_id"): DEVICE_ID_SCHEMA,
-    }
+SERVICE_RESUME_DOOR_SCHEMA = vol.All(
+    vol.Schema(
+        {
+            vol.Optional("door_entity"): DOOR_ENTITY_SCHEMA,
+            vol.Optional("door_device_id"): DEVICE_ID_SCHEMA,
+        }
+    ),
+    _require_door_target,
 )
 
 
@@ -313,6 +337,67 @@ def _normalize_device_ids(device_ids: str | list[str]) -> list[str]:
     if isinstance(device_ids, str):
         return [device_ids]
     return list(device_ids)
+
+
+def _resolve_door_targets(
+    hass: HomeAssistant,
+    call: ServiceCall,
+) -> tuple[dict[str, list[int]], list[str], list[str]]:
+    """Resolve `door_entity` and/or `door_device_id` from a ServiceCall to
+    a per-entry list of door_ids.
+
+    Both fields are optional individually but the schema requires at least
+    one (via _require_door_target). Targets from both are merged and
+    de-duplicated by (entry_id, door_id).
+
+    Returns:
+        (doors_by_entry, invalid_entities, invalid_devices)
+
+        doors_by_entry: {entry_id: [door_id, ...]}  — order preserved within
+        invalid_entities: entity_ids that couldn't be resolved
+        invalid_devices:  device_ids that couldn't be resolved
+    """
+    raw_entities = call.data.get("door_entity")
+    raw_devices  = call.data.get("door_device_id")
+
+    entity_ids: list[str] = []
+    if raw_entities:
+        entity_ids = (
+            [raw_entities] if isinstance(raw_entities, str)
+            else list(raw_entities)
+        )
+    device_ids: list[str] = (
+        _normalize_device_ids(raw_devices) if raw_devices else []
+    )
+
+    seen: set[tuple[str, int]] = set()
+    doors_by_entry: dict[str, list[int]] = {}
+    invalid_entities: list[str] = []
+    invalid_devices:  list[str] = []
+
+    for eid in entity_ids:
+        entry_id, door_id = _get_door_id_from_entity(hass, eid)
+        if entry_id is None or door_id is None:
+            invalid_entities.append(eid)
+            continue
+        key = (entry_id, int(door_id))
+        if key in seen:
+            continue
+        seen.add(key)
+        doors_by_entry.setdefault(entry_id, []).append(int(door_id))
+
+    for did in device_ids:
+        entry_id, door_id = _get_door_id_from_device(hass, did)
+        if entry_id is None or door_id is None:
+            invalid_devices.append(did)
+            continue
+        key = (entry_id, int(door_id))
+        if key in seen:
+            continue
+        seen.add(key)
+        doors_by_entry.setdefault(entry_id, []).append(int(door_id))
+
+    return doors_by_entry, invalid_entities, invalid_devices
 
 
 def _find_doors_with_code_in_entry(
@@ -1484,7 +1569,6 @@ async def async_setup_services(hass: HomeAssistant) -> None:
         from homeassistant.util import dt as dt_util
         import math
         
-        device_ids = _normalize_device_ids(call.data["door_device_id"])
         mode = call.data.get("mode", "Unlock")
         override_type = call.data.get("override_type", "until_resumed")
         minutes = call.data.get("minutes")
@@ -1523,22 +1607,16 @@ async def async_setup_services(hass: HomeAssistant) -> None:
         if type_token == "Time" and not minutes_arg:
             return {"success": False, "error": "minutes required for 'for_time' override type"}
         
-        # Group doors by entry_id for efficient API calls
-        doors_by_entry: dict[str, list[int]] = {}
-        invalid_devices = []
-        
-        for device_id in device_ids:
-            entry_id, door_id = _get_door_id_from_device(hass, device_id)
-            if entry_id is None or door_id is None:
-                invalid_devices.append(device_id)
-                continue
-            
-            if entry_id not in doors_by_entry:
-                doors_by_entry[entry_id] = []
-            doors_by_entry[entry_id].append(door_id)
+        # Resolve targets from door_entity and/or door_device_id (legacy)
+        doors_by_entry, invalid_entities, invalid_devices = _resolve_door_targets(hass, call)
         
         if not doors_by_entry:
-            return {"success": False, "error": "No valid doors found"}
+            return {
+                "success": False,
+                "error": "No valid doors found",
+                "invalid_entities": invalid_entities,
+                "invalid_devices":  invalid_devices,
+            }
         
         all_success = True
         results = []
@@ -1582,9 +1660,10 @@ async def async_setup_services(hass: HomeAssistant) -> None:
                 results.append({"entry_id": entry_id, "door_ids": door_ids, "success": False, "error": str(e)})
                 all_success = False
         
-        # Single device backward compatibility
-        if len(device_ids) == 1 and len(doors_by_entry) == 1:
-            entry_id = list(doors_by_entry.keys())[0]
+        # Single-target backward compatibility (preserve flat shape when one door)
+        if (len(doors_by_entry) == 1 and
+            len(next(iter(doors_by_entry.values()))) == 1):
+            entry_id = next(iter(doors_by_entry))
             door_id = doors_by_entry[entry_id][0]
             return {
                 "success": all_success,
@@ -1594,34 +1673,33 @@ async def async_setup_services(hass: HomeAssistant) -> None:
                 "minutes": minutes_arg,
             }
         
-        return {
+        out: dict[str, Any] = {
             "success": all_success,
             "mode": mode,
             "override_type": override_type,
             "minutes": minutes_arg,
             "results": results,
         }
+        if invalid_entities:
+            out["invalid_entities"] = invalid_entities
+        if invalid_devices:
+            out["invalid_devices"] = invalid_devices
+        return out
     
     async def handle_resume_door(call: ServiceCall) -> dict[str, Any]:
         """Handle the resume_door service call - resume normal schedule."""
         from . import api
         
-        device_ids = _normalize_device_ids(call.data["door_device_id"])
-        
-        # Group doors by entry_id for efficient API calls
-        doors_by_entry: dict[str, list[int]] = {}
-        
-        for device_id in device_ids:
-            entry_id, door_id = _get_door_id_from_device(hass, device_id)
-            if entry_id is None or door_id is None:
-                continue
-            
-            if entry_id not in doors_by_entry:
-                doors_by_entry[entry_id] = []
-            doors_by_entry[entry_id].append(door_id)
+        # Resolve targets from door_entity and/or door_device_id (legacy)
+        doors_by_entry, invalid_entities, invalid_devices = _resolve_door_targets(hass, call)
         
         if not doors_by_entry:
-            return {"success": False, "error": "No valid doors found"}
+            return {
+                "success": False,
+                "error": "No valid doors found",
+                "invalid_entities": invalid_entities,
+                "invalid_devices":  invalid_devices,
+            }
         
         all_success = True
         results = []
@@ -1650,13 +1728,19 @@ async def async_setup_services(hass: HomeAssistant) -> None:
                 results.append({"entry_id": entry_id, "door_ids": door_ids, "success": False, "error": str(e)})
                 all_success = False
         
-        # Single device backward compatibility
-        if len(device_ids) == 1 and len(doors_by_entry) == 1:
-            entry_id = list(doors_by_entry.keys())[0]
+        # Single-target backward compatibility
+        if (len(doors_by_entry) == 1 and
+            len(next(iter(doors_by_entry.values()))) == 1):
+            entry_id = next(iter(doors_by_entry))
             door_id = doors_by_entry[entry_id][0]
             return {"success": all_success, "door_id": door_id}
         
-        return {"success": all_success, "results": results}
+        out: dict[str, Any] = {"success": all_success, "results": results}
+        if invalid_entities:
+            out["invalid_entities"] = invalid_entities
+        if invalid_devices:
+            out["invalid_devices"] = invalid_devices
+        return out
     
     async def handle_set_door_schedule_mode(call: ServiceCall) -> dict[str, Any]:
         """Handle the set_door_schedule_mode service call.
@@ -1672,7 +1756,12 @@ async def async_setup_services(hass: HomeAssistant) -> None:
         """
         from . import api, managed_schedules
 
-        device_ids = _normalize_device_ids(call.data["door_device_id"])
+        # Entity-only — this service was introduced fresh in v0.2.5.
+        raw_entities = call.data["door_entity"]
+        entity_ids = (
+            [raw_entities] if isinstance(raw_entities, str)
+            else list(raw_entities)
+        )
         mode = call.data["mode"]
 
         # Group doors by entry_id so we can fire Update Panels at most once
@@ -1680,26 +1769,32 @@ async def async_setup_services(hass: HomeAssistant) -> None:
         per_entry: dict[str, list[int]] = {}
         unmanaged: list[int] = []
         invalid: list[str] = []
-        for device_id in device_ids:
-            entry_id, door_id = _get_door_id_from_device(hass, device_id)
+        seen: set[tuple[str, int]] = set()
+
+        for eid in entity_ids:
+            entry_id, door_id = _get_door_id_from_entity(hass, eid)
             if entry_id is None or door_id is None:
-                invalid.append(device_id)
+                invalid.append(eid)
                 continue
+            key = (entry_id, int(door_id))
+            if key in seen:
+                continue
+            seen.add(key)
             entry = hass.config_entries.async_get_entry(entry_id)
             if entry is None or not managed_schedules.is_managed(entry, door_id):
                 unmanaged.append(door_id)
                 continue
-            per_entry.setdefault(entry_id, []).append(door_id)
+            per_entry.setdefault(entry_id, []).append(int(door_id))
 
         if not per_entry:
             return {
                 "success": False,
                 "error": (
                     "No managed doors selected. Add the door(s) under "
-                    "integration options -> Door Schedule Management first."
+                    "integration options -> Door Time Zones first."
                 ),
                 "unmanaged_door_ids": unmanaged,
-                "invalid_devices":    invalid,
+                "invalid_entities":   invalid,
             }
 
         results: list[dict[str, Any]] = []
@@ -1759,7 +1854,7 @@ async def async_setup_services(hass: HomeAssistant) -> None:
         if unmanaged:
             results.append({"unmanaged_door_ids": unmanaged})
         if invalid:
-            results.append({"invalid_devices": invalid})
+            results.append({"invalid_entities": invalid})
 
         return {"success": all_success, "mode": mode, "results": results}
 
