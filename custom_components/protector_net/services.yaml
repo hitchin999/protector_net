@@ -306,15 +306,17 @@ override_door:
   name: Override Door
   description: Apply an override to door(s) (unlock, lockdown, etc.). Single service call instead of setting mode + turning on override switch.
   fields:
-    door_device_id:
+    door_entity:
       name: Door(s)
-      description: The door(s) to override
-      required: true
+      description: The door(s) to override. Pick the door's entity (one per door, named after the door).
+      required: false
       selector:
-        device:
+        entity:
           multiple: true
           filter:
             - integration: protector_net
+              domain: binary_sensor
+              device_class: door
     mode:
       name: Mode
       description: Door mode during override
@@ -362,20 +364,56 @@ override_door:
       example: "2026-02-18T14:00:00"
       selector:
         datetime:
+    legacy_options:
+      name: Legacy options (for old automations)
+      collapsed: false
+      fields:
+        door_device_id:
+          name: Door(s) — Legacy
+          description: >-
+            ⚠️ Legacy device picker for old automations. Please switch to the
+            "Door(s)" entity picker above — device IDs can change after Home
+            Assistant core updates, but entity IDs stay stable. To migrate:
+            clear this field, then pick the same doors from the entity picker.
+          required: false
+          selector:
+            device:
+              multiple: true
+              filter:
+                - integration: protector_net
 
 resume_door:
   name: Resume Door
   description: Resume normal schedule for door(s) (turn off any active override)
   fields:
-    door_device_id:
+    door_entity:
       name: Door(s)
-      description: The door(s) to resume
-      required: true
+      description: The door(s) to resume. Pick the door's entity (one per door, named after the door).
+      required: false
       selector:
-        device:
+        entity:
           multiple: true
           filter:
             - integration: protector_net
+              domain: binary_sensor
+              device_class: door
+    legacy_options:
+      name: Legacy options (for old automations)
+      collapsed: false
+      fields:
+        door_device_id:
+          name: Door(s) — Legacy
+          description: >-
+            ⚠️ Legacy device picker for old automations. Please switch to the
+            "Door(s)" entity picker above — device IDs can change after Home
+            Assistant core updates, but entity IDs stay stable. To migrate:
+            clear this field, then pick the same doors from the entity picker.
+          required: false
+          selector:
+            device:
+              multiple: true
+              filter:
+                - integration: protector_net
 
 set_door_schedule_mode:
   name: Set Door Schedule Mode (HA-managed)
@@ -385,15 +423,17 @@ set_door_schedule_mode:
     across panel reboots. The door must first be added to "Managed doors" via
     integration options.
   fields:
-    door_device_id:
+    door_entity:
       name: Door(s)
-      description: The door(s) to update. Must be HA-managed.
+      description: The door(s) to update. Must be HA-managed. Pick the door's entity (one per door, named after the door).
       required: true
       selector:
-        device:
+        entity:
           multiple: true
           filter:
             - integration: protector_net
+              domain: binary_sensor
+              device_class: door
     mode:
       name: Mode
       description: >
