@@ -144,3 +144,93 @@ SCHEDULE_VAL_TO_MODE = {v: k for k, v in SCHEDULE_MODE_TO_VAL.items()}
 # Default mode used when the HA TZ is first provisioned.
 DEFAULT_SCHEDULE_MODE = "CardOrPin"
 
+# --- Door contact binary sensors --------------------------------------------
+# Per-door open/closed state derived from panel inputs configured as
+# Door_Contact (or Monitored_Door_Contact). Discovered automatically from
+# /api/Panels and /api/Panels/{Id}/Inputs at integration load time and
+# refreshed on the hourly name-sync.
+
+# The two InputUsage strings Hartmann uses for door-contact inputs.
+# `Door_Contact` is the standard contact on a regular door (with reader/strike).
+# `Monitored_Door_Contact` is the standalone monitored-door variant (no reader).
+DOOR_CONTACT_USAGES = ("Door_Contact", "Monitored_Door_Contact")
+
+# Per-entry data key (hass.data[DOMAIN][entry_id][...]) holding the
+# discovered contact map. Built fresh on every load and on the hourly tick.
+#   {(panel_mac, input_index): {
+#       "door_id":     int,
+#       "panel_id":    int,
+#       "is_inverted": bool,
+#       "input_name":  str,
+#   }}
+KEY_DOOR_CONTACT_MAP = "door_contact_map"
+
+# Per-entry data key holding the most recent enabled value seen on each
+# input that's in the contact map. Lets a freshly-added binary_sensor
+# entity read the current state immediately on async_added_to_hass instead
+# of waiting for the next WS transition (which may never come for a stable
+# door). Keyed identically to KEY_DOOR_CONTACT_MAP.
+#   {(panel_mac, input_index): bool}  # raw `enabled` from WS frame
+KEY_INPUT_STATE_CACHE = "input_state_cache"
+
+# Per-entry data key holding the most recent door open/closed/held-open state
+# derived from `DOOR_CONTACT_STATE` notification frames (NotificationType =
+# "DOOR_CONTACT_STATE", StateValues in {OPEN, CLOSED, HELD_OPEN}). This is the
+# only state source on panels that don't push raw `Input` status frames for
+# the contact — Hartmann reports door physical state purely as notifications,
+# already polarity-corrected. Keyed by Hartmann door_id so the binary_sensor
+# can seed itself on async_added_to_hass without scanning the contact map.
+#   {door_id: {"is_open": bool, "held_open": bool, "ts": str|None}}
+KEY_DOOR_CONTACT_STATE_CACHE = "door_contact_state_cache"
+
+# Per-entry data key holding the per-door held-open threshold (in milliseconds)
+# read from /api/Doors `AllowedHeldOpenTime`. Protector.Net (legacy) does NOT
+# emit a `DOOR_CONTACT_STATE | HELD_OPEN` SignalR notification — its web UI
+# derives the "Held Open" badge purely client-side once the door's contact has
+# been ON longer than this threshold. To stay parity with Hartmann's UI on
+# Protector.Net, ws.py starts a per-door asyncio timer when the contact opens
+# and synthesizes a held-open dispatch when the timer elapses. Odyssey panels
+# that DO send a real HELD_OPEN notification short-circuit the timer (the
+# notification arrives first and updates the cache directly).
+#
+# Value is None when the door has `DisableHeldOpen=true` set in Hartmann —
+# in that case we skip the timer entirely so we don't fight the panel's
+# explicit "no held-open detection" config.
+#
+#   {door_id: int_ms_or_None}
+KEY_DOOR_HELD_OPEN_THRESHOLDS = "door_held_open_thresholds"
+
+# Default held-open threshold (milliseconds) used when the per-door value
+# can't be fetched (transient API error, door config endpoint unavailable on
+# very old Protector.Net builds). 30 seconds matches Hartmann's factory
+# default for AllowedHeldOpenTime.
+DEFAULT_HELD_OPEN_THRESHOLD_MS = 30000
+
+# Per-entry data key holding the last-seen merged door status payload for
+# each door. Populated by ws.py on every door frame (merging non-None fields
+# so a partial frame can't overwrite a previously good strike/opener with
+# None). Read by __init__.py's post-setup task to re-dispatch states once
+# entities are guaranteed to be subscribed — covers the WS-burst-vs-entity-
+# subscribe timing race that otherwise leaves sensors at "Unknown" on
+# Protector.Net (which has no REST snapshot fallback like Odyssey).
+#
+#   {door_id: {"strike": bool|None, "opener": bool|None,
+#              "overridden": bool|None, "timeZone": int|None}}
+KEY_LAST_DOOR_STATUS = "last_door_status"
+
+# How to interpret the `enabled` field on Input WS frames relative to the
+# input's `IsInverted` config.
+#   "raw"        → WS frame carries the raw circuit state; we apply IsInverted
+#                  ourselves to derive open/closed.
+#   "preapplied" → Hartmann pre-applies IsInverted before sending, so we use
+#                  `enabled` directly as the logical state.
+#
+# Default is "raw" (XOR with IsInverted), based on standard alarm-industry
+# convention. If this turns out to be wrong on real hardware, flipping this
+# single constant fixes every door.
+#
+# When in doubt, the `raw_enabled` and `is_inverted` attributes on each
+# binary_sensor expose the underlying values so the convention can be
+# verified against physical state.
+INVERSION_CONVENTION = "raw"
+
