@@ -4,11 +4,11 @@
       "user": {
         "title": "Protector.Net Access Control",
         "data": {
-          "base_url":         "Protector.Net URL",
-          "username":         "Protector.Net Username (With System Admin Rights)",
-          "password":         "Protector.Net Password",
+          "base_url": "Protector.Net URL",
+          "username": "Protector.Net Username (With System Admin Rights)",
+          "password": "Protector.Net Password",
           "override_minutes": "Default Override Minutes",
-          "pin_digits":       "Default PIN Code Digits (4-9)"
+          "pin_digits": "Default PIN Code Digits (4-9)"
         }
       },
       "partition": {
@@ -30,7 +30,33 @@
         "data": {
           "entities": "Select What Door Entities to Enable (Leave Empty If Not Needed)"
         }
+      },
+      "reconfigure": {
+        "title": "Update Protector.Net Credentials",
+        "description": "Update the credentials or URL for **{name}** without removing the integration. All entities, options, and HA-managed door schedules are preserved.",
+        "data": {
+          "base_url": "Protector.Net URL",
+          "username": "Protector.Net Username (With System Admin Rights)",
+          "password": "Protector.Net Password"
+        }
+      },
+      "reauth_confirm": {
+        "title": "Reauthenticate Protector.Net",
+        "description": "The Protector.Net server rejected the stored credentials for **{name}**. Please re-enter the username and password.",
+        "data": {
+          "username": "Protector.Net Username (With System Admin Rights)",
+          "password": "Protector.Net Password"
+        }
       }
+    },
+    "error": {
+      "cannot_connect": "Failed to connect. Check the URL and that the server is reachable.",
+      "invalid_auth": "The server rejected the username or password."
+    },
+    "abort": {
+      "reconfigure_successful": "Credentials updated successfully.",
+      "reauth_successful": "Reauthentication successful.",
+      "already_configured": "Another configured entry is already using that URL and partition."
     }
   },
   "options": {
@@ -38,17 +64,17 @@
       "init": {
         "title": "Protector.Net Options",
         "menu_options": {
-          "basic_settings":   "Basic Settings",
-          "door_time_zones":  "Door Time Zones (HA-controlled schedules)"
+          "basic_settings": "Basic Settings",
+          "door_time_zones": "Door Time Zones (HA-controlled schedules)"
         }
       },
       "basic_settings": {
         "title": "Basic Settings",
         "description": "Adjust Action Plan buttons, override duration, and temp code settings. Pulse Unlock is always included automatically.",
         "data": {
-          "override_minutes":  "Default Override Minutes",
-          "pin_digits":        "Default PIN Code Digits (4-9)",
-          "plan_ids":          "Select Action Plans to Enable (If There Is Any)"
+          "override_minutes": "Default Override Minutes",
+          "pin_digits": "Default PIN Code Digits (4-9)",
+          "plan_ids": "Select Action Plans to Enable (If There Is Any)"
         },
         "sections": {
           "legacy_entities_section": {
@@ -74,7 +100,7 @@
             "description": "Doors that HA will create a dedicated Door Time Zone for in Hartmann (named like 'HA[abc1234] Front Door' — an HA prefix with a short id, plus the door's name).\n\nCreating the Door Time Zone alone does NOT change door behavior — the door keeps following its existing Hartmann schedule until you also tick it under 'Activate Door Time Zones' below.\n\nNothing on this page does anything until you tick the 'Apply changes' checkbox below — opening this page is safe.\n\nUnticking a door later (with Apply ticked) rolls its schedule back to original and deletes the HA Door Time Zone.",
             "data": {
               "apply_managed_changes": "Apply changes to managed doors on submit",
-              "managed_doors_select":  "Pick doors"
+              "managed_doors_select": "Pick doors"
             },
             "data_description": {
               "apply_managed_changes": "Required to make any changes here. If unticked, the door list below is ignored on submit and your existing managed doors stay as they are."
@@ -85,7 +111,7 @@
             "description": "Subset of the doors above whose schedule HA actually controls right now. Ticking a door here flips its DoorTimeZoneId to the HA Door Time Zone we created above and pushes the change to panels.\n\nFrom there, use the 'set_door_schedule_mode' service to set the door's access mode (Lockdown, Card, Pin, CardOrPin, Unlock, etc.) — the service rewrites the HA Door Time Zone for the whole week and the panels pick up the change automatically.\n\nNothing on this page does anything until you tick the 'Apply changes' checkbox below — opening this page is safe.\n\nUnticking a door later (with Apply ticked) rolls the door back to its original schedule without removing the HA Door Time Zone.",
             "data": {
               "apply_active_changes": "Apply changes to active doors on submit",
-              "active_doors_select":  "Pick doors"
+              "active_doors_select": "Pick doors"
             },
             "data_description": {
               "apply_active_changes": "Required to make any changes here. If unticked, the door list below is ignored on submit and your existing active doors stay as they are."
