@@ -10,6 +10,18 @@ This custom integration controls **Hartmann Controls Protector.Net _and_ Odyssey
 
 ---
 
+## What's new in 0.2.6
+
+### Fix: scheduled door locks occasionally not reaching the panel (Update Panels race)
+
+When an automation changed several doors in quick succession — for example, locking a batch of doors and then, after a condition, **one more door in a second `set_door_schedule_mode` call** a fraction of a second later — each call fired its own **Update Panels** (`PanelCommands/UpdateAll`). A panel takes several seconds to apply an Update Panels, so the second push could land while the panel was still busy with the first and never take effect. The affected door's new schedule was written to the server but never reached the panel hardware, so the door silently kept its previous state — with **no error in Home Assistant and nothing in the panel log**, because as far as HA was concerned the service call succeeded.
+
+This release routes every Update Panels through a **per-entry debouncer**. Rapid pushes now collapse into a **single** Update Panels that fires only after a short quiet window — i.e. after every Door Time Zone write in the burst has committed — so no door's change can be lost to a competing push. A short automatic retry was also added so one transient failure (panel briefly offline) doesn't drop the push.
+
+This only affects the schedule path (`set_door_schedule_mode`). `override_door` / `resume_door` send direct panel commands and were never subject to this race, so **no automation changes are needed** — just update the integration. The quiet window defaults to 2.5 s (`UPDATE_PANELS_DEBOUNCE_SECONDS` in `const.py`); a couple of seconds of latency on a scheduled push is invisible in practice.
+
+---
+
 ## What's new in 0.2.5
 
 ### HA-managed door schedules (survives panel reboots)
@@ -501,6 +513,9 @@ Lock/Unlock **status** messages don’t flip the “by” state (that’s what *
 
 ## Troubleshooting
 
+* **A scheduled door didn't lock/unlock, but there's no error and nothing in the panel log**
+  Update to **0.2.6**. When an automation changed several doors within a second or two (e.g. a batch `set_door_schedule_mode` immediately followed by another call for one more door), the second Update Panels push could be dropped while the panel was still applying the first — so that door's change reached the server but never the hardware. Pushes are now coalesced through a debouncer into a single Update Panels fired after all writes land.
+
 * **Door sensors missing (only Hub Status appears)**
   If you see “No doors matched filters” in the logs, update to **0.2.3**. Older versions relied on site-name matching which fails on some Odyssey servers. The fix uses partition-scoped door discovery instead.
 
@@ -525,6 +540,9 @@ Lock/Unlock **status** messages don’t flip the “by” state (that’s what *
 ---
 
 ## Changelog
+
+### 0.2.6
+* Fix: **Update Panels race on rapid schedule changes** — back-to-back `set_door_schedule_mode` calls (e.g. a batch lock followed immediately by a second call for one more door) each fired their own `PanelCommands/UpdateAll`; the second could be dropped while the panel was still applying the first, leaving that door's new schedule on the server but never pushed to hardware — with no HA error and no panel log. Pushes now route through a per-entry **debouncer** that coalesces a burst into a single Update Panels fired after all Door Time Zone writes commit, plus a short retry for a transient panel-offline. `override_door` / `resume_door` are unaffected (they use direct panel commands); no automation changes needed.
 
 ### 0.2.5
 * New: **HA-managed door schedules** — opt-in per door under **Options → Door Time Zones**. Creates a dedicated Door Time Zone in Hartmann and (optionally) repoints the door to it, so schedule changes survive panel reboots. Rolls back cleanly on untick or integration removal.
