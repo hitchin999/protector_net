@@ -13,11 +13,14 @@ from homeassistant.const import EVENT_HOMEASSISTANT_STARTED
 from homeassistant.helpers.event import async_track_time_interval
 from homeassistant.helpers.dispatcher import async_dispatcher_send
 from homeassistant.helpers.typing import ConfigType
+from homeassistant.helpers.debounce import Debouncer
 
 from .const import (
     DOMAIN, UI_STATE, KEY_AUTO_ADD_NEW_DOORS,
     KEY_DOOR_CONTACT_MAP, KEY_INPUT_STATE_CACHE, KEY_LAST_DOOR_STATUS,
     KEY_DOOR_CONTACT_STATE_CACHE, KEY_DOOR_HELD_OPEN_THRESHOLDS,
+    KEY_UPDATE_PANELS_DEBOUNCER, UPDATE_PANELS_DEBOUNCE_SECONDS,
+    UPDATE_PANELS_PUSH_ATTEMPTS,
 )
 from .ws import SignalRClient
 from . import api
@@ -322,6 +325,40 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     }
     hass.data[DOMAIN][entry.entry_id] = data
 
+    # Coalesce PanelCommands/UpdateAll pushes. Multiple door mutations in
+    # quick succession (the classic case: an automation locks a batch of
+    # doors, then ~0.5s later locks one more door in a second service call)
+    # used to each fire their own UpdateAll. The second could race the first
+    # on the panel and be dropped, leaving that door on its old schedule with
+    # no HA error and no panel log. The debouncer collapses a burst into a
+    # single push that runs only after the quiet window — i.e. after every
+    # DoorTimeZone write has committed. See api.request_update_panels().
+    async def _push_panels_coalesced() -> None:
+        for attempt in range(1, UPDATE_PANELS_PUSH_ATTEMPTS + 1):
+            res = await api.update_panels(hass, entry.entry_id)
+            if res.get("success"):
+                return
+            _LOGGER.warning(
+                "[%s] Coalesced Update Panels attempt %d/%d failed: %s",
+                entry.entry_id, attempt, UPDATE_PANELS_PUSH_ATTEMPTS,
+                res.get("error"),
+            )
+            if attempt < UPDATE_PANELS_PUSH_ATTEMPTS:
+                await asyncio.sleep(float(attempt))
+        _LOGGER.error(
+            "[%s] Coalesced Update Panels gave up after %d attempts; "
+            "panels may be out of sync until the next push",
+            entry.entry_id, UPDATE_PANELS_PUSH_ATTEMPTS,
+        )
+
+    data[KEY_UPDATE_PANELS_DEBOUNCER] = Debouncer(
+        hass,
+        _LOGGER,
+        cooldown=UPDATE_PANELS_DEBOUNCE_SECONDS,
+        immediate=False,
+        function=_push_panels_coalesced,
+    )
+
     # Make options changes trigger a reload
     entry.async_on_unload(entry.add_update_listener(_async_update_listener))
 
@@ -469,6 +506,18 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     if hub:
         await hub.async_stop()
         _LOGGER.debug("[%s] Hub stopped", entry.entry_id)
+
+    # Cancel any pending coalesced Update Panels push so it can't fire after
+    # the entry's runtime data has been torn down.
+    debouncer = hass.data[DOMAIN].get(entry.entry_id, {}).get(KEY_UPDATE_PANELS_DEBOUNCER)
+    if debouncer is not None:
+        try:
+            if hasattr(debouncer, "async_shutdown"):
+                await debouncer.async_shutdown()
+            else:  # older HA cores
+                debouncer.async_cancel()
+        except Exception as e:  # never block unload on cleanup
+            _LOGGER.debug("[%s] Update Panels debouncer shutdown: %s", entry.entry_id, e)
 
     # Unload platforms
     unload_ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
