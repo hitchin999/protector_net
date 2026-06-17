@@ -1840,11 +1840,17 @@ async def async_setup_services(hass: HomeAssistant) -> None:
             new_options = {**entry.options, "managed_doors": updated_managed}
             hass.config_entries.async_update_entry(entry, options=new_options)
 
-            # Fire Update Panels once per entry if any active door's TZ
-            # actually changed.
+            # Request a coalesced Update Panels if any active door's TZ
+            # actually changed. Using request_update_panels (a per-entry
+            # debouncer) instead of a direct push means that when an
+            # automation makes several set_door_schedule_mode calls in quick
+            # succession — e.g. a batch lock immediately followed by a single
+            # extra door in a second call ~0.5s later — the pushes collapse
+            # into ONE UpdateAll that fires after every DoorTimeZone write has
+            # committed, instead of two UpdateAlls racing on the panel.
             if any_active_changed:
                 try:
-                    await api.update_panels(hass, entry_id)
+                    await api.request_update_panels(hass, entry_id)
                 except Exception as e:
                     _LOGGER.warning(
                         "%s: Update Panels after set_door_schedule_mode failed: %s",
