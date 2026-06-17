@@ -11,7 +11,12 @@ from homeassistant.exceptions import ConfigEntryAuthFailed
 
 _LOGGER = logging.getLogger(__name__)
 
-from .const import DOMAIN, FRIENDLY_TO_TZ_INDEX, OVERRIDE_MODE_LABEL_TO_TOKEN
+from .const import (
+    DOMAIN,
+    FRIENDLY_TO_TZ_INDEX,
+    OVERRIDE_MODE_LABEL_TO_TOKEN,
+    KEY_UPDATE_PANELS_DEBOUNCER,
+)
 
 _LOGGER = logging.getLogger(f"{DOMAIN}.api")
 
@@ -1421,7 +1426,13 @@ async def update_temp_code_user(
 
 
 async def update_panels(hass, entry_id: str) -> dict:
-    """Send 'Update Panels' command to push config to all connected panels."""
+    """Send 'Update Panels' command to push config to all connected panels.
+
+    This is the low-level, fire-immediately POST. Callers in the hot path
+    (set_door_schedule_mode) should use request_update_panels() instead so
+    that bursts of door changes coalesce into a single push — see that
+    function and KEY_UPDATE_PANELS_DEBOUNCER for the race this avoids.
+    """
     cfg = hass.data[DOMAIN][entry_id]
     url = f"{cfg['base_url']}/api/PanelCommands/UpdateAll"
     try:
@@ -1431,6 +1442,30 @@ async def update_panels(hass, entry_id: str) -> dict:
     except Exception as e:
         _LOGGER.error("%s: Error sending Update Panels: %s", entry_id, e)
         return {"success": False, "error": f"Failed to update panels: {e}"}
+
+
+async def request_update_panels(hass, entry_id: str) -> None:
+    """Request a coalesced 'Update Panels' push for this entry.
+
+    Routes through the per-entry Debouncer created in async_setup_entry. A
+    burst of requests (e.g. the 11:59 PM batch lock followed ~0.5s later by
+    the basement_entrance lock in a second service call) collapses into ONE
+    UpdateAll that runs only after the quiet window — i.e. after every
+    DoorTimeZone write in the burst has committed. This closes the race where
+    a second UpdateAll fired on the heels of the first was dropped/coalesced
+    server-side, leaving the later door on its old schedule with no error and
+    no panel log.
+
+    Returns immediately after scheduling; the push runs in the background.
+    Falls back to an immediate direct push if no debouncer is wired up (e.g.
+    a transient cleanup cfg in async_remove_entry).
+    """
+    cfg = hass.data.get(DOMAIN, {}).get(entry_id) or {}
+    debouncer = cfg.get(KEY_UPDATE_PANELS_DEBOUNCER)
+    if debouncer is None:
+        await update_panels(hass, entry_id)
+        return
+    await debouncer.async_call()
 
 
 async def add_user_to_door_apg(
