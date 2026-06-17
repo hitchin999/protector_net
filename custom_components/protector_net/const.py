@@ -234,3 +234,31 @@ KEY_LAST_DOOR_STATUS = "last_door_status"
 # verified against physical state.
 INVERSION_CONVENTION = "raw"
 
+# ---------------------------------------------------------------------------
+# Update Panels coalescing
+# ---------------------------------------------------------------------------
+# Per-entry data key holding the Debouncer that coalesces PanelCommands/
+# UpdateAll requests. Multiple door mutations in quick succession (e.g. an
+# automation that locks a batch of doors and then — after a condition — a
+# single extra door in a second service call ~0.5s later) used to each fire
+# their own UpdateAll. The second push could race the first on the panel
+# side: the panel pulls a config snapshot taken before the later DoorTimeZone
+# write committed, or the server coalesces the two and drops the later one.
+# The affected door silently keeps its old schedule — no HA error, no panel
+# log, because no effective command ran for it. Routing every UpdateAll
+# through one debouncer per entry collapses a burst into a SINGLE push that
+# fires only after the last DoorTimeZone write has committed.
+KEY_UPDATE_PANELS_DEBOUNCER = "update_panels_debouncer"
+
+# Quiet-window (seconds) the debouncer waits after the most recent
+# request_update_panels() before firing one UpdateAll. Must comfortably
+# exceed the gap between consecutive set_door_schedule_mode service calls in
+# a single automation run (observed ~0.8s) so they coalesce. A few seconds of
+# latency on a scheduled door push is irrelevant operationally.
+UPDATE_PANELS_DEBOUNCE_SECONDS = 2.5
+
+# How many times the debounced push retries update_panels on a transient
+# failure (panel briefly offline / HTTP hiccup) before giving up. Guards the
+# coalesced single push against being the one that happens to fail.
+UPDATE_PANELS_PUSH_ATTEMPTS = 3
+
