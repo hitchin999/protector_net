@@ -33,6 +33,9 @@ SERVICE_UPDATE_PANELS = "update_panels"
 # Dispatcher signal for temp code updates
 DISPATCH_TEMP_CODE = f"{DOMAIN}_temp_code_update"
 DISPATCH_OTR = f"{DOMAIN}_otr_update"
+# Fired after a managed-door schedule change so the Hub "Door Schedules"
+# sensor refreshes immediately instead of waiting for its poll interval.
+DISPATCH_DOOR_SCHEDULES = f"{DOMAIN}_door_schedules_update"
 
 # Helper to accept single device or list of devices
 DEVICE_ID_SCHEMA = vol.Any(cv.string, vol.All(cv.ensure_list, [cv.string]))
@@ -1856,6 +1859,10 @@ async def async_setup_services(hass: HomeAssistant) -> None:
                         "%s: Update Panels after set_door_schedule_mode failed: %s",
                         entry_id, e,
                     )
+
+            # Nudge the Hub "Door Schedules" sensor to refresh now so it
+            # reflects the new mode/assignment without waiting for its poll.
+            async_dispatcher_send(hass, f"{DISPATCH_DOOR_SCHEDULES}_{entry_id}")
 
         if unmanaged:
             results.append({"unmanaged_door_ids": unmanaged})
