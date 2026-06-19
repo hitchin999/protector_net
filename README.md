@@ -20,6 +20,45 @@ This release routes every Update Panels through a **per-entry debouncer**. Rapid
 
 This only affects the schedule path (`set_door_schedule_mode`). `override_door` / `resume_door` send direct panel commands and were never subject to this race, so **no automation changes are needed** — just update the integration. The quiet window defaults to 2.5 s (`UPDATE_PANELS_DEBOUNCE_SECONDS` in `const.py`); a couple of seconds of latency on a scheduled push is invisible in practice.
 
+### New: Door Schedules sensor (see every door's current schedule at a glance)
+
+A new `sensor.door_schedules_<partition>` on the Hub device shows, **per door, which Door Time Zone (schedule) it is currently assigned to on the server** — so you no longer have to log into Hartmann and open each door to check whether it's on its HA-managed schedule or something else.
+
+State is the number of doors currently on an HA-managed schedule; the `doors` attribute lists every door with its current schedule and a lifecycle status:
+
+```yaml
+state: 3
+attributes:
+  doors:
+    - door_id: 5
+      name: Front Door
+      schedule: "HA[abc1234] Front Door"   # the Door Time Zone the door points at right now
+      ha_managed: true
+      status: Active                         # door is on its HA-managed schedule
+      mode: CardOrPin
+    - door_id: 6
+      name: Basement Entrance
+      schedule: "Always Unlock"
+      ha_managed: false
+      status: Drifted                        # HA thinks it's active, but it isn't on the HA schedule
+      mode: Unlock
+  ha_managed_count: 3
+  staged_count: 1
+  drifted_count: 1
+  unmanaged_count: 2
+  total_count: 7
+  last_updated: "2026-06-19T13:23:58"
+```
+
+The four statuses:
+
+- **Active** — door is on its HA-managed schedule, as intended.
+- **Staged** — an HA schedule is provisioned for the door, but it hasn't been activated onto it yet (still on its original schedule).
+- **Drifted** — `managed_doors` says the door should be active, but on the server its assigned Door Time Zone is **not** the HA one (e.g. someone repointed it in Hartmann directly, or an activation didn't take). Worth investigating.
+- **Unmanaged** — HA isn't managing this door's schedule at all.
+
+This reads each door's assignment from the **server** (its `DoorTimeZoneId` resolved against the partition's Door Time Zone list) — the same thing you'd see in Hartmann's door config. Note it reflects the **server's configured schedule, not what the panel hardware is currently enforcing**: if an Update Panels push were ever lost, the server (and this sensor) would still show the intended schedule. To confirm a panel actually applied a mode, compare with the per-door **Reader Mode** sensor (live from the panel). Refreshes every 5 minutes and immediately after a `set_door_schedule_mode` call.
+
 ---
 
 ## What's new in 0.2.5
@@ -335,6 +374,8 @@ Revisit any time: **Settings → Devices & Services → Protector.Net → Option
   **State:** `running / connecting / idle / stopped / error`
   **Attributes:** `phase`, `connected`, `mapped_doors`, `partition_id`, `system_type` *(“Odyssey” or “ProtectorNET”)* 
 * **Update Panels** *(button)* — push configuration to all connected panels immediately
+* **Panels Online – <Partition>** *(sensor)* — count of panels currently online; attributes break down online/offline panels (name, MAC, model, IP). Polled every 60s.
+* **Door Schedules – <Partition>** *(sensor)* — per-door current Door Time Zone (schedule) assignment **as configured on the server**, with `ha_managed` and a lifecycle `status` (Active / Staged / Drifted / Unmanaged) for each door. Lets you see which doors are on their HA-managed schedule without opening each door in Hartmann. Refreshed every 5 min and immediately after `set_door_schedule_mode`.
 
 ### 2) Door devices (one per door)
 
@@ -543,6 +584,7 @@ Lock/Unlock **status** messages don’t flip the “by” state (that’s what *
 
 ### 0.2.6
 * Fix: **Update Panels race on rapid schedule changes** — back-to-back `set_door_schedule_mode` calls (e.g. a batch lock followed immediately by a second call for one more door) each fired their own `PanelCommands/UpdateAll`; the second could be dropped while the panel was still applying the first, leaving that door's new schedule on the server but never pushed to hardware — with no HA error and no panel log. Pushes now route through a per-entry **debouncer** that coalesces a burst into a single Update Panels fired after all Door Time Zone writes commit, plus a short retry for a transient panel-offline. `override_door` / `resume_door` are unaffected (they use direct panel commands); no automation changes needed.
+* New: **Door Schedules sensor** — `sensor.door_schedules_<partition>` on the Hub device lists each door's current Door Time Zone (schedule) assignment from the server and whether it's the HA-managed one (status: Active / Staged / Drifted / Unmanaged), so you don't have to open each door in Hartmann to check. Reflects the server's configured schedule (not panel-enforced state); refreshes every 5 min and immediately after `set_door_schedule_mode`.
 
 ### 0.2.5
 * New: **HA-managed door schedules** — opt-in per door under **Options → Door Time Zones**. Creates a dedicated Door Time Zone in Hartmann and (optionally) repoints the door to it, so schedule changes survive panel reboots. Rolls back cleanly on untick or integration removal.
