@@ -18,8 +18,8 @@ from homeassistant.helpers.typing import StateType
 from homeassistant.helpers.restore_state import RestoreEntity
 from homeassistant.util import dt as dt_util
 
-from .const import DOMAIN
-from .services import DISPATCH_TEMP_CODE, DISPATCH_OTR
+from .const import DOMAIN, KEY_MANAGED_DOORS
+from .services import DISPATCH_TEMP_CODE, DISPATCH_OTR, DISPATCH_DOOR_SCHEDULES
 
 _LOGGER = logging.getLogger(f"{DOMAIN}.sensor")
 
@@ -189,12 +189,13 @@ async def async_setup_entry(
     base_url: str = cfg["base_url"]
     host = base_url.split("://", 1)[1]
 
-    # Create hub status + panels-online sensors immediately so platform
-    # returns quickly. Both attach to the same hub device.
+    # Create hub status + panels-online + door-schedules sensors immediately
+    # so platform returns quickly. All attach to the same hub device.
     hub_ent = ProtectorHubSensor(hass, entry.entry_id, base_url)
     panels_ent = ProtectorPanelsOnlineSensor(hass, entry.entry_id, base_url)
+    schedules_ent = ProtectorDoorSchedulesSensor(hass, entry.entry_id, base_url)
 
-    async_add_entities([hub_ent, panels_ent])
+    async_add_entities([hub_ent, panels_ent, schedules_ent])
 
     # Defer door discovery to a background task (don’t block startup)
     async def _add_doors_later() -> None:
@@ -551,6 +552,268 @@ class ProtectorPanelsOnlineSensor(SensorEntity, RestoreEntity):
         self._last_updated = datetime.now().isoformat(timespec="seconds")
 
         self.async_write_ha_state()
+
+
+# ------------------------
+# Door Schedules sensor — shows, per door, which DoorTimeZone (schedule) it is
+# currently assigned to on the server and whether that's the HA-managed one.
+# Saves logging into Hartmann to check each door individually. Attached to the
+# hub device so it sits next to "Hub Status".
+# ------------------------
+
+DOOR_SCHEDULES_UPDATE_INTERVAL = timedelta(minutes=5)
+
+
+class ProtectorDoorSchedulesSensor(SensorEntity, RestoreEntity):
+    """Per-door current-schedule (DoorTimeZone) overview for a partition.
+
+    State:       integer count of doors currently on an HA-managed schedule.
+    Attributes:  doors (list of {door_id, name, schedule, ha_managed, status,
+                 mode}), ha_managed_count, staged_count, drifted_count,
+                 unmanaged_count, total_count, last_updated.
+
+    Ground truth comes from the live server — each door's DoorTimeZoneId
+    (api.get_all_doors) resolved against the partition's DoorTimeZone list
+    (api.list_door_time_zones). The integration's own managed_doors record
+    adds lifecycle context:
+      * Active    — door is on its HA-managed schedule (as intended).
+      * Staged    — HA schedule provisioned, door not yet activated onto it.
+      * Drifted   — managed_doors says active, but the door is NOT currently
+                    on the HA schedule (e.g. changed in Hartmann directly) —
+                    a red flag worth surfacing.
+      * Unmanaged — HA isn't managing this door's schedule at all.
+    """
+
+    _attr_should_poll = False
+    _attr_icon = "mdi:calendar-clock"
+
+    def __init__(self, hass: HomeAssistant, entry_id: str, base_url: str) -> None:
+        self.hass = hass
+        self._entry_id = entry_id
+        self._base_url = base_url
+
+        entry_data = hass.data[DOMAIN].get(entry_id, {})
+        entry_obj = hass.config_entries.async_get_entry(entry_id)
+        partition_name = (
+            entry_data.get("partition_name")
+            or (entry_obj.title.split("–", 1)[1].strip()
+                if entry_obj and "–" in entry_obj.title
+                else str(entry_data.get("partition_id", "Unknown")))
+        )
+        self._partition_name = partition_name
+
+        host = base_url.split("://", 1)[1]
+        self._attr_name = f"Door Schedules – {partition_name}"
+        self._attr_unique_id = f"{DOMAIN}_{host}_door_schedules|{entry_id}"
+        self._attr_native_unit_of_measurement = "doors"
+
+        self._attr_native_value: StateType = None
+        self._doors: list[dict[str, Any]] = []
+        self._ha_managed_count = 0
+        self._staged_count = 0
+        self._drifted_count = 0
+        self._unmanaged_count = 0
+        self._total = 0
+        self._last_updated: Optional[str] = None
+        self._unsub_timer: Optional[Callable[[], None]] = None
+        self._unsub_signal: Optional[Callable[[], None]] = None
+
+    @property
+    def device_info(self):
+        return {
+            "identifiers": {(DOMAIN, f"hub:{self._base_url.split('://',1)[1]}|{self._entry_id}")},
+            "manufacturer": "Yoel Goldstein/Vaayer LLC",
+            "model": "Protector.Net Hub",
+            "name": f"Hub Status – {self._partition_name}",
+            "configuration_url": self._base_url,
+        }
+
+    @property
+    def extra_state_attributes(self) -> Dict[str, Any]:
+        return {
+            "doors":            self._doors,
+            "ha_managed_count": self._ha_managed_count,
+            "staged_count":     self._staged_count,
+            "drifted_count":    self._drifted_count,
+            "unmanaged_count":  self._unmanaged_count,
+            "total_count":      self._total,
+            "last_updated":     self._last_updated,
+        }
+
+    async def async_added_to_hass(self) -> None:
+        await super().async_added_to_hass()
+
+        # Restore last values so the card doesn't flash "unknown" pre-poll.
+        last = await self.async_get_last_state()
+        if last and last.state not in (STATE_UNKNOWN, STATE_UNAVAILABLE, None, ""):
+            try:
+                self._attr_native_value = int(last.state)
+            except (ValueError, TypeError):
+                pass
+        if last:
+            la = last.attributes or {}
+            self._doors = la.get("doors", []) or []
+            self._ha_managed_count = int(la.get("ha_managed_count", 0) or 0)
+            self._staged_count = int(la.get("staged_count", 0) or 0)
+            self._drifted_count = int(la.get("drifted_count", 0) or 0)
+            self._unmanaged_count = int(la.get("unmanaged_count", 0) or 0)
+            self._total = int(la.get("total_count", 0) or 0)
+            self._last_updated = la.get("last_updated")
+
+        await self._async_refresh()
+
+        from homeassistant.helpers.event import async_track_time_interval
+
+        async def _scheduled(_now):
+            await self._async_refresh()
+
+        self._unsub_timer = async_track_time_interval(
+            self.hass, _scheduled, DOOR_SCHEDULES_UPDATE_INTERVAL,
+        )
+
+        # Refresh immediately after a set_door_schedule_mode call so the view
+        # reflects the new mode/assignment without waiting for the poll.
+        @callback
+        def _on_signal(_data=None):
+            self.hass.async_create_task(self._async_refresh())
+
+        self._unsub_signal = async_dispatcher_connect(
+            self.hass, f"{DISPATCH_DOOR_SCHEDULES}_{self._entry_id}", _on_signal,
+        )
+
+    async def async_will_remove_from_hass(self) -> None:
+        if self._unsub_timer:
+            self._unsub_timer()
+            self._unsub_timer = None
+        if self._unsub_signal:
+            self._unsub_signal()
+            self._unsub_signal = None
+
+    async def async_update(self) -> None:
+        await self._async_refresh()
+
+    @staticmethod
+    def _tz_mode_summary(tz: Optional[dict]) -> Optional[str]:
+        """Best-effort single mode for a DoorTimeZone from its TimeSpans.
+
+        Read TimeSpans expose the mode as `TimeSpanState`; request-shaped data
+        uses `Mode`. Returns the mode if every span shares one, "mixed" if they
+        differ, or None if the list response doesn't carry spans.
+        """
+        if not tz:
+            return None
+        modes = set()
+        for s in (tz.get("TimeSpans") or []):
+            m = s.get("TimeSpanState") or s.get("Mode")
+            if m:
+                modes.add(str(m))
+        if not modes:
+            return None
+        return next(iter(modes)) if len(modes) == 1 else "mixed"
+
+    async def _async_refresh(self) -> None:
+        from . import api
+        from datetime import datetime
+
+        try:
+            doors = await api.get_all_doors(self.hass, self._entry_id)
+            tzs = await api.list_door_time_zones(self.hass, self._entry_id)
+        except Exception as e:
+            _LOGGER.debug("[%s] door-schedules refresh failed: %s", self._entry_id, e)
+            return
+
+        tz_by_id: dict[int, dict] = {}
+        for tz in tzs or []:
+            try:
+                tz_by_id[int(tz.get("Id"))] = tz
+            except (TypeError, ValueError):
+                continue
+
+        entry_obj = self.hass.config_entries.async_get_entry(self._entry_id)
+        managed: dict[str, dict] = {}
+        if entry_obj:
+            raw = entry_obj.options.get(KEY_MANAGED_DOORS) or {}
+            managed = {str(k): (v or {}) for k, v in raw.items()}
+
+        ha_tag = f"protector_net:{self._entry_id}:"
+
+        rows: list[dict[str, Any]] = []
+        ha_managed_count = staged_count = drifted_count = unmanaged_count = 0
+
+        for d in doors or []:
+            try:
+                did = int(d.get("Id"))
+            except (TypeError, ValueError):
+                continue
+            name = d.get("Name") or f"Door {did}"
+
+            tz_id = d.get("DoorTimeZoneId")
+            try:
+                tz_id = int(tz_id) if tz_id is not None else None
+            except (TypeError, ValueError):
+                tz_id = None
+
+            tz = tz_by_id.get(tz_id) if tz_id is not None else None
+            if tz:
+                schedule = tz.get("Name") or f"DoorTimeZone {tz_id}"
+                desc = str(tz.get("Description") or "")
+            else:
+                schedule = f"(unknown schedule {tz_id})" if tz_id is not None else "(none)"
+                desc = ""
+
+            minfo = managed.get(str(did))
+            ha_tz_id = None
+            if minfo and minfo.get("ha_tz_id") is not None:
+                try:
+                    ha_tz_id = int(minfo.get("ha_tz_id"))
+                except (TypeError, ValueError):
+                    ha_tz_id = None
+
+            ha_managed = bool(
+                desc.startswith(ha_tag)
+                or schedule.startswith("HA[")
+                or (ha_tz_id is not None and tz_id == ha_tz_id)
+            )
+
+            if not minfo:
+                status = "Unmanaged"
+                unmanaged_count += 1
+            elif ha_managed:
+                status = "Active"
+                ha_managed_count += 1
+            elif minfo.get("active"):
+                status = "Drifted"          # HA thinks active, but door isn't on the HA schedule
+                drifted_count += 1
+            else:
+                status = "Staged"           # provisioned, not yet activated
+                staged_count += 1
+
+            if ha_managed and minfo and minfo.get("current_mode"):
+                mode = minfo.get("current_mode")
+            else:
+                mode = self._tz_mode_summary(tz)
+
+            rows.append({
+                "door_id":    did,
+                "name":       name,
+                "schedule":   schedule,
+                "ha_managed": ha_managed,
+                "status":     status,
+                "mode":       mode,
+            })
+
+        rows.sort(key=lambda r: str(r["name"]).lower())
+        self._doors = rows
+        self._ha_managed_count = ha_managed_count
+        self._staged_count = staged_count
+        self._drifted_count = drifted_count
+        self._unmanaged_count = unmanaged_count
+        self._total = len(rows)
+        self._attr_native_value = ha_managed_count
+        self._last_updated = datetime.now().isoformat(timespec="seconds")
+
+        self.async_write_ha_state()
+
 
 OTR_UPDATE_INTERVAL = timedelta(minutes=5)
 
