@@ -20,6 +20,7 @@ from homeassistant.util import dt as dt_util
 
 from .const import DOMAIN, KEY_MANAGED_DOORS
 from .services import DISPATCH_TEMP_CODE, DISPATCH_OTR, DISPATCH_DOOR_SCHEDULES
+from .discovery import async_on_hub_connected
 
 _LOGGER = logging.getLogger(f"{DOMAIN}.sensor")
 
@@ -197,8 +198,14 @@ async def async_setup_entry(
 
     async_add_entities([hub_ent, panels_ent, schedules_ent])
 
+    # Track which door IDs we've already created sensors for, so a
+    # reconnect-triggered backfill (SIGNAL_HUB_CONNECTED) only adds doors that
+    # are missing. This is what lets the door sensors self-heal after a
+    # setup-time Hartmann outage instead of staying "unavailable".
+    added_door_ids: set[int] = set()
+
     # Defer door discovery to a background task (don’t block startup)
-    async def _add_doors_later() -> None:
+    async def _add_doors_later(*_args) -> None:
         from . import api
         try:
             # Give the server a moment to warm after HA boot, and bound the call.
@@ -269,8 +276,16 @@ async def async_setup_entry(
             _LOGGER.warning("[%s] No doors matched filters; only Hub Status sensor will exist", entry.entry_id)
             return
 
+        # Only create sensors for doors we haven't already added — a
+        # reconnect-triggered backfill re-runs this whole function. The
+        # check → reserve → add sequence below is await-free, so two
+        # concurrent passes (initial task + a reconnect) can't double-add.
+        new_doors = [t for t in doors if t[0] not in added_door_ids]
+        if not new_doors:
+            return
+
         entities: List[SensorEntity] = []
-        for did, dname, _status_id, _site_name in doors:
+        for did, dname, _status_id, _site_name in new_doors:
             entities.append(ProtectorDoorSensor(hass, entry.entry_id, base_url, did, dname, LOCK_STATE_DESC))
             entities.append(ProtectorDoorSensor(hass, entry.entry_id, base_url, did, dname, OVERRIDDEN_DESC))
             entities.append(ProtectorDoorSensor(hass, entry.entry_id, base_url, did, dname, READER_MODE_DESC))
@@ -278,10 +293,19 @@ async def async_setup_entry(
             entities.append(ProtectorDoorTempCodeSensor(hass, entry.entry_id, base_url, did, dname, TEMP_CODE_DESC))
             entities.append(ProtectorDoorOTRSensor(hass, entry.entry_id, base_url, did, dname, OTR_SCHEDULES_DESC))
 
+        added_door_ids.update(t[0] for t in new_doors)
         async_add_entities(entities)
-        _LOGGER.debug("[%s] Added %d door sensors", entry.entry_id, len(entities))
+        _LOGGER.debug(
+            "[%s] Added %d door sensors (%d door(s))",
+            entry.entry_id, len(entities), len(new_doors),
+        )
 
     hass.async_create_task(_add_doors_later())
+
+    # Self-heal: re-run door discovery whenever the WS (re)connects, so door
+    # sensors that couldn't be created because Hartmann was unreachable at
+    # setup time get added once the server is back — no manual reload needed.
+    async_on_hub_connected(hass, entry, _add_doors_later)
 
 
 # ------------------------
