@@ -262,3 +262,12 @@ UPDATE_PANELS_DEBOUNCE_SECONDS = 2.5
 # coalesced single push against being the one that happens to fail.
 UPDATE_PANELS_PUSH_ATTEMPTS = 3
 
+
+# Dispatcher signal fired by ws.py after every successful SignalR (re)connect
+# to Hartmann (i.e. the moment the socket reaches the "running" phase, which
+# guarantees the server is reachable again). Door platforms listen on
+# f"{SIGNAL_HUB_CONNECTED}_{entry_id}" to backfill any door entities that
+# couldn't be created because Hartmann was unreachable at setup time — this
+# is what makes the integration self-heal after a server outage instead of
+# leaving every door entity stuck "unavailable" until a manual reload.
+SIGNAL_HUB_CONNECTED = f"{DOMAIN}_hub_connected"
