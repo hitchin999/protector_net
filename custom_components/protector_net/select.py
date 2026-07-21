@@ -26,6 +26,7 @@ from .const import (
     TZ_INDEX_TO_FRIENDLY,
 )
 from .device import ProtectorNetDevice
+from .discovery import async_setup_door_platform_backfill
 from . import api
 
 _LOGGER = logging.getLogger(__name__)
@@ -42,20 +43,36 @@ async def async_setup_entry(
     hass.data[DOMAIN].setdefault(entry.entry_id, {})
     hass.data[DOMAIN][entry.entry_id].setdefault(UI_STATE, {})
 
+    added_door_ids: set[int] = set()
+
+    @callback
+    def _add_doors(door_list: List[dict]) -> None:
+        entities: List[SelectEntity] = []
+        for door in door_list:
+            entities.append(OverrideTypeSelect(hass, entry, door))
+            entities.append(OverrideModeSelect(hass, entry, door))
+        added_door_ids.update(int(d["Id"]) for d in door_list if "Id" in d)
+        if entities:
+            async_add_entities(entities, update_before_add=True)
+            _LOGGER.debug("[%s] Added %d select entities", entry.entry_id, len(entities))
+
     try:
         doors = await asyncio.wait_for(api.get_all_doors(hass, entry.entry_id), timeout=30)
     except Exception as e:
         _LOGGER.error("[%s] Failed to fetch doors for selects: %s", entry.entry_id, e)
         doors = []
 
-    entities: List[SelectEntity] = []
-    for door in doors or []:
-        entities.append(OverrideTypeSelect(hass, entry, door))
-        entities.append(OverrideModeSelect(hass, entry, door))
+    _add_doors([d for d in (doors or []) if "Id" in d])
 
-    if entities:
-        async_add_entities(entities, update_before_add=True)
-        _LOGGER.debug("[%s] Added %d select entities", entry.entry_id, len(entities))
+    # Self-heal: if Hartmann was unreachable above (doors == []), re-add the
+    # select entities once the WS reconnects instead of leaving them
+    # "unavailable" until a manual reload.
+    async_setup_door_platform_backfill(
+        hass, entry,
+        added_door_ids=added_door_ids,
+        add_doors=_add_doors,
+        label="select",
+    )
 
 
 class _DoorEntityBase(ProtectorNetDevice):
