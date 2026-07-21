@@ -11,7 +11,7 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.const import EVENT_HOMEASSISTANT_STARTED
 from homeassistant.helpers.event import async_track_time_interval
-from homeassistant.helpers.dispatcher import async_dispatcher_send
+from homeassistant.helpers.dispatcher import async_dispatcher_send, async_dispatcher_connect
 from homeassistant.helpers.typing import ConfigType
 from homeassistant.helpers.debounce import Debouncer
 
@@ -21,6 +21,7 @@ from .const import (
     KEY_DOOR_CONTACT_STATE_CACHE, KEY_DOOR_HELD_OPEN_THRESHOLDS,
     KEY_UPDATE_PANELS_DEBOUNCER, UPDATE_PANELS_DEBOUNCE_SECONDS,
     UPDATE_PANELS_PUSH_ATTEMPTS,
+    SIGNAL_HUB_CONNECTED,
 )
 from .ws import SignalRClient
 from . import api
@@ -36,6 +37,36 @@ NAME_SYNC_INTERVAL = timedelta(hours=1)
 # Platforms we expose
 # (Old per-action buttons are going away except Pulse Unlock; new controls live in select/number/switch.)
 PLATFORMS: list[str] = ["button", "sensor", "binary_sensor", "select", "number", "switch", "datetime"]
+
+
+@callback
+def _redispatch_cached_door_status(hass: HomeAssistant, entry_id: str) -> None:
+    """Replay the last-seen door status for every cached door.
+
+    ws.py caches every door frame in KEY_LAST_DOOR_STATUS as it arrives. This
+    replays that cache onto the door-event dispatcher so entities that
+    subscribed *after* the WS delivered its state burst — the post-setup case,
+    and now also entities added by a reconnect-triggered self-heal backfill —
+    are seeded with current state instead of sitting at Unknown until the next
+    physical door transition. Reads-only and best-effort.
+    """
+    try:
+        cache = (hass.data.get(DOMAIN, {})
+                 .get(entry_id, {})
+                 .get(KEY_LAST_DOOR_STATUS) or {})
+        if not cache:
+            return
+        _LOGGER.debug(
+            "[%s] Re-dispatching cached state for %d door(s)", entry_id, len(cache),
+        )
+        for door_id, status in cache.items():
+            async_dispatcher_send(
+                hass,
+                f"{DOMAIN}_door_event_{entry_id}",
+                {"door_id": int(door_id), "status": dict(status)},
+            )
+    except Exception as e:
+        _LOGGER.debug("[%s] cached door-status re-dispatch skipped: %s", entry_id, e)
 
 
 async def _sync_partition_title_only(hass: HomeAssistant, entry: ConfigEntry) -> None:
@@ -397,6 +428,21 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         hub.async_start()
         _LOGGER.debug("[%s] Hub started for %s", entry.entry_id, host)
 
+        # Self-heal seeding: whenever the WS (re)connects, the door platforms
+        # backfill any entities that couldn't be created during a setup-time
+        # outage (they listen for the same signal). Give those a moment to be
+        # added and subscribe, then replay cached door status so the freshly
+        # added entities don't sit at Unknown.
+        async def _reseed_on_reconnect(*_args) -> None:
+            await asyncio.sleep(2)
+            _redispatch_cached_door_status(hass, entry.entry_id)
+
+        entry.async_on_unload(
+            async_dispatcher_connect(
+                hass, f"{SIGNAL_HUB_CONNECTED}_{entry.entry_id}", _reseed_on_reconnect,
+            )
+        )
+
         # Fast partition-title sync only (one API call). The hub device's
         # display name is read from entry.title at platform-setup time, so
         # this needs to happen before forward_entry_setups. Heavier work
@@ -428,26 +474,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
             # Re-dispatch cached states. Reads-only — safe to run even if
             # the WS hasn't connected yet (cache will be empty, no-op).
-            try:
-                cache = (hass.data.get(DOMAIN, {})
-                         .get(entry.entry_id, {})
-                         .get(KEY_LAST_DOOR_STATUS) or {})
-                if cache:
-                    _LOGGER.debug(
-                        "[%s] Re-dispatching cached state for %d door(s) post-setup",
-                        entry.entry_id, len(cache),
-                    )
-                    for door_id, status in cache.items():
-                        async_dispatcher_send(
-                            hass,
-                            f"{DOMAIN}_door_event_{entry.entry_id}",
-                            {"door_id": int(door_id), "status": dict(status)},
-                        )
-            except Exception as e:
-                _LOGGER.debug(
-                    "[%s] post-setup state re-dispatch skipped: %s",
-                    entry.entry_id, e,
-                )
+            _redispatch_cached_door_status(hass, entry.entry_id)
 
             # Now do the actual heavy work: name sync + contact map build.
             await _sync_names_from_hartmann(hass, entry, allow_state_changes=False)
