@@ -80,6 +80,7 @@ from .const import (
     KEY_INPUT_STATE_CACHE,
 )
 from .ws import DISPATCH_DOOR_CONTACT
+from .discovery import async_setup_door_platform_backfill
 
 _LOGGER = logging.getLogger(f"{DOMAIN}.binary_sensor")
 
@@ -119,6 +120,29 @@ async def async_setup_entry(
     cfg = hass.data[DOMAIN][entry.entry_id]
     base_url: str = cfg["base_url"]
 
+    added_door_ids: set[int] = set()
+
+    @callback
+    def _add_doors(door_list: list[dict]) -> None:
+        entities = [
+            ProtectorDoorContactSensor(
+                hass,
+                entry.entry_id,
+                base_url,
+                int(d["Id"]),
+                str(d.get("Name") or f"Door {d['Id']}"),
+            )
+            for d in door_list
+            if "Id" in d
+        ]
+        added_door_ids.update(int(d["Id"]) for d in door_list if "Id" in d)
+        if entities:
+            async_add_entities(entities)
+            _LOGGER.debug(
+                "[%s] Added %d door-contact binary_sensor(s)",
+                entry.entry_id, len(entities),
+            )
+
     try:
         doors = await api.get_all_doors(hass, entry.entry_id)
     except Exception as e:
@@ -126,29 +150,24 @@ async def async_setup_entry(
             "[%s] Failed to fetch doors for door-contact binary_sensors: %s",
             entry.entry_id, e,
         )
-        return
+        doors = []
 
     if not doors:
-        _LOGGER.debug("[%s] No doors found; skipping door-contact binary_sensors", entry.entry_id)
-        return
-
-    entities = [
-        ProtectorDoorContactSensor(
-            hass,
-            entry.entry_id,
-            base_url,
-            int(d["Id"]),
-            str(d.get("Name") or f"Door {d['Id']}"),
-        )
-        for d in doors
-        if "Id" in d
-    ]
-    if entities:
-        async_add_entities(entities)
         _LOGGER.debug(
-            "[%s] Added %d door-contact binary_sensor(s)",
-            entry.entry_id, len(entities),
+            "[%s] No doors yet for door-contact binary_sensors; will backfill "
+            "on hub reconnect", entry.entry_id,
         )
+
+    _add_doors([d for d in (doors or []) if "Id" in d])
+
+    # Self-heal: re-add the contact sensors once the WS reconnects if Hartmann
+    # was unreachable above, instead of leaving them "unavailable".
+    async_setup_door_platform_backfill(
+        hass, entry,
+        added_door_ids=added_door_ids,
+        add_doors=_add_doors,
+        label="binary_sensor",
+    )
 
 
 class ProtectorDoorContactSensor(BinarySensorEntity, RestoreEntity):
