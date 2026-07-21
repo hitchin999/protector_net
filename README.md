@@ -10,6 +10,24 @@ This custom integration controls **Hartmann Controls Protector.Net _and_ Odyssey
 
 ---
 
+## What's new in 0.2.7
+
+### Fix: door entities now recover on their own after a server outage (no more manual reload)
+
+If the integration happened to **(re)start while Hartmann was unreachable** — an HA restart, or an integration reload, that coincided with a server reboot (e.g. the nightly panel bounce) or a brief network drop — the door-enumeration call at setup would fail and the door platforms would come up with **zero door entities**. The integration still finished loading "successfully", so the existing door entities went **unavailable** with nothing backing them, and nothing retried creating them.
+
+The SignalR websocket itself reconnected fine once the server came back — but a reconnect only refreshes entities that **already exist**; it can't recreate missing ones. So the doors stayed unavailable, and **any automation keyed on them silently stopped**, until you manually reloaded the integration.
+
+This release treats a successful SignalR **(re)connect as a recovery signal**. The moment the websocket comes back up, every door platform re-checks for doors it's missing and **backfills** any that couldn't be created earlier, then re-seeds their state from cache so they don't sit at *Unknown*. Once Hartmann is reachable again the websocket reconnects on its own (as it already did) — and now your door entities come back with it, **automatically**.
+
+It covers every per-door entity: the override controls (Override Type / Override Mode selects, Override Minutes, Override Until), **Pulse Unlock** and any optional legacy buttons, the Lock State / Overridden / Reader Mode / Last Door Log / Temp Code / OTR sensors, the door-contact binary sensors, and the partition-wide **All Doors Lockdown** switch.
+
+On a healthy startup this does nothing — every door already exists, so the re-check is a no-op — and it adds **no extra load while Hartmann is down**, because it only fires on a *successful* reconnect. As a bonus, doors added in Hartmann during an outage are picked up on the next reconnect too. **No configuration or automation changes needed — just update.**
+
+> This complements the earlier websocket work in 0.2.4 (auto-reconnect / re-auth): that keeps the *connection* alive; 0.2.7 makes sure the door *entities* are rebuilt if they were lost to an outage during setup.
+
+---
+
 ## What's new in 0.2.6
 
 ### Fix: scheduled door locks occasionally not reaching the panel (Update Panels race)
@@ -328,6 +346,7 @@ Pick a target date & time for timed overrides instead of calculating minutes man
 * ✅ **HA Door Log** entries when you use HA buttons (e.g., “Home Assistant unlocked …”)
 * ✅ All controls & options in the UI (HACS-friendly)
 * ✅ **Odyssey servers supported** (auto-detect)
+* ✅ **Self-healing** — door entities auto-recover after a Hartmann outage (no manual reload)
   
 ---
 
@@ -554,6 +573,9 @@ Lock/Unlock **status** messages don’t flip the “by” state (that’s what *
 
 ## Troubleshooting
 
+* **Door entities stuck "unavailable" after a Hartmann outage (automations stopped), fixed only by reloading**
+  Update to **0.2.7**. If the integration (re)started while the server was down — e.g. an HA restart or reload during a Hartmann reboot — the door platforms came up empty and the door entities stayed unavailable even after the server returned, because a websocket reconnect can only refresh entities that already exist. The integration now rebuilds the missing door entities automatically on the next successful reconnect.
+
 * **A scheduled door didn't lock/unlock, but there's no error and nothing in the panel log**
   Update to **0.2.6**. When an automation changed several doors within a second or two (e.g. a batch `set_door_schedule_mode` immediately followed by another call for one more door), the second Update Panels push could be dropped while the panel was still applying the first — so that door's change reached the server but never the hardware. Pushes are now coalesced through a debouncer into a single Update Panels fired after all writes land.
 
@@ -581,6 +603,9 @@ Lock/Unlock **status** messages don’t flip the “by” state (that’s what *
 ---
 
 ## Changelog
+
+### 0.2.7
+* Fix: **Door entities auto-recover after a server outage** — if the integration (re)started while Hartmann was unreachable (an HA restart / reload coinciding with a server reboot or network drop), the setup-time door fetch failed and the door platforms came up with **no entities**, so the existing door entities went **unavailable** and nothing retried — they stayed stuck (and automations keyed on them stopped) until a manual reload. The integration now treats a successful SignalR reconnect as a recovery signal and **backfills** any missing door entities the moment the websocket comes back, then re-seeds their state. Covers every per-door entity (override selects / Override Minutes / Override Until, Pulse Unlock + legacy buttons, Lock State / Overridden / Reader Mode / Last Log / Temp Code / OTR sensors, door-contact binary sensors) and the All Doors Lockdown switch. No-op on a healthy start; no extra load during the outage; also picks up doors added in Hartmann during the outage. No config/automation changes needed. Complements the 0.2.4 websocket auto-reconnect (which keeps the connection alive — this rebuilds the entities).
 
 ### 0.2.6
 * Fix: **Update Panels race on rapid schedule changes** — back-to-back `set_door_schedule_mode` calls (e.g. a batch lock followed immediately by a second call for one more door) each fired their own `PanelCommands/UpdateAll`; the second could be dropped while the panel was still applying the first, leaving that door's new schedule on the server but never pushed to hardware — with no HA error and no panel log. Pushes now route through a per-entry **debouncer** that coalesces a burst into a single Update Panels fired after all Door Time Zone writes commit, plus a short retry for a transient panel-offline. `override_door` / `resume_door` are unaffected (they use direct panel commands); no automation changes needed.
