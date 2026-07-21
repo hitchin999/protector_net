@@ -14,6 +14,7 @@ import re
 from . import api
 from .const import DEFAULT_OVERRIDE_MINUTES, KEY_PLAN_IDS, DOMAIN
 from .device import ProtectorNetDevice
+from .discovery import async_on_hub_connected
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -131,98 +132,121 @@ async def async_setup_entry(
     
     host_safe = (urlparse(entry.data["base_url"]).hostname or "").replace(":", "_")
 
-    async def _setup_buttons_later() -> None:
-        # Gather remote data with timeouts
-        try:
-            await asyncio.sleep(0.5)
-            doors = await asyncio.wait_for(api.get_all_doors(hass, entry.entry_id), timeout=30)
-        except asyncio.TimeoutError:
-            _LOGGER.error("[%s] get_all_doors timed out; no door buttons will be created right now", entry.entry_id)
-            return
-        except Exception as e:
-            _LOGGER.error("[%s] Failed to fetch doors from Protector.Net: %s", entry.entry_id, e)
-            return
+    # Tracking state persists across passes so a reconnect-triggered backfill
+    # only adds what's missing. A lock serialises the initial task and any
+    # backfill pass so no entity is built twice across an await.
+    added_door_ids: set[int] = set()
+    added_plan_ids: set[int] = set()
+    hub_button_added = {"v": False}
+    setup_lock = asyncio.Lock()
 
-        # Provision HA log plan (best-effort)
-        try:
-            log_plan_id = await asyncio.wait_for(api.find_or_create_ha_log_plan(hass, entry.entry_id), timeout=30)
-            hass.data[DOMAIN][entry.entry_id]["ha_log_plan_id"] = log_plan_id
-            _LOGGER.debug("[%s] HA log plan id is %s", entry.entry_id, log_plan_id)
-        except Exception as e:
-            _LOGGER.error("[%s] Failed to create/find HA log plan: %s", entry.entry_id, e)
-            hass.data[DOMAIN][entry.entry_id]["ha_log_plan_id"] = None
-
-        # Default minutes (options override data; both fall back to const)
-        override_mins = entry.options.get(
-            "override_minutes",
-            entry.data.get("override_minutes", DEFAULT_OVERRIDE_MINUTES),
-        )
-
-        # Selected trigger plans to clone to system plans
-        raw_plan_ids = entry.options.get(KEY_PLAN_IDS, entry.data.get(KEY_PLAN_IDS, []))
-        plan_ids: list[int] = []
-        for pid in raw_plan_ids or []:
+    async def _setup_buttons_later(*_args) -> None:
+        async with setup_lock:
+            # Gather remote data with timeouts
             try:
-                plan_ids.append(int(pid))
-            except Exception:
-                continue
-
-        # Clone/resolve system plans
-        system_ids: list[int] = []
-        for trig_id in plan_ids:
-            try:
-                sys_id = await asyncio.wait_for(api.find_or_clone_system_plan(hass, entry.entry_id, trig_id), timeout=30)
-                system_ids.append(sys_id)
+                await asyncio.sleep(0.5)
+                doors = await asyncio.wait_for(api.get_all_doors(hass, entry.entry_id), timeout=30)
             except asyncio.TimeoutError:
-                _LOGGER.error("[%s] find_or_clone_system_plan(%s) timed out", entry.entry_id, trig_id)
+                _LOGGER.error("[%s] get_all_doors timed out; no door buttons will be created right now", entry.entry_id)
+                return
             except Exception as e:
-                _LOGGER.error("[%s] Error cloning trigger plan %s: %s", entry.entry_id, trig_id, e)
-        _LOGGER.debug("[%s] System plan ids=%s", entry.entry_id, system_ids)
+                _LOGGER.error("[%s] Failed to fetch doors from Protector.Net: %s", entry.entry_id, e)
+                return
 
-        # ---------- Only add selected legacy door buttons (Pulse Unlock always) ----------
-        selected = _selected_legacy(entry)
-
-        entities: list[ButtonEntity] = []
-
-        for door in doors:
-            if LEGACY_PULSE in selected:
-                entities.append(DoorPulseUnlockButton(hass, entry, door, host_safe))
-            if "_resume_schedule" in selected:
-                entities.append(DoorResumeScheduleButton(hass, entry, door, host_safe))
-            if "_unlock_until_resume" in selected:
-                entities.append(DoorOverrideUntilResumeButton(hass, entry, door, host_safe))
-            if "_override_card_or_pin" in selected:
-                entities.append(DoorOverrideUntilResumeCardOrPinButton(hass, entry, door, host_safe))
-            if "_unlock_until_next_schedule" in selected:
-                entities.append(DoorOverrideUntilNextScheduleButton(hass, entry, door, host_safe))
-            if "_timed_override_unlock" in selected:
-                entities.append(DoorTimedOverrideUnlockButton(hass, entry, door, host_safe, override_mins))
-
-        # ---------- Hub-level: Update Panels button ----------
-        entities.append(UpdatePanelsButton(hass, entry, host_safe))
-
-        # ---------- Action Plan buttons (System clones) ----------
-        if system_ids:
+            # Provision HA log plan (best-effort, idempotent server-side)
             try:
-                plans = await asyncio.wait_for(api.get_action_plans(hass, entry.entry_id), timeout=30)
-            except asyncio.TimeoutError:
-                _LOGGER.error("[%s] get_action_plans timed out; skipping action plan buttons", entry.entry_id)
-                plans = []
+                log_plan_id = await asyncio.wait_for(api.find_or_create_ha_log_plan(hass, entry.entry_id), timeout=30)
+                hass.data[DOMAIN][entry.entry_id]["ha_log_plan_id"] = log_plan_id
+                _LOGGER.debug("[%s] HA log plan id is %s", entry.entry_id, log_plan_id)
             except Exception as e:
-                _LOGGER.error("[%s] Failed to fetch action plans: %s", entry.entry_id, e)
-                plans = []
+                _LOGGER.error("[%s] Failed to create/find HA log plan: %s", entry.entry_id, e)
+                # Don't clobber a good id from a previous successful pass.
+                hass.data[DOMAIN][entry.entry_id].setdefault("ha_log_plan_id", None)
 
-            for plan in plans:
-                if plan.get("Id") in system_ids:
-                    entities.append(ActionPlanButton(hass, entry, plan, host_safe))
+            # Default minutes (options override data; both fall back to const)
+            override_mins = entry.options.get(
+                "override_minutes",
+                entry.data.get("override_minutes", DEFAULT_OVERRIDE_MINUTES),
+            )
 
-        if entities:
-            async_add_entities(entities)
-            _LOGGER.debug("[%s] Added %d button entities", entry.entry_id, len(entities))
-        else:
-            _LOGGER.debug("[%s] No button entities to add", entry.entry_id)
+            # Selected trigger plans to clone to system plans
+            raw_plan_ids = entry.options.get(KEY_PLAN_IDS, entry.data.get(KEY_PLAN_IDS, []))
+            plan_ids: list[int] = []
+            for pid in raw_plan_ids or []:
+                try:
+                    plan_ids.append(int(pid))
+                except Exception:
+                    continue
+
+            # Clone/resolve system plans
+            system_ids: list[int] = []
+            for trig_id in plan_ids:
+                try:
+                    sys_id = await asyncio.wait_for(api.find_or_clone_system_plan(hass, entry.entry_id, trig_id), timeout=30)
+                    system_ids.append(sys_id)
+                except asyncio.TimeoutError:
+                    _LOGGER.error("[%s] find_or_clone_system_plan(%s) timed out", entry.entry_id, trig_id)
+                except Exception as e:
+                    _LOGGER.error("[%s] Error cloning trigger plan %s: %s", entry.entry_id, trig_id, e)
+            _LOGGER.debug("[%s] System plan ids=%s", entry.entry_id, system_ids)
+
+            # ---------- Only add selected legacy door buttons (Pulse Unlock always) ----------
+            selected = _selected_legacy(entry)
+
+            entities: list[ButtonEntity] = []
+
+            # Only build buttons for doors we haven't already created (a
+            # reconnect-triggered backfill re-runs this whole function).
+            new_doors = [d for d in doors if "Id" in d and int(d["Id"]) not in added_door_ids]
+            for door in new_doors:
+                if LEGACY_PULSE in selected:
+                    entities.append(DoorPulseUnlockButton(hass, entry, door, host_safe))
+                if "_resume_schedule" in selected:
+                    entities.append(DoorResumeScheduleButton(hass, entry, door, host_safe))
+                if "_unlock_until_resume" in selected:
+                    entities.append(DoorOverrideUntilResumeButton(hass, entry, door, host_safe))
+                if "_override_card_or_pin" in selected:
+                    entities.append(DoorOverrideUntilResumeCardOrPinButton(hass, entry, door, host_safe))
+                if "_unlock_until_next_schedule" in selected:
+                    entities.append(DoorOverrideUntilNextScheduleButton(hass, entry, door, host_safe))
+                if "_timed_override_unlock" in selected:
+                    entities.append(DoorTimedOverrideUnlockButton(hass, entry, door, host_safe, override_mins))
+            added_door_ids.update(int(d["Id"]) for d in new_doors)
+
+            # ---------- Hub-level: Update Panels button (once) ----------
+            if not hub_button_added["v"]:
+                entities.append(UpdatePanelsButton(hass, entry, host_safe))
+                hub_button_added["v"] = True
+
+            # ---------- Action Plan buttons (System clones) ----------
+            if system_ids:
+                try:
+                    plans = await asyncio.wait_for(api.get_action_plans(hass, entry.entry_id), timeout=30)
+                except asyncio.TimeoutError:
+                    _LOGGER.error("[%s] get_action_plans timed out; skipping action plan buttons", entry.entry_id)
+                    plans = []
+                except Exception as e:
+                    _LOGGER.error("[%s] Failed to fetch action plans: %s", entry.entry_id, e)
+                    plans = []
+
+                for plan in plans:
+                    pid = plan.get("Id")
+                    if pid in system_ids and pid not in added_plan_ids:
+                        entities.append(ActionPlanButton(hass, entry, plan, host_safe))
+                        added_plan_ids.add(pid)
+
+            if entities:
+                async_add_entities(entities)
+                _LOGGER.debug("[%s] Added %d button entities", entry.entry_id, len(entities))
+            else:
+                _LOGGER.debug("[%s] No new button entities to add", entry.entry_id)
 
     hass.async_create_task(_setup_buttons_later())
+
+    # Self-heal: re-run button setup whenever the WS (re)connects, so buttons
+    # that couldn't be created because Hartmann was unreachable at setup time
+    # get added once the server is back — no manual reload needed.
+    async_on_hub_connected(hass, entry, _setup_buttons_later)
 
 
 # -----------------------
