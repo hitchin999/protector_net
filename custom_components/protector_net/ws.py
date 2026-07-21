@@ -24,10 +24,12 @@ try:
         KEY_LAST_DOOR_STATUS,
         KEY_DOOR_HELD_OPEN_THRESHOLDS,
         DEFAULT_HELD_OPEN_THRESHOLD_MS,
+        SIGNAL_HUB_CONNECTED,
     )
 except Exception:
     from .const import DOMAIN
     FRIENDLY_TO_TZ_INDEX = {}
+    SIGNAL_HUB_CONNECTED = f"{DOMAIN}_hub_connected"
     KEY_DOOR_CONTACT_MAP = "door_contact_map"
     KEY_INPUT_STATE_CACHE = "input_state_cache"
     KEY_DOOR_CONTACT_STATE_CACHE = "door_contact_state_cache"
@@ -843,6 +845,18 @@ class SignalRClient:
                             self._push_hub_state()
                             _LOGGER.debug("[%s] WS connected. Listening… (mapped_doors=%d)",
                                           self.entry_id, len(self._door_map))
+
+                            # We're live and Hartmann is reachable again.
+                            # Tell the door platforms so they can backfill any
+                            # entities that couldn't be created because the
+                            # server was down at setup time. On a healthy boot
+                            # this is a no-op (every door already exists); it
+                            # only does work after a setup-time outage, and is
+                            # what makes the doors recover on their own instead
+                            # of staying "unavailable" until a manual reload.
+                            async_dispatcher_send(
+                                self.hass, f"{SIGNAL_HUB_CONNECTED}_{self.entry_id}"
+                            )
 
                             # ---- Odyssey: immediate snapshot + periodic sync (gated) ----
                             if self._supports_status_snapshot:
