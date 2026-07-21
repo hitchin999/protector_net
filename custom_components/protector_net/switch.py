@@ -16,6 +16,7 @@ from homeassistant.helpers import entity_registry as er
 from homeassistant.util import dt as dt_util
 
 from .device import ProtectorNetDevice
+from .discovery import async_setup_door_platform_backfill
 from . import api
 from .const import (
     DOMAIN,
@@ -46,6 +47,26 @@ async def async_setup_entry(
     hass.data[DOMAIN].setdefault(entry.entry_id, {})
     hass.data[DOMAIN][entry.entry_id].setdefault(UI_STATE, {})
 
+    added_door_ids: set[int] = set()
+    lockdown_created = {"v": False}
+
+    @callback
+    def _add_doors(door_list: list[dict]) -> None:
+        entities: list[SwitchEntity] = [OverrideSwitch(hass, entry, d) for d in door_list]
+        # One "All Doors – Lockdown Mode" switch per entry, created the first
+        # time we actually have doors. It needs the door list to know which
+        # doors to command, so it must not be created against an empty list.
+        if door_list and not lockdown_created["v"]:
+            try:
+                entities.append(AllDoorsLockdownSwitch(hass, entry, door_list))
+                lockdown_created["v"] = True
+            except Exception as e:
+                _LOGGER.error("[%s] Failed to create All Doors Lockdown switch: %s", entry.entry_id, e)
+        added_door_ids.update(int(d["Id"]) for d in door_list if "Id" in d)
+        if entities:
+            async_add_entities(entities)
+            _LOGGER.debug("[%s] Added %d switches (incl. All Doors Lockdown)", entry.entry_id, len(entities))
+
     # ----- Per-door override switches -----
     try:
         await asyncio.sleep(0.4)
@@ -54,20 +75,17 @@ async def async_setup_entry(
         _LOGGER.error("[%s] Failed to fetch doors for override switches: %s", entry.entry_id, e)
         doors = []
 
-    entities: list[SwitchEntity] = [OverrideSwitch(hass, entry, d) for d in (doors or [])]
+    _add_doors([d for d in (doors or []) if "Id" in d])
 
-    # ----- One "All Doors – Lockdown Mode" switch per entry -----
-    if doors:
-        try:
-            entities.append(AllDoorsLockdownSwitch(hass, entry, doors))
-        except Exception as e:
-            _LOGGER.error("[%s] Failed to create All Doors Lockdown switch: %s", entry.entry_id, e)
-
-    if entities:
-        async_add_entities(entities)
-        _LOGGER.debug("[%s] Added %d switches (incl. All Doors Lockdown)", entry.entry_id, len(entities))
-    else:
-        _LOGGER.debug("[%s] No switches to add", entry.entry_id)
+    # Self-heal: if Hartmann was unreachable above, re-add the switches once
+    # the WS reconnects. This also finally creates the All Doors Lockdown
+    # switch, which otherwise never appears after a setup-time outage.
+    async_setup_door_platform_backfill(
+        hass, entry,
+        added_door_ids=added_door_ids,
+        add_doors=_add_doors,
+        label="switch",
+    )
 
 
 # =====================================================================
