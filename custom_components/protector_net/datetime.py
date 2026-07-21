@@ -16,12 +16,13 @@ from urllib.parse import urlparse
 
 from homeassistant.components.datetime import DateTimeEntity
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.util import dt as dt_util
 
 from .const import DOMAIN, UI_STATE
 from .device import ProtectorNetDevice
+from .discovery import async_setup_door_platform_backfill
 from . import api
 
 _LOGGER = logging.getLogger(__name__)
@@ -37,21 +38,34 @@ async def async_setup_entry(
     hass.data[DOMAIN].setdefault(entry.entry_id, {})
     hass.data[DOMAIN][entry.entry_id].setdefault(UI_STATE, {})
 
+    added_door_ids: set[int] = set()
+
+    @callback
+    def _add_doors(door_list: List[dict]) -> None:
+        entities: List[DateTimeEntity] = [
+            OverrideUntilDatetime(hass, entry, d) for d in door_list
+        ]
+        added_door_ids.update(int(d["Id"]) for d in door_list if "Id" in d)
+        if entities:
+            async_add_entities(entities)
+            _LOGGER.debug("[%s] Added %d datetime entities", entry.entry_id, len(entities))
+
     try:
         doors = await api.get_all_doors(hass, entry.entry_id)
     except Exception as e:
         _LOGGER.error("[%s] Failed to fetch doors for datetime entities: %s", entry.entry_id, e)
         doors = []
 
-    entities: List[DateTimeEntity] = []
-    for door in doors or []:
-        entities.append(OverrideUntilDatetime(hass, entry, door))
+    _add_doors([d for d in (doors or []) if "Id" in d])
 
-    if entities:
-        async_add_entities(entities)
-        _LOGGER.debug("[%s] Added %d datetime entities", entry.entry_id, len(entities))
-    else:
-        _LOGGER.debug("[%s] No datetime entities to add", entry.entry_id)
+    # Self-heal: re-add these once the WS reconnects if Hartmann was
+    # unreachable above, instead of leaving them "unavailable".
+    async_setup_door_platform_backfill(
+        hass, entry,
+        added_door_ids=added_door_ids,
+        add_doors=_add_doors,
+        label="datetime",
+    )
 
 
 class OverrideUntilDatetime(ProtectorNetDevice, DateTimeEntity):
