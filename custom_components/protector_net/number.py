@@ -6,7 +6,7 @@ from urllib.parse import urlparse
 
 from homeassistant.components.number import NumberEntity
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from .const import (
@@ -19,6 +19,7 @@ from .const import (
     OVERRIDE_MODE_LABEL_TO_TOKEN,
 )
 from .device import ProtectorNetDevice
+from .discovery import async_setup_door_platform_backfill
 from . import api
 
 _LOGGER = logging.getLogger(__name__)
@@ -35,21 +36,34 @@ async def async_setup_entry(
     hass.data[DOMAIN].setdefault(entry.entry_id, {})
     hass.data[DOMAIN][entry.entry_id].setdefault(UI_STATE, {})
 
+    added_door_ids: set[int] = set()
+
+    @callback
+    def _add_doors(door_list: List[dict]) -> None:
+        entities: List[NumberEntity] = [
+            OverrideMinutesNumber(hass, entry, d) for d in door_list
+        ]
+        added_door_ids.update(int(d["Id"]) for d in door_list if "Id" in d)
+        if entities:
+            async_add_entities(entities)
+            _LOGGER.debug("[%s] Added %d number entities", entry.entry_id, len(entities))
+
     try:
         doors = await api.get_all_doors(hass, entry.entry_id)
     except Exception as e:
         _LOGGER.error("[%s] Failed to fetch doors for numbers: %s", entry.entry_id, e)
         doors = []
 
-    entities: List[NumberEntity] = []
-    for door in doors:
-        entities.append(OverrideMinutesNumber(hass, entry, door))
+    _add_doors([d for d in (doors or []) if "Id" in d])
 
-    if entities:
-        async_add_entities(entities)
-        _LOGGER.debug("[%s] Added %d number entities", entry.entry_id, len(entities))
-    else:
-        _LOGGER.debug("[%s] No number entities to add", entry.entry_id)
+    # Self-heal: re-add these once the WS reconnects if Hartmann was
+    # unreachable above, instead of leaving them "unavailable".
+    async_setup_door_platform_backfill(
+        hass, entry,
+        added_door_ids=added_door_ids,
+        add_doors=_add_doors,
+        label="number",
+    )
 
 
 class OverrideMinutesNumber(ProtectorNetDevice, NumberEntity):
