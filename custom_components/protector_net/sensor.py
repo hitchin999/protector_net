@@ -19,6 +19,7 @@ from homeassistant.helpers.restore_state import RestoreEntity
 from homeassistant.util import dt as dt_util
 
 from .const import DOMAIN, KEY_MANAGED_DOORS
+from .compat import async_via_hub
 from .services import DISPATCH_TEMP_CODE, DISPATCH_OTR, DISPATCH_DOOR_SCHEDULES
 from .discovery import async_on_hub_connected
 
@@ -885,7 +886,7 @@ class ProtectorDoorOTRSensor(SensorEntity, RestoreEntity):
             "model": "Protector.Net Door",
             "name": self._door_name,
             "configuration_url": self._base_url,
-            "via_device": (DOMAIN, f"hub:{host}|{self._entry_id}"),
+            **async_via_hub(self.hass, self._entry_id),
         }
 
     @property
@@ -1058,7 +1059,7 @@ class ProtectorDoorSensor(SensorEntity, RestoreEntity):
             "model": "Protector.Net Door",
             "name": self._door_name,
             "configuration_url": self._base_url,
-            "via_device": (DOMAIN, f"hub:{host}|{self._entry_id}"),
+            **async_via_hub(self.hass, self._entry_id),
         }
 
     @property
@@ -1215,7 +1216,7 @@ class ProtectorDoorLastLogSensor(SensorEntity, RestoreEntity):
             "model": "Protector.Net Door",
             "name": self._door_name,
             "configuration_url": self._base_url,
-            "via_device": (DOMAIN, f"hub:{host}|{self._entry_id}"),
+            **async_via_hub(self.hass, self._entry_id),
         }
 
     @property
@@ -1417,7 +1418,7 @@ class ProtectorDoorTempCodeSensor(SensorEntity, RestoreEntity):
             "model": "Protector.Net Door",
             "name": self._door_name,
             "configuration_url": self._base_url,
-            "via_device": (DOMAIN, f"hub:{host}|{self._entry_id}"),
+            **async_via_hub(self.hass, self._entry_id),
         }
 
     @property
