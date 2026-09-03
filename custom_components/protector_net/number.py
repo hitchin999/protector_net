@@ -19,6 +19,7 @@ from .const import (
     OVERRIDE_MODE_LABEL_TO_TOKEN,
 )
 from .device import ProtectorNetDevice
+from .compat import async_via_hub
 from .discovery import async_setup_door_platform_backfill
 from . import api
 
@@ -115,7 +116,7 @@ class OverrideMinutesNumber(ProtectorNetDevice, NumberEntity):
             "name": self.door_name,
             "manufacturer": "Yoel Goldstein/Vaayer LLC",
             "model": "Protector.Net Door",
-            "via_device": (DOMAIN, self._hub_identifier),
+            **async_via_hub(self.hass, self._entry_id),
             "configuration_url": self._entry.data.get("base_url"),
         }
 
