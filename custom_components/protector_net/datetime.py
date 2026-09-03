@@ -21,6 +21,7 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.util import dt as dt_util
 
 from .const import DOMAIN, UI_STATE
+from .compat import async_via_hub
 from .device import ProtectorNetDevice
 from .discovery import async_setup_door_platform_backfill
 from . import api
@@ -111,7 +112,7 @@ class OverrideUntilDatetime(ProtectorNetDevice, DateTimeEntity):
             "name": self.door_name,
             "manufacturer": "Yoel Goldstein/Vaayer LLC",
             "model": "Protector.Net Door",
-            "via_device": (DOMAIN, self._hub_identifier),
+            **async_via_hub(self.hass, self._entry_id),
             "configuration_url": self._entry.data.get("base_url"),
         }
 
