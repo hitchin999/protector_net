@@ -4,6 +4,8 @@ import voluptuous as vol
 from urllib.parse import urlparse, urlsplit
 
 from homeassistant import config_entries
+from homeassistant.config_entries import ConfigEntry
+from homeassistant.core import callback
 from homeassistant.data_entry_flow import section
 from homeassistant.helpers import config_validation as cv
 
@@ -268,17 +270,25 @@ class ProtectorNetConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 else:
                     new_title = entry.title
 
-                return self.async_update_reload_and_abort(
+                # Update only — the entry's update listener owns the reload.
+                # HA 2026.12 stops reloading on our behalf when an update
+                # listener is registered (async_update_reload_and_abort warns
+                # about exactly that), and a double reload here would tear
+                # every entity down twice.
+                changed = self.hass.config_entries.async_update_entry(
                     entry,
                     unique_id=new_unique_id,
                     title=new_title,
-                    data_updates={
+                    data={
+                        **entry.data,
                         "base_url":       new_base_url,
                         "username":       new_username,
                         "password":       new_password,
                         "session_cookie": new_cookie,
                     },
                 )
+                self._ensure_reload(entry, changed)
+                return self.async_abort(reason="reconfigure_successful")
 
         return self.async_show_form(
             step_id="reconfigure",
@@ -297,6 +307,23 @@ class ProtectorNetConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     # (i.e. the stored credentials are actually rejected by the server,
     # not just a routine session-cookie expiry).
     # ------------------------------------------------------------------
+    @callback
+    def _ensure_reload(self, entry: ConfigEntry, changed: bool) -> None:
+        """Make sure the entry reloads after a reconfigure/reauth.
+
+        Normally __init__'s update listener does it — HA 2026.12 requires an
+        integration with an update listener to schedule its own reloads, which
+        is why we don't use async_update_reload_and_abort. Two cases the
+        listener can't cover:
+
+        * nothing actually changed, so no listener fires;
+        * the entry isn't loaded (e.g. reauth after a failed setup), so its
+          listener was torn down by async_on_unload.
+        """
+        if changed and entry.update_listeners:
+            return
+        self.hass.config_entries.async_schedule_reload(entry.entry_id)
+
     async def async_step_reauth(self, entry_data):
         """Entrypoint called by HA when the integration raises ConfigEntryAuthFailed."""
         return await self.async_step_reauth_confirm()
@@ -318,14 +345,19 @@ class ProtectorNetConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 errors["base"] = "invalid_auth"
 
             if not errors:
-                return self.async_update_reload_and_abort(
+                # Update only — the entry's update listener owns the reload.
+                # See the note in async_step_reconfigure.
+                changed = self.hass.config_entries.async_update_entry(
                     entry,
-                    data_updates={
+                    data={
+                        **entry.data,
                         "username":       user_input["username"],
                         "password":       user_input["password"],
                         "session_cookie": new_cookie,
                     },
                 )
+                self._ensure_reload(entry, changed)
+                return self.async_abort(reason="reauth_successful")
 
         return self.async_show_form(
             step_id="reauth_confirm",
