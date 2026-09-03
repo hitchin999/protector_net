@@ -12,6 +12,7 @@ from homeassistant.helpers import entity_registry as er
 import re
 
 from . import api
+from .compat import async_via_hub
 from .const import DEFAULT_OVERRIDE_MINUTES, KEY_PLAN_IDS, DOMAIN
 from .device import ProtectorNetDevice
 from .discovery import async_on_hub_connected
@@ -277,7 +278,7 @@ class BaseDoorButton(ProtectorNetDevice, ButtonEntity):
             "name": self.door_name,
             "manufacturer": "Yoel Goldstein/Vaayer LLC",
             "model": "Protector.Net Door",
-            "via_device": (DOMAIN, self._hub_identifier),
+            **async_via_hub(self.hass, self._entry_id),
             "configuration_url": self._entry.data.get("base_url"),
         }
 
