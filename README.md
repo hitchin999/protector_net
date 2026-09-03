@@ -12,74 +12,76 @@ This custom integration controls **Hartmann Controls Protector.Net _and_ Odyssey
 
 ## What's new in 0.2.7
 
-### Fix: door entities now recover on their own after a server outage (no more manual reload)
+### Fix: door entities recover on their own after a Hartmann outage
 
-If the integration happened to **(re)start while Hartmann was unreachable** — an HA restart, or an integration reload, that coincided with a server reboot (e.g. the nightly panel bounce) or a brief network drop — the door-enumeration call at setup would fail and the door platforms would come up with **zero door entities**. The integration still finished loading "successfully", so the existing door entities went **unavailable** with nothing backing them, and nothing retried creating them.
+If the integration **(re)started while Hartmann was unreachable** — an HA restart or reload coinciding with a server reboot (e.g. the nightly panel bounce) or a brief network drop — the setup-time door fetch failed and the door platforms came up with **zero door entities**. The integration still finished loading "successfully", so your doors sat **unavailable** with nothing backing them, and **any automation keyed on them silently stopped**, until you manually reloaded. A websocket reconnect only refreshes entities that *already exist*; it can't recreate missing ones.
 
-The SignalR websocket itself reconnected fine once the server came back — but a reconnect only refreshes entities that **already exist**; it can't recreate missing ones. So the doors stayed unavailable, and **any automation keyed on them silently stopped**, until you manually reloaded the integration.
+A successful SignalR **(re)connect is now treated as a recovery signal**. Every door platform re-checks for doors it's missing, **backfills** them, and re-seeds their state from cache so they don't sit at *Unknown*. Your doors come back on their own when Hartmann does. It's a **no-op on a healthy start**, adds **no load while Hartmann is down** (it only fires on a *successful* reconnect), and picks up doors added in Hartmann during the outage as a bonus.
 
-This release treats a successful SignalR **(re)connect as a recovery signal**. The moment the websocket comes back up, every door platform re-checks for doors it's missing and **backfills** any that couldn't be created earlier, then re-seeds their state from cache so they don't sit at *Unknown*. Once Hartmann is reachable again the websocket reconnects on its own (as it already did) — and now your door entities come back with it, **automatically**.
+Covers every per-door entity — the Override **Type** / **Mode** selects, **Override Minutes**, **Override Until**, **Pulse Unlock** and optional legacy buttons, the **Lock State** / **Overridden** / **Reader Mode** / **Last Door Log** / **Temp Code** / **OTR** sensors, and the door-contact **binary sensors** — plus the partition-wide **All Doors Lockdown** switch.
 
-It covers every per-door entity: the override controls (Override Type / Override Mode selects, Override Minutes, Override Until), **Pulse Unlock** and any optional legacy buttons, the Lock State / Overridden / Reader Mode / Last Door Log / Temp Code / OTR sensors, the door-contact binary sensors, and the partition-wide **All Doors Lockdown** switch.
+### Fix: door entities unavailable on Home Assistant 2026.9+
 
-On a healthy startup this does nothing — every door already exists, so the re-check is a no-op — and it adds **no extra load while Hartmann is down**, because it only fires on a *successful* reconnect. As a bonus, doors added in Hartmann during an outage are picked up on the next reconnect too. **No configuration or automation changes needed — just update.**
+On Home Assistant **2026.9** and newer, every **Door** entity and the **All Doors Lockdown** switch came up unavailable and stayed that way — a reload didn't help, since it recurred on every start. Hub and Action Plans entities kept working, so it looked like a partial outage. Home Assistant changed how a device links to its parent (the link nesting each Door under its Hub), and the old form began raising an error, which made Home Assistant silently drop those entities.
 
-> This complements the earlier websocket work in 0.2.4 (auto-reconnect / re-auth): that keeps the *connection* alive; 0.2.7 makes sure the door *entities* are rebuilt if they were lost to an outage during setup.
+Doors now link to the Hub the new way on Home Assistant 2026.8+, and the old way on older versions. Device grouping, entity IDs, dashboards, and automations are unchanged, and there's **no minimum Home Assistant version bump**.
 
----
+### Fix: Reconfigure and re-authentication rebuilt every entity twice
 
-## What's new in 0.2.6
+Completing a **Reconfigure** or **re-authentication** reloaded the entry twice, so every entity went unavailable and came back twice in a row. It's now a single clean reload.
 
-### Fix: scheduled door locks occasionally not reaching the panel (Update Panels race)
-
-When an automation changed several doors in quick succession — for example, locking a batch of doors and then, after a condition, **one more door in a second `set_door_schedule_mode` call** a fraction of a second later — each call fired its own **Update Panels** (`PanelCommands/UpdateAll`). A panel takes several seconds to apply an Update Panels, so the second push could land while the panel was still busy with the first and never take effect. The affected door's new schedule was written to the server but never reached the panel hardware, so the door silently kept its previous state — with **no error in Home Assistant and nothing in the panel log**, because as far as HA was concerned the service call succeeded.
-
-This release routes every Update Panels through a **per-entry debouncer**. Rapid pushes now collapse into a **single** Update Panels that fires only after a short quiet window — i.e. after every Door Time Zone write in the burst has committed — so no door's change can be lost to a competing push. A short automatic retry was also added so one transient failure (panel briefly offline) doesn't drop the push.
-
-This only affects the schedule path (`set_door_schedule_mode`). `override_door` / `resume_door` send direct panel commands and were never subject to this race, so **no automation changes are needed** — just update the integration. The quiet window defaults to 2.5 s (`UPDATE_PANELS_DEBOUNCE_SECONDS` in `const.py`); a couple of seconds of latency on a scheduled push is invisible in practice.
-
-### New: Door Schedules sensor (see every door's current schedule at a glance)
-
-A new `sensor.door_schedules_<partition>` on the Hub device shows, **per door, which Door Time Zone (schedule) it is currently assigned to on the server** — so you no longer have to log into Hartmann and open each door to check whether it's on its HA-managed schedule or something else.
-
-State is the number of doors currently on an HA-managed schedule; the `doors` attribute lists every door with its current schedule and a lifecycle status:
-
-```yaml
-state: 3
-attributes:
-  doors:
-    - door_id: 5
-      name: Front Door
-      schedule: "HA[abc1234] Front Door"   # the Door Time Zone the door points at right now
-      ha_managed: true
-      status: Active                         # door is on its HA-managed schedule
-      mode: CardOrPin
-    - door_id: 6
-      name: Basement Entrance
-      schedule: "Always Unlock"
-      ha_managed: false
-      status: Drifted                        # HA thinks it's active, but it isn't on the HA schedule
-      mode: Unlock
-  ha_managed_count: 3
-  staged_count: 1
-  drifted_count: 1
-  unmanaged_count: 2
-  total_count: 7
-  last_updated: "2026-06-19T13:23:58"
-```
-
-The four statuses:
-
-- **Active** — door is on its HA-managed schedule, as intended.
-- **Staged** — an HA schedule is provisioned for the door, but it hasn't been activated onto it yet (still on its original schedule).
-- **Drifted** — `managed_doors` says the door should be active, but on the server its assigned Door Time Zone is **not** the HA one (e.g. someone repointed it in Hartmann directly, or an activation didn't take). Worth investigating.
-- **Unmanaged** — HA isn't managing this door's schedule at all.
-
-This reads each door's assignment from the **server** (its `DoorTimeZoneId` resolved against the partition's Door Time Zone list) — the same thing you'd see in Hartmann's door config. Note it reflects the **server's configured schedule, not what the panel hardware is currently enforcing**: if an Update Panels push were ever lost, the server (and this sensor) would still show the intended schedule. To confirm a panel actually applied a mode, compare with the per-door **Reader Mode** sensor (live from the panel). Refreshes every 5 minutes and immediately after a `set_door_schedule_mode` call.
+**No configuration or automation changes needed — just update.**
 
 ---
 
-## What's new in 0.2.5
+## Features
+
+* ✅ Cookie login (`ss-id`) with automatic re-auth
+* ✅ Partition selection (imports only your chosen partition)
+* ✅ **Zero-polling** live updates via SignalR
+* ✅ Door controls: per-door override UI + Pulse Unlock (+ optional legacy buttons)
+* ✅ **Override Until** date/time picker for timed overrides
+* ✅ **All Doors Lockdown** switch (partition-wide)
+* ✅ **Temporary access codes** with start/end times, extension support, and auto-cleanup
+* ✅ **OTR Schedules** — schedule overrides that run on the panel even if HA is offline
+* ✅ **HA Door Log** entries when you use HA buttons (e.g., “Home Assistant unlocked …”)
+* ✅ All controls & options in the UI (HACS-friendly)
+* ✅ **Odyssey servers supported** (auto-detect)
+* ✅ **Self-healing** — door entities auto-recover after a Hartmann outage (no manual reload)
+  
+---
+
+## Installation
+
+**HACS (recommended):**
+
+1. In **HACS → Integrations**, search for **“Protector.Net Access Control”** and install.
+2. **Restart** Home Assistant.
+
+**Manual:**
+
+1. Copy `custom_components/protector_net/` into your Home Assistant `config/custom_components/`.
+2. **Restart** Home Assistant.
+
+Then go to **Settings → Devices & Services → Add Integration** → “Protector.Net Access Control”.
+
+---
+
+## Setup & Options
+
+* **Base URL** – `https://host:port`
+* **Credentials** – a Protector.Net user with sufficient privileges (**must be a System Administrator** in Hartmann)
+* **Default override minutes** – used for Timed Override
+* **Default PIN digits** – 4–9 digits for generated temp codes
+* **Partition** – select exactly one
+* **Action Plans** – pick trigger plans to clone as **System** plans (so they can be executed from HA)
+
+Revisit any time: **Settings → Devices & Services → Protector.Net → Options**.
+
+### Door Entities (legacy buttons)
+
+* **Pulse Unlock** is always included (not shown in the picker).
+* Choose any **additional** legacy buttons you want; **none** are pre-selected by default.
 
 ### HA-managed door schedules (survives panel reboots)
 The existing `override_door` (and the "Unlock Until" controls it powers) lives **only in the panel's RAM**. If a door panel reboots mid-override, it forgets the override and falls back to whatever base schedule the door has set in Hartmann. That made the common "Always Card or Pin in Hartmann + HA override on top" pattern unreliable for anything safety-critical or scheduled — rental check-ins, facility opening hours, scheduled lockdowns, etc.
@@ -164,20 +166,45 @@ Caveat: if you turn this on, then later untick a door from "Create Door Time Zon
 
 The existing `override_door` service is **unchanged**. Keep using it for ad-hoc unlocks and the JS card. The two systems coexist cleanly: an active panel override still wins until cleared, regardless of which schedule sits underneath. Once the override is resumed, the door falls back to whichever schedule it's pointing at — original or HA-managed.
 
-### Door contact sensors
-Each door now exposes a `binary_sensor` with `device_class=door`, auto-discovered from Hartmann. The integration reads each panel's inputs (`/api/Panels/{id}/Inputs`), finds those configured as `Door_Contact` or `Monitored_Door_Contact`, and maps them to the right door — so the sensor's name is just the door name and HA's logbook/history shows clean **Open / Closed** transitions.
+### Reconfigure and re-authentication (no more delete-and-re-add)
+You can now fix credentials in place. The integration's **Reconfigure** flow (Settings → Devices & Services → Protector.Net → ⋮ → Reconfigure) updates the **Protector.Net URL, username, and password** without removing the integration — all entities, options, and HA-managed door schedules are preserved. Point it at a new host and the entry's unique ID and title update automatically; it refuses the change if it would collide with another configured entry/partition.
 
-State is driven live off the SignalR/WebSocket feed (`DOOR_CONTACT_STATE` / `DOOR_CONTACT_INPUT_STATE`, already polarity-corrected by Hartmann), so it tracks the physical door in real time. Both Protector.Net and Odyssey are supported from the same path.
+And when the server rejects the stored credentials (e.g. the Hartmann account password was changed), the integration raises a proper **re-authentication** prompt asking you to re-enter the username and password — instead of failing quietly in the background. Both flows reload the entry cleanly on success.
 
-Two attributes to automate on:
+> Note: this is distinct from the WebSocket session re-auth, which silently refreshes the `ss-id` cookie on reconnect. That handles *expired* sessions; this handles *wrong* credentials.
 
-- **`contact_configured`** — `true` only once a real contact is confirmed wired (discovered in the Hartmann config, or proven by a live notification). Doors without a contact input default to **Closed** and report `contact_configured: false`, so automations can branch on this instead of trusting a hardcoded state.
-- **`held_open`** — flags a door propped/held open past its threshold (Odyssey reports this directly; Protector.Net derives it from the contact-state stream).
+### Partition + door names sync from Hartmann
+Renaming a partition or a door in Hartmann is now picked up by HA automatically — no need to delete and re-add the integration, or even reload it.
 
-State and `held_open` survive HA restarts, with the next live notification re-syncing to ground truth.
+The integration syncs names on every load and re-checks every hour in the background:
 
-### Panels Online sensor
-Each integration entry now exposes a `sensor.panels_online_<partition>` entity on its Hub device. State is the integer count of panels currently online; attributes give the breakdown:
+- The hub device picks up new partition names (which also updates the integration entry title and the card's partition section header)
+- Door devices get their new names, with entities re-labeled to match
+- Worst-case lag between a Hartmann rename and HA picking it up is about an hour
+
+**Custom names you've set in HA are preserved.** If you renamed a door in HA's UI (Settings → Devices → click the door → pencil icon), HA records that as `name_by_user` and the sync skips that device — your custom name wins forever, even when the Hartmann name changes.
+
+This is useful when the Hartmann admin names doors one way (say, internal codes like "Main 4") and you want different labels in HA ("Lobby Door"). Mix and match per-door — let some sync from Hartmann, override others.
+
+**Entity IDs never change** regardless of renames — automations referencing entities by entity_id keep working unconditionally.
+
+---
+
+## Devices & Entities
+
+### 1) Hub device (per partition)
+
+* **Device:** `Hub Status – <Partition>`
+* **Entity:** **Hub Status – <Partition>** *(sensor)*
+  **State:** `running / connecting / idle / stopped / error`
+  **Attributes:** `phase`, `connected`, `mapped_doors`, `partition_id`, `system_type` *(“Odyssey” or “ProtectorNET”)* 
+* **Update Panels** *(button)* — push configuration to all connected panels immediately
+* **Panels Online – <Partition>** *(sensor)* — count of panels currently online; attributes break down online/offline panels (name, MAC, model, IP). Polled every 60s.
+* **Door Schedules – <Partition>** *(sensor)* — per-door current Door Time Zone (schedule) assignment **as configured on the server**, with `ha_managed` and a lifecycle `status` (Active / Staged / Drifted / Unmanaged) for each door. Lets you see which doors are on their HA-managed schedule without opening each door in Hartmann. Refreshed every 5 min and immediately after `set_door_schedule_mode`.
+
+#### Panels Online attributes
+
+State is the integer count of panels currently online; attributes give the breakdown:
 
 ```yaml
 state: 1
@@ -215,186 +242,42 @@ action:
            | map(attribute='name') | join(', ') }}
 ```
 
-### Partition + door names sync from Hartmann
-Renaming a partition or a door in Hartmann is now picked up by HA automatically — no need to delete and re-add the integration, or even reload it.
+#### Door Schedules attributes
 
-The integration syncs names on every load and re-checks every hour in the background:
+State is the number of doors currently on an HA-managed schedule; the `doors` attribute lists every door with its current schedule and a lifecycle status:
 
-- The hub device picks up new partition names (which also updates the integration entry title and the card's partition section header)
-- Door devices get their new names, with entities re-labeled to match
-- Worst-case lag between a Hartmann rename and HA picking it up is about an hour
+```yaml
+state: 3
+attributes:
+  doors:
+    - door_id: 5
+      name: Front Door
+      schedule: "HA[abc1234] Front Door"   # the Door Time Zone the door points at right now
+      ha_managed: true
+      status: Active                         # door is on its HA-managed schedule
+      mode: CardOrPin
+    - door_id: 6
+      name: Basement Entrance
+      schedule: "Always Unlock"
+      ha_managed: false
+      status: Drifted                        # HA thinks it's active, but it isn't on the HA schedule
+      mode: Unlock
+  ha_managed_count: 3
+  staged_count: 1
+  drifted_count: 1
+  unmanaged_count: 2
+  total_count: 7
+  last_updated: "2026-06-19T13:23:58"
+```
 
-**Custom names you've set in HA are preserved.** If you renamed a door in HA's UI (Settings → Devices → click the door → pencil icon), HA records that as `name_by_user` and the sync skips that device — your custom name wins forever, even when the Hartmann name changes.
+The four statuses:
 
-This is useful when the Hartmann admin names doors one way (say, internal codes like "Main 4") and you want different labels in HA ("Lobby Door"). Mix and match per-door — let some sync from Hartmann, override others.
+- **Active** — door is on its HA-managed schedule, as intended.
+- **Staged** — an HA schedule is provisioned for the door, but it hasn't been activated onto it yet (still on its original schedule).
+- **Drifted** — `managed_doors` says the door should be active, but on the server its assigned Door Time Zone is **not** the HA one (e.g. someone repointed it in Hartmann directly, or an activation didn't take). Worth investigating.
+- **Unmanaged** — HA isn't managing this door's schedule at all.
 
-**Entity IDs never change** regardless of renames — automations referencing entities by entity_id keep working unconditionally.
-
-### Reconfigure and re-authentication (no more delete-and-re-add)
-You can now fix credentials in place. The integration's **Reconfigure** flow (Settings → Devices & Services → Protector.Net → ⋮ → Reconfigure) updates the **Protector.Net URL, username, and password** without removing the integration — all entities, options, and HA-managed door schedules are preserved. Point it at a new host and the entry's unique ID and title update automatically; it refuses the change if it would collide with another configured entry/partition.
-
-And when the server rejects the stored credentials (e.g. the Hartmann account password was changed), the integration raises a proper **re-authentication** prompt asking you to re-enter the username and password — instead of failing quietly in the background. Both flows reload the entry cleanly on success.
-
-> Note: this is distinct from the WebSocket session re-auth, which silently refreshes the `ss-id` cookie on reconnect. That handles *expired* sessions; this handles *wrong* credentials.
-
-### Manage Active PINs view (Hartman Door Lock Card)
-A new "Manage Active PINs" panel in the bulk actions area lets you see every active temp code at a glance — name, expiry, how many doors it unlocks, and the PIN itself (hidden behind a "show" toggle by default; flip the new `always_show_temp_pin: true` card option if you'd rather see them all). Clicking a code expands it inline so you can:
-
-- **Add or remove doors** without changing the PIN — checkboxes for every door, one Save click applies the diff. Behind the scenes this hits the new `add_door_to_temp_code` / `remove_door_from_temp_code` services, so the same Hartmann user gets assigned to (or removed from) the new doors' Access Privilege Groups.
-- **Extend the expiry** with a datetime picker — same PIN, no interruption to the guest.
-- **Delete now** — removes the Hartmann user immediately.
-
-Removing the last door is allowed — the Hartmann user record stays intact (you can re-add doors later or delete it manually from the Hartmann admin UI).
-
-### Multi-door temp codes now actually work
-Bulk-creating a PIN for multiple doors at once would previously only succeed for the **first** door — every subsequent door got rejected by Hartmann with “PIN provided is not available. This could indicate the PIN is in use or being blocked by Enhanced Pin Security.” The integration was creating a separate Hartmann user for each door with the same PIN, and Hartmann’s built-in PIN-uniqueness rule blocked all but the first.
-
-The `create_temp_code` service now creates **one** Hartmann user with a single PIN credential and assigns that user to each requested door’s Access Privilege Group. Bulk-creating a code across 6 doors now does what you’d expect: 6 working doors, one user record. `update_temp_code` and `delete_temp_code` now propagate changes/cleanups to every sensor that was tracking the same code, so the per-door temp_code sensors stay in sync.
-
-### Auto-deletion of expired temp codes
-Temp codes created with an `end_time` now auto-delete themselves the moment they expire — the Hartmann user record is removed and the entry disappears from the Temp Code sensor. No more 5-minute polling automation needed for cleanup; it just works for hotel/Airbnb-style bookings out of the box. Existing helper automations that delete codes by name still work fine — they’ll just become a redundant safety net.
-
-The scheduler survives Home Assistant restarts: any restored codes whose `end_time` is in the past get cleaned up immediately, and codes still in the future are rescheduled. Updating a code’s `end_time` (e.g., via `update_temp_code` for an extended booking) reschedules the deletion automatically.
-
-If Hartmann is unreachable when a code tries to expire, the integration retries every hour until it succeeds — the entry stays in the sensor until the cleanup actually completes, so nothing gets silently dropped.
-
-### Quieter logs for stale temp codes
-The “No temp user found with PIN …” log line is now DEBUG instead of WARNING. This was just the API layer being chatty about a routine, recoverable case (e.g., the user was deleted out-of-band) — the actual error was already returned in the structured response, and callers handle it appropriately.
-
----
-
-
-
-### Fix: WebSocket auto-heals after session expiry
-If the Hartmann session cookie expired while the WebSocket was running, the connection would drop and never recover — every reconnect attempt failed silently because it kept using the stale cookie. The WebSocket client now refreshes its credentials on each reconnect attempt, re-authenticates automatically on 401 errors, and shuts down cleanly when Home Assistant stops (no more “Task was still running” warnings in the logs).
-
-### Fix: Last Door Log timestamps showing UTC instead of local time
-Event timestamps like “Home Assistant unlocked @ 6:39 AM” were displaying the raw UTC time from the Hartmann server instead of converting to your local timezone. Now correctly shows local time (e.g., “@ 2:39 AM” for EDT).
-
-### Fix: No more phantom activity entries after restart
-Restarting or reloading the integration used to create a wall of fake state-change entries in the Activity log (e.g., “Override Type changed to For Specified Time”, “Lock State changed to Locked”) even though nothing actually happened at the door. Sensors now restore silently without triggering history entries.
-
-### Quieter logs during server reboots
-Transient connection errors (timeouts, connection refused) during Hartmann server reboots no longer show as errors in the HA log. They’re now logged as warnings since the integration always retries and self-heals.
-
----
-
-## What’s new in 0.2.3
-
-### Fix: Door sensors missing on some Odyssey servers
-On certain Hartmann systems, the overview tree’s site names didn’t match the partition name, causing door discovery to silently find zero doors — only the Hub Status sensor would appear. Discovery now uses the partition’s own door list from the API (the same reliable source the websocket client already uses), with the old site-name filter as a fallback.
-
-### Fix: Override Type resets after restart
-The Override Type select (“Until Resumed”, “For Specified Time”, etc.) used to reset to “For Specified Time” every time Home Assistant restarted, because the Hartmann API doesn’t expose the current override type. The select now persists its value across restarts.
-
----
-
-## What’s new in 0.2.2
-
-### Temporary Access Codes
-Create and manage temporary PIN codes for doors — perfect for Airbnb, rental properties, or visitor management.
-- `create_temp_code` — Generate random or manual PINs with optional start/end times
-- `update_temp_code` — Extend a guest’s stay by patching the expiration directly on Hartmann. Same PIN, no downtime, no interruption to the guest.
-- `delete_temp_code` / `delete_temp_code_by_name` — Remove codes by PIN or name
-- `clear_all_temp_codes` — Wipe all temp codes from a door
-- **Temp Code sensor** per door stores `code_name`, `code`, `user_id`, `start_time`, and `end_time` per code for automation-driven extension detection
-- Configurable default PIN digits (4–9) in integration setup and options
-
-### OTR Schedules (OneTimeRun)
-Schedule future door overrides that execute directly in the Hartmann panel — works even if Home Assistant is offline.
-- `create_otr_schedule` / `delete_otr_schedule` / `get_otr_schedules`
-- All times automatically converted between your local timezone and Hartmann’s UTC
-- **OTR Schedules sensor** per door — state is the schedule count, attributes include `active_schedules`, `upcoming_schedules`, and `all_schedules` with id, name, mode, start, and stop times
-- Refreshes every 5 minutes + immediately after create/delete via dispatcher signals
-
-### Override Until (date/time picker)
-Pick a target date & time for timed overrides instead of calculating minutes manually — just like Hartmann’s app.
-- **Override Until** datetime entity per door — when Override Type is “For Specified Time”, the Override switch auto-computes minutes from the datetime picker
-- Falls back to Override Minutes if the datetime is empty or in the past
-- **`until` parameter on `override_door` service** — pass `until: "2026-02-18T14:00:00"` and the service auto-computes minutes. Great for automations where you know the end time, not the duration.
-
-### Instant Door Override
-- `override_door` — Single service call to override a door (no need to set mode + enable separately)
-- `resume_door` — Resume normal schedule
-- Override Type and Override Mode selects update immediately in the UI after service calls
-
-### Update Panels
-- **Button** on the Hub device + `update_panels` **service** to push configuration to all connected panels immediately, so changes take effect without waiting for Hartmann’s auto-sync interval
-
-### Last Door Log Improvements
-- State now includes timestamp: “John Smith granted access @ 1:06 PM” — each event is a separate History entry
-- OTR schedule activations appear as “OTR Unlock @ 10:01 PM”
-
-### Other Changes
-- **Multi-door support** — All services accept multiple doors via the device picker
-- **Override Minutes** max increased to 2,147,483,647
-- `force_remove` option on `delete_temp_code_by_name` for cleaning stale sensor entries
-- Better error messages when PIN creation fails (shows Hartmann’s actual error)
-
----
-
-## Features
-
-* ✅ Cookie login (`ss-id`) with automatic re-auth
-* ✅ Partition selection (imports only your chosen partition)
-* ✅ **Zero-polling** live updates via SignalR
-* ✅ Door controls: per-door override UI + Pulse Unlock (+ optional legacy buttons)
-* ✅ **Override Until** date/time picker for timed overrides
-* ✅ **All Doors Lockdown** switch (partition-wide)
-* ✅ **Temporary access codes** with start/end times, extension support, and auto-cleanup
-* ✅ **OTR Schedules** — schedule overrides that run on the panel even if HA is offline
-* ✅ **HA Door Log** entries when you use HA buttons (e.g., “Home Assistant unlocked …”)
-* ✅ All controls & options in the UI (HACS-friendly)
-* ✅ **Odyssey servers supported** (auto-detect)
-* ✅ **Self-healing** — door entities auto-recover after a Hartmann outage (no manual reload)
-  
----
-
-## Installation
-
-**HACS (recommended):**
-
-1. In **HACS → Integrations**, search for **“Protector.Net Access Control”** and install.
-2. **Restart** Home Assistant.
-
-**Manual:**
-
-1. Copy `custom_components/protector_net/` into your Home Assistant `config/custom_components/`.
-2. **Restart** Home Assistant.
-
-Then go to **Settings → Devices & Services → Add Integration** → “Protector.Net Access Control”.
-
----
-
-## Setup & Options
-
-* **Base URL** – `https://host:port`
-* **Credentials** – a Protector.Net user with sufficient privileges (**must be a System Administrator** in Hartmann)
-* **Default override minutes** – used for Timed Override
-* **Default PIN digits** – 4–9 digits for generated temp codes
-* **Partition** – select exactly one
-* **Action Plans** – pick trigger plans to clone as **System** plans (so they can be executed from HA)
-
-Revisit any time: **Settings → Devices & Services → Protector.Net → Options**.
-
-### Door Entities (legacy buttons)
-
-* **Pulse Unlock** is always included (not shown in the picker).
-* Choose any **additional** legacy buttons you want; **none** are pre-selected by default.
-
----
-
-## Devices & Entities
-
-### 1) Hub device (per partition)
-
-* **Device:** `Hub Status – <Partition>`
-* **Entity:** **Hub Status – <Partition>** *(sensor)*
-  **State:** `running / connecting / idle / stopped / error`
-  **Attributes:** `phase`, `connected`, `mapped_doors`, `partition_id`, `system_type` *(“Odyssey” or “ProtectorNET”)* 
-* **Update Panels** *(button)* — push configuration to all connected panels immediately
-* **Panels Online – <Partition>** *(sensor)* — count of panels currently online; attributes break down online/offline panels (name, MAC, model, IP). Polled every 60s.
-* **Door Schedules – <Partition>** *(sensor)* — per-door current Door Time Zone (schedule) assignment **as configured on the server**, with `ha_managed` and a lifecycle `status` (Active / Staged / Drifted / Unmanaged) for each door. Lets you see which doors are on their HA-managed schedule without opening each door in Hartmann. Refreshed every 5 min and immediately after `set_door_schedule_mode`.
+This reads each door's assignment from the **server** (its `DoorTimeZoneId` resolved against the partition's Door Time Zone list) — the same thing you'd see in Hartmann's door config. Note it reflects the **server's configured schedule, not what the panel hardware is currently enforcing**: if an Update Panels push were ever lost, the server (and this sensor) would still show the intended schedule. To confirm a panel actually applied a mode, compare with the per-door **Reader Mode** sensor (live from the panel). Refreshes every 5 minutes and immediately after a `set_door_schedule_mode` call.
 
 ### 2) Door devices (one per door)
 
@@ -408,6 +291,8 @@ Revisit any time: **Settings → Devices & Services → Protector.Net → Option
 * **Temp Code** — state is `None` or the active code name. Attributes: list of all temp codes with `code_name`, `code`, `user_id`, `start_time`, `end_time` per entry.
 * **OTR Schedules** — state is the count of schedules for this door. Attributes: `active_schedules` (currently running), `upcoming_schedules` (future), and `all_schedules` with id, name, mode, start, and stop times. Refreshes every 5 minutes and immediately after create/delete.
 * **Door Contact** *(binary_sensor, `device_class=door`)* — live **Open** / **Closed** state from the panel's door-contact input. Attributes: `contact_configured` (whether a contact input is actually wired) and `held_open` (door propped past its threshold). Doors without a contact input default to **Closed** with `contact_configured: false`.
+
+  Auto-discovered from Hartmann: the integration reads each panel's inputs (`/api/Panels/{id}/Inputs`), finds those configured as `Door_Contact` or `Monitored_Door_Contact`, and maps them to the right door — so the sensor's name is just the door name and HA's logbook/history shows clean Open / Closed transitions. State is driven live off the SignalR/WebSocket feed (`DOOR_CONTACT_STATE` / `DOOR_CONTACT_INPUT_STATE`, already polarity-corrected by Hartmann), on **both Protector.Net and Odyssey** from the same path. `contact_configured` becomes `true` only once a real contact is confirmed — either discovered in the Hartmann config, or proven by a live notification — so automations can branch on it instead of trusting a hardcoded state. `held_open` is reported directly by Odyssey and derived from the contact-state stream on Protector.Net. State and `held_open` survive HA restarts, with the next live notification re-syncing to ground truth.
 
 **Controls**
 
@@ -469,6 +354,8 @@ Revisit any time: **Settings → Devices & Services → Protector.Net → Option
 | `update_panels` | Push current configuration to all connected panels immediately. |
 
 All services accept **multiple doors** via the device picker.
+
+Rapid `set_door_schedule_mode` calls coalesce into a **single** Update Panels push, fired after a short quiet window once every Door Time Zone write in the burst has committed — so no door's change can be lost to a competing push. The window defaults to 2.5 s (`UPDATE_PANELS_DEBOUNCE_SECONDS` in `const.py`); a couple of seconds of latency on a scheduled push is invisible in practice. `override_door` / `resume_door` send direct panel commands and are not affected.
 
 ---
 
@@ -606,6 +493,8 @@ Lock/Unlock **status** messages don’t flip the “by” state (that’s what *
 
 ### 0.2.7
 * Fix: **Door entities auto-recover after a server outage** — if the integration (re)started while Hartmann was unreachable (an HA restart / reload coinciding with a server reboot or network drop), the setup-time door fetch failed and the door platforms came up with **no entities**, so the existing door entities went **unavailable** and nothing retried — they stayed stuck (and automations keyed on them stopped) until a manual reload. The integration now treats a successful SignalR reconnect as a recovery signal and **backfills** any missing door entities the moment the websocket comes back, then re-seeds their state. Covers every per-door entity (override selects / Override Minutes / Override Until, Pulse Unlock + legacy buttons, Lock State / Overridden / Reader Mode / Last Log / Temp Code / OTR sensors, door-contact binary sensors) and the All Doors Lockdown switch. No-op on a healthy start; no extra load during the outage; also picks up doors added in Hartmann during the outage. No config/automation changes needed. Complements the 0.2.4 websocket auto-reconnect (which keeps the connection alive — this rebuilds the entities).
+* Fix: **Door entities unavailable on Home Assistant 2026.9+** — HA changed how a device links to its parent (the link nesting each Door under its Hub), and the old form began raising an error, so HA silently dropped every entity that used it. All **Door** entities and the **All Doors Lockdown** switch went unavailable and stayed there (a reload didn't help); Hub and Action Plans entities were unaffected. Doors now link to the Hub by registry ID on HA 2026.8+ and the old way on older versions. No minimum HA version bump; grouping, entity IDs, and automations unchanged.
+* Fix: **Reconfigure / re-authentication reloaded the entry twice** — every entity went unavailable and came back twice in a row. The update listener now owns the reload, so it's a single clean rebuild.
 
 ### 0.2.6
 * Fix: **Update Panels race on rapid schedule changes** — back-to-back `set_door_schedule_mode` calls (e.g. a batch lock followed immediately by a second call for one more door) each fired their own `PanelCommands/UpdateAll`; the second could be dropped while the panel was still applying the first, leaving that door's new schedule on the server but never pushed to hardware — with no HA error and no panel log. Pushes now route through a per-entry **debouncer** that coalesces a burst into a single Update Panels fired after all Door Time Zone writes commit, plus a short retry for a transient panel-offline. `override_door` / `resume_door` are unaffected (they use direct panel commands); no automation changes needed.
