@@ -16,6 +16,7 @@ from homeassistant.helpers import entity_registry as er
 from homeassistant.util import dt as dt_util
 
 from .device import ProtectorNetDevice
+from .compat import async_via_hub
 from .discovery import async_setup_door_platform_backfill
 from . import api
 from .const import (
@@ -142,7 +143,7 @@ class OverrideSwitch(ProtectorNetDevice, SwitchEntity):
             "name": self._door_name,
             "manufacturer": "Yoel Goldstein/Vaayer LLC",
             "model": "Protector.Net Door",
-            "via_device": (DOMAIN, self._hub_identifier),
+            **async_via_hub(self.hass, self._entry_id),
             "configuration_url": self._entry.data.get("base_url"),
         }
 
@@ -352,7 +353,6 @@ class AllDoorsLockdownSwitch(ProtectorNetDevice, SwitchEntity):
             "manufacturer": "Yoel Goldstein/Vaayer LLC",
             "model": "Protector.Net Partition",
             "name": f"All Doors – {partition_name}",
-            "via_device": (DOMAIN, self._hub_identifier),
             "configuration_url": base_url,
         }
 
@@ -369,7 +369,9 @@ class AllDoorsLockdownSwitch(ProtectorNetDevice, SwitchEntity):
 
     @property
     def device_info(self):
-        return dict(self._device_info)
+        # Resolved lazily: the hub link is a registry id on HA >= 2026.8, and
+        # the hub device may not be registered yet when __init__ runs.
+        return {**self._device_info, **async_via_hub(self.hass, self._entry_id)}
 
     @property
     def is_on(self) -> bool:
