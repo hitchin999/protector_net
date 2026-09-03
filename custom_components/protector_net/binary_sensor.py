@@ -72,6 +72,7 @@ from homeassistant.helpers.restore_state import RestoreEntity
 from homeassistant.util import dt as dt_util
 
 from . import api
+from .compat import async_via_hub
 from .const import (
     DOMAIN,
     INVERSION_CONVENTION,
@@ -248,7 +249,7 @@ class ProtectorDoorContactSensor(BinarySensorEntity, RestoreEntity):
             "model": "Protector.Net Door",
             "name": self._door_name,
             "configuration_url": self._base_url,
-            "via_device": (DOMAIN, f"hub:{self._host}|{self._entry_id}"),
+            **async_via_hub(self.hass, self._entry_id),
         }
 
     @property
