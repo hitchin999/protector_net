@@ -25,6 +25,10 @@ from .const import (
 )
 from .ws import SignalRClient
 from . import api
+from .compat import (
+    async_ensure_hub_device,
+    async_get_device_by_identifier,
+)
 from .services import async_setup_services, async_unload_services
 
 _LOGGER = logging.getLogger(DOMAIN)
@@ -105,7 +109,7 @@ async def _sync_partition_title_only(hass: HomeAssistant, entry: ConfigEntry) ->
         try:
             device_reg = dr.async_get(hass)
             hub_ident = (DOMAIN, cfg.get("hub_identifier") or f"hub:{host}|{entry_id}")
-            hub_device = device_reg.async_get_device(identifiers={hub_ident})
+            hub_device = async_get_device_by_identifier(hass, hub_ident, entry_id)
             if hub_device and not hub_device.name_by_user:
                 new_hub_name = f"Hub Status – {part_name}"
                 if hub_device.name != new_hub_name:
@@ -176,7 +180,7 @@ async def _sync_names_from_hartmann(
                 continue
 
             ident = (DOMAIN, f"door:{host_key}:{door_id}|{entry_id}")
-            device = device_reg.async_get_device(identifiers={ident})
+            device = async_get_device_by_identifier(hass, ident, entry_id)
             if device is None:
                 continue  # not yet created — first run
 
@@ -348,11 +352,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         # on every door frame, read by post-setup re-dispatch to defeat the
         # WS-burst-vs-entity-subscribe timing race.
         KEY_LAST_DOOR_STATUS: {},
-        # Snapshot of options at load time. The update listener compares
-        # against this to decide whether an entry update is a real options
-        # change (reload needed) or just a title rename (no reload — would
-        # cause a race with in-flight platform setup).
+        # Snapshot of options/data at load time. The update listener compares
+        # against these to decide whether an entry update is a real change
+        # (reload needed) or just a title rename (no reload — would cause a
+        # race with in-flight platform setup).
         "_last_options_seen": dict(entry.options),
+        "_last_data_seen": dict(entry.data),
     }
     hass.data[DOMAIN][entry.entry_id] = data
 
@@ -450,6 +455,20 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         # platforms are up so it doesn't delay entity creation past the
         # WS client's initial-state burst.
         await _sync_partition_title_only(hass, entry)
+
+        # Register the hub device before any platform runs. Door devices link
+        # to it by registry id (HA >= 2026.8 `via_device_id`), which requires
+        # the hub to already exist — and platform setup order doesn't
+        # guarantee a hub entity is added first.
+        partition_name = (
+            entry.title.split("–", 1)[1].strip()
+            if entry.title and "–" in entry.title
+            else str(entry.data.get("partition_id", "Unknown"))
+        )
+        hass.data[DOMAIN][entry.entry_id]["partition_name"] = partition_name
+        hass.data[DOMAIN][entry.entry_id]["hub_device_id"] = async_ensure_hub_device(
+            hass, entry, partition_name, base_url
+        )
 
         # Now set up platforms (these return quickly; our platforms offload I/O)
         await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
@@ -634,7 +653,7 @@ def _options_diff_is_runtime_only(old: dict, new: dict) -> bool:
 
 
 async def _async_update_listener(hass: HomeAssistant, entry: ConfigEntry) -> None:
-    """Reload on real options changes; skip reloads on:
+    """Reload on real options/data changes; skip reloads on:
        - pure title updates (e.g. partition rename in Hartmann)
        - runtime-only options writes (e.g. managed_doors current_mode tracking
          after a set_door_schedule_mode call)
@@ -642,10 +661,26 @@ async def _async_update_listener(hass: HomeAssistant, entry: ConfigEntry) -> Non
     Both of these used to trigger a full entry reload, which destroys and
     recreates every entity — making them all briefly 'unavailable' in the
     Activity log even though nothing about the entities themselves changed.
+
+    This listener owns *every* reload for the entry, including the ones that
+    follow a reconfigure/reauth flow. HA 2026.12 stops auto-reloading on behalf
+    of an entry that has an update listener — the listener is expected to do it
+    — so the config flow updates the entry and leaves the reload to us.
     """
     cfg = hass.data[DOMAIN].get(entry.entry_id, {})
     last_options = cfg.get("_last_options_seen") or {}
     new_options = dict(entry.options)
+    last_data = cfg.get("_last_data_seen") or {}
+    new_data = dict(entry.data)
+
+    # Credentials / base_url changed (reconfigure or reauth). Always reload —
+    # the API client and WS hub both capture these at setup time.
+    if last_data != new_data:
+        cfg["_last_data_seen"] = new_data
+        cfg["_last_options_seen"] = new_options
+        _LOGGER.debug("[%s] Entry data updated; reloading entry", entry.entry_id)
+        hass.config_entries.async_schedule_reload(entry.entry_id)
+        return
 
     if last_options == new_options:
         _LOGGER.debug(
@@ -664,5 +699,4 @@ async def _async_update_listener(hass: HomeAssistant, entry: ConfigEntry) -> Non
 
     cfg["_last_options_seen"] = new_options
     _LOGGER.debug("[%s] Options updated; reloading entry", entry.entry_id)
-    await hass.config_entries.async_reload(entry.entry_id)
-
+    hass.config_entries.async_schedule_reload(entry.entry_id)
