@@ -12,6 +12,34 @@ from typing import Any, Dict, Optional, Tuple, List, Set
 from aiohttp import ClientError, ClientSession, TCPConnector, WSMsgType
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.const import EVENT_HOMEASSISTANT_STOP
+
+# Minimum seconds between door-map rebuilds triggered by an unrecognised
+# Door frame. When one Hartmann server hosts several partitions, its hub
+# broadcasts every partition's frames to every connection — so most frames
+# an entry sees belong to a sibling entry and will never be in its map.
+# Rebuilding per frame costs a full system-overview fetch each time.
+UNKNOWN_STATUS_REBUILD_COOLDOWN = 300.0
+
+# Reader-mode text -> controller time-zone index. Ordered: multi-word modes
+# must be tested before the bare "card" / "pin" patterns they contain.
+_MODE_PATTERNS: tuple[tuple[str, int], ...] = (
+    (r"\bcard\s+or\s+pin\b", 3),
+    (r"\bcard\s+and\s+pin\b", 4),
+    (r"\bfirst\s+credential\s+in\b", 6),
+    (r"\bdual\s+credential\b", 7),
+    (r"\blockdown\b", 0),
+    (r"\bunlock(?:ed)?\b", 5),
+    (r"\bpin\b", 2),
+    (r"\bcard\b", 1),
+)
+
+
+def _tz_from_mode_text(text: str) -> Optional[int]:
+    """Map a Hartmann reader-mode phrase to its controller index, or None."""
+    for pat, val in _MODE_PATTERNS:
+        if re.search(pat, text):
+            return val
+    return None
 from homeassistant.helpers.dispatcher import async_dispatcher_send
 
 try:
@@ -25,11 +53,13 @@ try:
         KEY_DOOR_HELD_OPEN_THRESHOLDS,
         DEFAULT_HELD_OPEN_THRESHOLD_MS,
         SIGNAL_HUB_CONNECTED,
+        SIGNAL_PANEL_STARTED,
     )
 except Exception:
     from .const import DOMAIN
     FRIENDLY_TO_TZ_INDEX = {}
     SIGNAL_HUB_CONNECTED = f"{DOMAIN}_hub_connected"
+    SIGNAL_PANEL_STARTED = f"{DOMAIN}_panel_started"
     KEY_DOOR_CONTACT_MAP = "door_contact_map"
     KEY_INPUT_STATE_CACHE = "input_state_cache"
     KEY_DOOR_CONTACT_STATE_CACHE = "door_contact_state_cache"
@@ -119,6 +149,17 @@ class SignalRClient:
         self.ws_url: str | None = None
         self.connection_token: str | None = None
         self._subscribed_panels: List[str] = []
+
+        # statusIds proven to belong to another partition on this server.
+        # Checked before rebuilding the door map so a sibling entry's frames
+        # cost one lookup instead of a system-overview fetch. Reset on each
+        # new websocket connection, since the subscription set changes there.
+        self._unknown_status_ids: Set[str] = set()
+        self._last_map_rebuild_ts: float = 0.0
+
+        # Last StateValues seen per panel, to dedup repeated notifications
+        # (OFFLINE:TIMEDOUT arrives more than once per outage).
+        self._panel_state: dict[str, str] = {}
 
         # counters / last seen
         self.door_events_seen = 0
@@ -255,6 +296,49 @@ class SignalRClient:
         if ts is None:
             return False
         return (self.hass.loop.time() - ts) <= window
+
+    @callback
+    def _handle_panel_status(self, note: dict) -> None:
+        """Track panel online/offline/restart and announce cold starts.
+
+        Hartmann sends StateValues like ``OFFLINE:TIMEDOUT``, ``ONLINE`` and
+        ``STARTED:COLD``. A ``STARTED:`` state means the panel actually
+        restarted, so every override it was running is gone — the panel comes
+        back following its schedule with no memory of having been overridden,
+        and no resume notification is ever sent.
+
+        Two quirks this has to survive, both observed on real hardware:
+        ``OFFLINE:TIMEDOUT`` repeats, and the ``Date`` field on a buffered
+        cold-start event can predate the offline event that preceded it
+        (the panel queues it and delivers it on reconnect). So dedup on the
+        state, and never order by ``Date`` — arrival order is the truth.
+        """
+        state = str(note.get("StateValues") or "").upper()
+        if not state:
+            return
+        panel_id = note.get("SourceId")
+        panel_name = note.get("SourceName") or "panel"
+        key = str(panel_id if panel_id is not None else panel_name)
+
+        if self._panel_state.get(key) == state:
+            return
+        self._panel_state[key] = state
+        _LOGGER.debug(
+            "[%s] Panel status: %s (id=%s) -> %s", self.entry_id, panel_name, panel_id, state
+        )
+
+        if not state.startswith("STARTED"):
+            return
+
+        _LOGGER.info(
+            "[%s] Panel %s restarted (%s); any override it was running is gone",
+            self.entry_id, panel_name, state,
+        )
+        async_dispatcher_send(
+            self.hass,
+            f"{SIGNAL_PANEL_STARTED}_{self.entry_id}",
+            {"panel_id": panel_id, "panel_name": panel_name, "state": state},
+        )
 
     async def _refresh_allowed_doors(self) -> None:
         """Populate the set of allowed door IDs for THIS entry’s partition."""
@@ -800,6 +884,10 @@ class SignalRClient:
                     # (called by _build_door_map) may have refreshed it after a 401.
                     cookie = f"ss-id={cfg['session_cookie']}"
                     try:
+                        # New connection => new subscription set, so any
+                        # statusId previously ruled out gets one fresh chance.
+                        self._unknown_status_ids.clear()
+                        self._last_map_rebuild_ts = 0.0
                         await self._build_door_map()
                         # Re-read cookie after _build_door_map in case it triggered re-auth
                         cookie = f"ss-id={cfg['session_cookie']}"
@@ -991,8 +1079,34 @@ class SignalRClient:
                                 self.entry_id, sid, compact
                             )
                             continue
-                        # Otherwise, map might actually be stale -> refresh once
+
+                        # Frame from a panel we aren't subscribed to. On a
+                        # server hosting several partitions this is the steady
+                        # state, not an anomaly: the hub broadcasts every
+                        # partition's frames to every connection, so a sibling
+                        # entry's doors arrive here constantly and will never
+                        # be in our map. Rebuilding per frame meant a
+                        # system-overview + all-doors fetch several times a
+                        # minute, forever.
+                        #
+                        # A rebuild is still worth doing once, in case a panel
+                        # really was added to our partition after connect — so
+                        # remember which statusIds we've already ruled out, and
+                        # rate-limit rebuilds for the rest.
+                        sid_s = str(sid)
+                        if sid_s in self._unknown_status_ids:
+                            continue
+                        now_ts = self.hass.loop.time()
+                        if (now_ts - self._last_map_rebuild_ts) < UNKNOWN_STATUS_REBUILD_COOLDOWN:
+                            continue
+                        self._last_map_rebuild_ts = now_ts
                         await self._build_door_map()
+                        if sid_s not in self._door_map:
+                            self._unknown_status_ids.add(sid_s)
+                            _LOGGER.debug(
+                                "[%s] statusId=%s not ours after rebuild; ignoring it "
+                                "until the next reconnect", self.entry_id, sid_s,
+                            )
                         continue
 
                     door_id, door_name = door
@@ -1168,6 +1282,14 @@ class SignalRClient:
                     did = self._door_id_from_notification(note)
 
                     if did is None:
+                        # Panel-scoped notifications carry no door, so they'd
+                        # otherwise be dropped as "unmapped". PANEL_STATUS is
+                        # how Hartmann reports a panel going offline, coming
+                        # back, and — critically — cold-starting, which is the
+                        # only signal that an override was silently lost.
+                        if ntype == "PANEL_STATUS":
+                            self._handle_panel_status(note)
+                            continue
                         if ntype.startswith("ACTIONPLAN_"):
                             continue
                         _LOGGER.debug("[%s] Unmapped notification: %s", self.entry_id, note)
@@ -1212,6 +1334,24 @@ class SignalRClient:
                             return
                         _LOGGER.debug("[%s] Synth door status -> door_id=%s payload=%s",
                                       self.entry_id, did, payload)
+                        # Merge into the same cache real frames write to. The
+                        # cache is "best known door state" and is read both by
+                        # the post-setup re-seed and by the override reconciler
+                        # deciding whether an override actually went missing —
+                        # a synthesized state is our best knowledge, so leaving
+                        # it out made the cache disagree with the entities.
+                        try:
+                            cache = (self.hass.data.get(DOMAIN, {})
+                                     .get(self.entry_id, {})
+                                     .get(KEY_LAST_DOOR_STATUS))
+                            if isinstance(cache, dict):
+                                merged = dict(cache.get(did) or {})
+                                merged.update(
+                                    {k: v for k, v in payload.items() if v is not None}
+                                )
+                                cache[did] = merged
+                        except Exception:
+                            pass
                         async_dispatcher_send(
                             self.hass,
                             f"{DISPATCH_DOOR}_{self.entry_id}",
@@ -1221,21 +1361,7 @@ class SignalRClient:
                     if "has been overridden" in msg_l and "current state is" in msg_l:
                         m = re.search(r"current state is\s+([a-z\s/]+)", msg_l)
                         mode_txt = (m.group(1).strip() if m else "")
-                        modes_ordered = [
-                            (r"\bcard\s+or\s+pin\b", 3),
-                            (r"\bcard\s+and\s+pin\b", 4),
-                            (r"\bfirst\s+credential\s+in\b", 6),
-                            (r"\bdual\s+credential\b", 7),
-                            (r"\blockdown\b", 0),
-                            (r"\bunlock(?:ed)?\b", 5),
-                            (r"\bpin\b", 2),
-                            (r"\bcard\b", 1),
-                        ]
-                        tz = None
-                        for pat, val in modes_ordered:
-                            if re.search(pat, mode_txt):
-                                tz = val
-                                break
+                        tz = _tz_from_mode_text(mode_txt)
                         payload = {"overridden": True}
                         if tz is not None:
                             payload["timeZone"] = tz
@@ -1262,6 +1388,40 @@ class SignalRClient:
                     ):
                         restore_tz = self._baseline_reader_tz.get(did, 1)
                         _emit_status({"overridden": False, "timeZone": restore_tz})
+
+                    elif "time zone changed to mode" in msg_l:
+                        # The door is now following its schedule at the stated
+                        # mode. Hartmann sends this when a panel cold-starts
+                        # after losing power: the override lived only in panel
+                        # RAM, so it is gone and the door has reverted.
+                        #
+                        # There is no "NoOverride" notification — this message
+                        # is the only announcement that the override ended, and
+                        # until it was handled the Overridden / Reader Mode /
+                        # Lock State sensors stayed stuck at their pre-reboot
+                        # values indefinitely.
+                        m = re.search(r"time zone changed to mode\s+([a-z\s/]+)", msg_l)
+                        tz = _tz_from_mode_text(m.group(1).strip() if m else "")
+                        payload: dict[str, Any] = {"overridden": False}
+                        if tz is not None:
+                            payload["timeZone"] = tz
+                            payload["strike"] = tz == 5
+                            payload["opener"] = tz == 5
+                            # This message states the door's *schedule* mode, so
+                            # it is the authoritative baseline — the value the
+                            # resume handler restores when an override ends.
+                            # The baseline is otherwise only written from WS
+                            # status frames, so a schedule edit (which arrives
+                            # solely as this notification) used to leave it
+                            # stale, and a later resume would restore the
+                            # door's pre-edit mode.
+                            if self._baseline_reader_tz.get(did) != tz:
+                                _LOGGER.debug(
+                                    "[%s] Baseline reader mode updated from schedule "
+                                    "change -> door_id=%s tz=%s", self.entry_id, did, tz,
+                                )
+                            self._baseline_reader_tz[did] = tz
+                        _emit_status(payload)
 
                     if ntype == "DOOR_LOCK_STATE":
                         if "unlocked" in msg_l:
