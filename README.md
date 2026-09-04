@@ -12,6 +12,32 @@ This custom integration controls **Hartmann Controls Protector.Net _and_ Odyssey
 
 ## What's new in 0.2.7
 
+### New: Restore Override after a panel reboot
+
+An override lives only in the panel's RAM. If the panel loses power — or is rebooted by an action plan on every Update Panels, as some sites do — it comes back following its schedule and the override is simply gone. Hartmann doesn't announce it either: a resume is announced only when an override ends deliberately, so a lost one is silent.
+
+Each door now has an opt-in **Restore Override** switch under **Configuration** on its device page. With it on, Home Assistant remembers that the door *should* be overridden and puts the override back once the panel reports it has restarted — typically about 75 seconds after power returns, most of which is Hartmann noticing the panel is back.
+
+**Off by default on every door**, so nothing changes until you turn it on.
+
+Home Assistant records what you asked for the moment you ask, **before** the command is sent. So if you press Resume while the panel is offline and the command never lands, the door is still left alone when the panel returns — it doesn't come back unlocked. The switch's attributes show what's being held: `should_be_overridden`, the mode, when the override started, and how many times it's been restored.
+
+**Until Resumed** and **For Specified Time** are restored; a timed override comes back with only the time still remaining, and is dropped entirely if its window elapsed while the panel was down. **Until Next Schedule** is not restored — a restarting panel reloads its schedule, which is arguably the next schedule event, so that type has no meaning across a reboot.
+
+> Home Assistant is the source of truth here. If you resume a door in **Hartmann** while HA still expects it to be overridden, the next panel restart will put the override back. Turn the door's Restore Override switch off to clear what HA is holding.
+
+### Fix: door state was wrong for a long time after a panel reboot
+
+After a panel restarted, **Overridden**, **Reader Mode** and **Lock State** could keep showing their pre-reboot values — a door reported as overridden and unlocked while it was physically locked on its schedule. It wasn't brief: nothing corrected it until something unrelated happened to refresh the door, which could be a long time on a quiet system.
+
+The panel does announce the change, as a *Door Time Zone Changed to Mode …* notification, but the integration wasn't reading it. It now is, so the door's state corrects within seconds of the panel coming back. The same notification also keeps each door's schedule mode current, so resuming an override afterwards returns the door to the mode it's actually on rather than the one it was on before the schedule was last edited.
+
+### Fix: much lower API load when one server hosts several partitions
+
+When a single Hartmann server hosts more than one partition, its hub sends every partition's door updates to every connection. Each entry was rebuilding its full door map on each update meant for a sibling entry — a system-overview fetch every time, several times a minute, indefinitely. On a two-partition server that measured about 1,190 rebuilds in three hours.
+
+Updates that belong to another partition are now recognised once and skipped after that, with rebuilds rate-limited regardless. A door genuinely added in Hartmann is still picked up. Single-partition setups were never affected.
+
 ### Fix: door entities recover on their own after a Hartmann outage
 
 If the integration **(re)started while Hartmann was unreachable** — an HA restart or reload coinciding with a server reboot (e.g. the nightly panel bounce) or a brief network drop — the setup-time door fetch failed and the door platforms came up with **zero door entities**. The integration still finished loading "successfully", so your doors sat **unavailable** with nothing backing them, and **any automation keyed on them silently stopped**, until you manually reloaded. A websocket reconnect only refreshes entities that *already exist*; it can't recreate missing ones.
@@ -77,6 +103,27 @@ Then go to **Settings → Devices & Services → Add Integration** → “Protec
 * **Action Plans** – pick trigger plans to clone as **System** plans (so they can be executed from HA)
 
 Revisit any time: **Settings → Devices & Services → Protector.Net → Options**.
+
+### Recommended: give Home Assistant its own Hartmann administrator
+
+Rather than reusing your own login, create a dedicated administrator in Hartmann for the integration. Everything HA does then shows up under that name in **Reporting → Administrative Log**, so it's obvious at a glance which changes came from Home Assistant and which came from a person.
+
+In Hartmann: **Administrators → Add Administrator**. Type **Local**, give it a recognisable name (First Name `Home`, Last Name `Assistant` reads nicely in the log), tick **System Admin**, and grant it the partition(s) the integration manages. Then use those credentials when you add the integration — or point an existing entry at them via **Reconfigure**.
+
+What you get in the Administrative Log:
+
+```
+Home Assistant requested Door Front Door override to Unlock until resumed.
+Home Assistant requested Door Side Entrance pulse unlock.
+Home Assistant executed Action Plan HA Door Log.
+Home Assistant successfully logged in from 192.168.1.50.
+```
+
+Filter the report by administrator to see only the integration's activity. This also covers **Restore Override**: an override put back after a panel reboot is logged as an ordinary HA request, so a restore is distinguishable from someone pressing the button.
+
+> **Worth knowing:** an override has no user attached in **Reporting → Door Activity** — it appears as *"… has been overridden. Current state is Unlock"* with the User column empty, whoever triggered it. The Administrative Log is where the attribution lives.
+
+A separate account is also easier to manage: you can change or revoke the integration's access without touching anyone's personal login, and the login entries show which IP Home Assistant is connecting from.
 
 ### Door Entities (legacy buttons)
 
@@ -211,7 +258,7 @@ state: 1
 attributes:
   online_panels:
     - name: Main Panel
-      mac: 44B7D0A029D0
+      mac: AABBCCDDEEFF
       model: PRS-Door-Master
       ip: 192.168.1.42
   offline_panels: []
@@ -492,6 +539,9 @@ Lock/Unlock **status** messages don’t flip the “by” state (that’s what *
 ## Changelog
 
 ### 0.2.7
+* New: **Restore Override after a panel reboot** — an override lives only in panel RAM, so a power cut (or an action plan that reboots the panel on Update Panels) silently loses it, with no notification from Hartmann. An opt-in per-door **Restore Override** switch (under Configuration, **off by default**) remembers that a door should be overridden and re-applies it when the panel reports it has restarted — roughly 75s after power returns. Intent is recorded when you ask, *before* the command is sent, so a Resume that never reaches an offline panel still leaves the door alone on return. Restores **Until Resumed** and **For Specified Time** (with only the remaining time, dropped if the window elapsed); **Until Next Schedule** is not restorable. Survives a Home Assistant restart. Note HA is authoritative: resuming a door in Hartmann while HA still expects an override means the next restart re-applies it.
+* Fix: **Door state wrong for a long time after a panel restart** — **Overridden**, **Reader Mode** and **Lock State** kept their pre-reboot values (a door shown as overridden and unlocked while physically locked on its schedule) until something unrelated refreshed it. The panel's *Door Time Zone Changed to Mode …* notification was being ignored; it's now handled, so state corrects within seconds. It also keeps each door's schedule mode current, so a later resume returns the door to the mode it's actually on rather than the one from before the last schedule edit.
+* Fix: **Far fewer API calls when one server hosts several partitions** — the hub broadcasts every partition's door updates to every connection, and each entry rebuilt its whole door map on each update meant for a sibling entry (a system-overview fetch each time, several times a minute, forever — ~1,190 rebuilds in three hours on a two-partition server). Foreign updates are now recognised once and skipped, with rebuilds rate-limited regardless; genuinely new doors are still picked up. Single-partition setups were unaffected.
 * Fix: **Door entities auto-recover after a server outage** — if the integration (re)started while Hartmann was unreachable (an HA restart / reload coinciding with a server reboot or network drop), the setup-time door fetch failed and the door platforms came up with **no entities**, so the existing door entities went **unavailable** and nothing retried — they stayed stuck (and automations keyed on them stopped) until a manual reload. The integration now treats a successful SignalR reconnect as a recovery signal and **backfills** any missing door entities the moment the websocket comes back, then re-seeds their state. Covers every per-door entity (override selects / Override Minutes / Override Until, Pulse Unlock + legacy buttons, Lock State / Overridden / Reader Mode / Last Log / Temp Code / OTR sensors, door-contact binary sensors) and the All Doors Lockdown switch. No-op on a healthy start; no extra load during the outage; also picks up doors added in Hartmann during the outage. No config/automation changes needed. Complements the 0.2.4 websocket auto-reconnect (which keeps the connection alive — this rebuilds the entities).
 * Fix: **Door entities unavailable on Home Assistant 2026.9+** — HA changed how a device links to its parent (the link nesting each Door under its Hub), and the old form began raising an error, so HA silently dropped every entity that used it. All **Door** entities and the **All Doors Lockdown** switch went unavailable and stayed there (a reload didn't help); Hub and Action Plans entities were unaffected. Doors now link to the Hub by registry ID on HA 2026.8+ and the old way on older versions. No minimum HA version bump; grouping, entity IDs, and automations unchanged.
 * Fix: **Reconfigure / re-authentication reloaded the entry twice** — every entity went unavailable and came back twice in a row. The update listener now owns the reload, so it's a single clean rebuild.
