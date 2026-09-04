@@ -271,3 +271,25 @@ UPDATE_PANELS_PUSH_ATTEMPTS = 3
 # is what makes the integration self-heal after a server outage instead of
 # leaving every door entity stuck "unavailable" until a manual reload.
 SIGNAL_HUB_CONNECTED = f"{DOMAIN}_hub_connected"
+
+# Dispatcher signal fired by ws.py when a panel reports it has (re)started.
+# Payload: {"panel_id": int|None, "panel_name": str, "state": str} where
+# ``state`` is the raw StateValues, e.g. "STARTED:COLD".
+#
+# A cold start means the panel's RAM was cleared, so any override that was
+# running on it is gone — the override lives only in panel RAM, which is the
+# whole reason the HA-managed Door Time Zone feature exists. Hartmann never
+# announces "the override ended" in that case (it announces a resume only
+# when the override ends deliberately); the panel simply reloads its schedule
+# and reports the resulting mode. This signal is what lets the integration
+# notice the difference and put a remembered override back.
+SIGNAL_PANEL_STARTED = f"{DOMAIN}_panel_started"
+
+# hass.data[DOMAIN][entry_id] key holding the OverrideIntentStore instance.
+KEY_OVERRIDE_INTENT = "override_intent"
+
+# Dispatcher signal fired whenever a door's override intent changes (the
+# Restore Override switch position, or what the door should be overridden to).
+# The switch entity has no polling and would otherwise keep serving the
+# attributes it last wrote, so an override applied elsewhere would never show.
+SIGNAL_OVERRIDE_INTENT = f"{DOMAIN}_override_intent_changed"
