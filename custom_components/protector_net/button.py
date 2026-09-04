@@ -16,6 +16,7 @@ from .compat import async_via_hub
 from .const import DEFAULT_OVERRIDE_MINUTES, KEY_PLAN_IDS, DOMAIN
 from .device import ProtectorNetDevice
 from .discovery import async_on_hub_connected
+from .override_intent import async_clear_override, async_record_override
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -306,6 +307,7 @@ class DoorResumeScheduleButton(BaseDoorButton):
         self._attr_unique_id = f"protector_net_{self._host_safe}_{self._entry_id}_{self.door_id}_resume_schedule"
 
     async def async_press(self):
+        await async_clear_override(self.hass, self._entry_id, [self.door_id])
         await api.resume_schedule(self.hass, self._entry_id, [self.door_id])
 
 
@@ -316,6 +318,8 @@ class DoorOverrideUntilResumeButton(BaseDoorButton):
         self._attr_unique_id = f"protector_net_{self._host_safe}_{self._entry_id}_{self.door_id}_unlock_until_resume"
 
     async def async_press(self):
+        await async_record_override(self.hass, self._entry_id, [self.door_id],
+                                    mode="Unlock", override_type="Resume")
         await api.set_override(self.hass, self._entry_id, [self.door_id], "Resume")
         plan_id = self.hass.data[DOMAIN][self._entry_id].get("ha_log_plan_id")
         if plan_id:
@@ -332,6 +336,8 @@ class DoorOverrideUntilResumeCardOrPinButton(BaseDoorButton):
         self._attr_unique_id = f"protector_net_{self._host_safe}_{self._entry_id}_{self.door_id}_cardorpin_until_resume"
 
     async def async_press(self):
+        await async_record_override(self.hass, self._entry_id, [self.door_id],
+                                    mode="CardOrPin", override_type="Resume")
         await api.override_until_resume_card_or_pin(self.hass, self._entry_id, [self.door_id])
 
 
@@ -359,6 +365,9 @@ class DoorTimedOverrideUnlockButton(BaseDoorButton):
         self._attr_unique_id = f"protector_net_{self._host_safe}_{self._entry_id}_{self.door_id}_timed_override_unlock"
 
     async def async_press(self):
+        await async_record_override(self.hass, self._entry_id, [self.door_id],
+                                    mode="Unlock", override_type="Time",
+                                    minutes=self._override_minutes)
         await api.set_override(self.hass, self._entry_id, [self.door_id], "Time", minutes=self._override_minutes)
         plan_id = self.hass.data[DOMAIN][self._entry_id].get("ha_log_plan_id")
         if plan_id:
