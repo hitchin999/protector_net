@@ -13,11 +13,18 @@ from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.dispatcher import async_dispatcher_connect, async_dispatcher_send
 from homeassistant.helpers import entity_registry as er
+from homeassistant.helpers.entity import EntityCategory
 from homeassistant.util import dt as dt_util
 
 from .device import ProtectorNetDevice
 from .compat import async_via_hub
 from .discovery import async_setup_door_platform_backfill
+from .const import SIGNAL_OVERRIDE_INTENT
+from .override_intent import (
+    async_clear_override,
+    async_get_intent,
+    async_record_override,
+)
 from . import api
 from .const import (
     DOMAIN,
@@ -53,7 +60,10 @@ async def async_setup_entry(
 
     @callback
     def _add_doors(door_list: list[dict]) -> None:
-        entities: list[SwitchEntity] = [OverrideSwitch(hass, entry, d) for d in door_list]
+        entities: list[SwitchEntity] = []
+        for d in door_list:
+            entities.append(OverrideSwitch(hass, entry, d))
+            entities.append(RestoreOverrideSwitch(hass, entry, d))
         # One "All Doors – Lockdown Mode" switch per entry, created the first
         # time we actually have doors. It needs the door list to know which
         # doors to command, so it must not be created against an empty list.
@@ -209,6 +219,14 @@ class OverrideSwitch(ProtectorNetDevice, SwitchEntity):
 
             minutes_arg = minutes if type_token == "Time" else None
 
+            # Intent BEFORE the command. If this call fails, or the panel is
+            # offline and never receives it, the user still asked for the
+            # override — recording on success instead would lose it.
+            await async_record_override(
+                self.hass, self._entry_id, [self._door_id],
+                mode=mode_token, override_type=type_token, minutes=minutes_arg,
+            )
+
             ok = await api.apply_override(
                 self.hass,
                 self._entry_id,
@@ -239,6 +257,10 @@ class OverrideSwitch(ProtectorNetDevice, SwitchEntity):
             return
         self._busy = True
         try:
+            # Intent BEFORE the command: a Resume that never reaches the panel
+            # must still stop us putting the override back later.
+            await async_clear_override(self.hass, self._entry_id, [self._door_id])
+
             ok = await api.resume_schedule(self.hass, self._entry_id, [self._door_id])
             if not ok:
                 _LOGGER.error("[%s] Door %s: resume_schedule failed", self._entry_id, self._door_id)
@@ -400,6 +422,13 @@ class AllDoorsLockdownSwitch(ProtectorNetDevice, SwitchEntity):
             type_token = OVERRIDE_TYPE_LABEL_TO_TOKEN.get("until resume") or OVERRIDE_TYPE_LABEL_TO_TOKEN.get("resume") or "Resume"
             mode_token = OVERRIDE_MODE_LABEL_TO_TOKEN.get("lockdown") or "Lockdown"
 
+            # A reboot during a lockdown is the one case where losing an
+            # override is a security problem rather than an inconvenience.
+            await async_record_override(
+                self.hass, self._entry_id, list(self._door_ids),
+                mode=mode_token, override_type=type_token, minutes=None,
+            )
+
             ok = await api.apply_override(
                 self.hass,
                 self._entry_id,
@@ -431,6 +460,8 @@ class AllDoorsLockdownSwitch(ProtectorNetDevice, SwitchEntity):
             return
         self._busy = True
         try:
+            await async_clear_override(self.hass, self._entry_id, list(self._door_ids))
+
             ok = await api.resume_schedule(self.hass, self._entry_id, self._door_ids)
             if not ok:
                 _LOGGER.error("[%s] AllDoors: resume_schedule failed", self._entry_id)
@@ -518,3 +549,114 @@ class AllDoorsLockdownSwitch(ProtectorNetDevice, SwitchEntity):
                 if st and st.state:
                     self._state_by_door[did]["reader_mode"] = st.state
         self._recompute_and_push()
+
+
+# =====================================================================
+# Per-door "Restore Override" switch
+# =====================================================================
+
+class RestoreOverrideSwitch(ProtectorNetDevice, SwitchEntity):
+    """Opt-in: put this door's override back if a panel reboot loses it.
+
+    An override lives only in panel RAM. When the panel cold-starts it comes
+    back on its schedule with no memory of the override, and Hartmann sends no
+    resume notification — so without this the door silently reverts.
+
+    Off by default on every door, so existing installs behave exactly as they
+    did. The switch position lives in the intent store rather than in
+    RestoreEntity state, because the reconciler has to be able to read it
+    before entity restoration has necessarily finished.
+    """
+
+    _attr_should_poll = False
+    _attr_has_entity_name = True
+    _attr_entity_category = EntityCategory.CONFIG
+    _attr_translation_key = "restore_override"
+    _attr_icon = "mdi:lock-reset"
+
+    def __init__(self, hass: HomeAssistant, entry: ConfigEntry, door: dict):
+        super().__init__(entry)
+        self.hass = hass
+        self._entry = entry
+        self._entry_id = entry.entry_id
+        self._door_id = int(door["Id"])
+        self._door_name = door.get("Name", f"Door {self._door_id}")
+
+        entry_data = hass.data[DOMAIN][entry.entry_id]
+        self._host_key: str = entry_data.get("host") or ""
+        host_safe = (urlparse(entry.data["base_url"]).hostname or "").replace(":", "_")
+
+        self._attr_name = "Restore Override"
+        self._attr_unique_id = (
+            f"protector_net_{host_safe}_{self._entry_id}_{self._door_id}_restore_override"
+        )
+
+    @property
+    def device_info(self):
+        return {
+            "identifiers": {(DOMAIN, f"door:{self._host_key}:{self._door_id}|{self._entry_id}")},
+            "name": self._door_name,
+            "manufacturer": "Yoel Goldstein/Vaayer LLC",
+            "model": "Protector.Net Door",
+            **async_via_hub(self.hass, self._entry_id),
+            "configuration_url": self._entry.data.get("base_url"),
+        }
+
+    @property
+    def is_on(self) -> bool:
+        store = async_get_intent(self.hass, self._entry_id)
+        return bool(store and store.is_enabled(self._door_id))
+
+    @property
+    def extra_state_attributes(self) -> Dict[str, Any]:
+        store = async_get_intent(self.hass, self._entry_id)
+        st = store.get(self._door_id) if store else {}
+        return {
+            "should_be_overridden": bool(st.get("should_be_overridden")),
+            "mode": st.get("mode"),
+            "override_type": st.get("override_type"),
+            "ends_at": st.get("ends_at"),
+            "overridden_since": st.get("overridden_since"),
+            "last_restored_at": st.get("last_restored_at"),
+            "restore_count": st.get("restore_count") or 0,
+            # "Until Next Schedule" has no reboot-independent meaning: a
+            # cold-starting panel reloads its schedule, which is arguably the
+            # next schedule event. It is never restored.
+            "restorable": st.get("override_type") in ("Resume", "Time"),
+        }
+
+    async def async_added_to_hass(self) -> None:
+        """Re-render whenever intent changes.
+
+        The attributes are a view onto the intent store, which is written by
+        every override/resume path — the Override switch, the services, the
+        legacy buttons, and the reconciler. Without this the switch would keep
+        showing whatever was true when it last wrote state.
+        """
+        self.async_on_remove(
+            async_dispatcher_connect(
+                self.hass,
+                f"{SIGNAL_OVERRIDE_INTENT}_{self._entry_id}",
+                self._on_intent_changed,
+            )
+        )
+
+    @callback
+    def _on_intent_changed(self, *_args) -> None:
+        self.async_write_ha_state()
+
+    async def async_turn_on(self, **kwargs) -> None:
+        store = async_get_intent(self.hass, self._entry_id)
+        if store is None:
+            return
+        await store.async_set_enabled(self._door_id, True)
+        self.async_write_ha_state()
+
+    async def async_turn_off(self, **kwargs) -> None:
+        store = async_get_intent(self.hass, self._entry_id)
+        if store is None:
+            return
+        # Also forgets any override we were holding, so flipping the switch
+        # back on later can't resurrect a stale one.
+        await store.async_set_enabled(self._door_id, False)
+        self.async_write_ha_state()
