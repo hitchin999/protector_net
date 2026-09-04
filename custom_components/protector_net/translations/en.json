@@ -234,5 +234,12 @@
         }
       }
     }
+  },
+  "entity": {
+    "switch": {
+      "restore_override": {
+        "name": "Restore Override"
+      }
+    }
   }
 }
