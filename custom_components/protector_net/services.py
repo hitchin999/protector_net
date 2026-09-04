@@ -20,6 +20,7 @@ from homeassistant.helpers import config_validation as cv, entity_registry as er
 from homeassistant.helpers.dispatcher import async_dispatcher_send
 
 from .const import DOMAIN, UI_STATE, SCHEDULE_MODES
+from .override_intent import async_clear_override, async_record_override
 
 _LOGGER = logging.getLogger(f"{DOMAIN}.services")
 
@@ -1626,6 +1627,11 @@ async def async_setup_services(hass: HomeAssistant) -> None:
         
         for entry_id, door_ids in doors_by_entry.items():
             try:
+                # Intent before command (see override_intent.py).
+                await async_record_override(
+                    hass, entry_id, list(door_ids),
+                    mode=mode, override_type=type_token, minutes=minutes_arg,
+                )
                 ok = await api.apply_override(
                     hass,
                     entry_id,
@@ -1709,6 +1715,7 @@ async def async_setup_services(hass: HomeAssistant) -> None:
         
         for entry_id, door_ids in doors_by_entry.items():
             try:
+                await async_clear_override(hass, entry_id, list(door_ids))
                 ok = await api.resume_schedule(hass, entry_id, door_ids)
                 
                 if ok:
