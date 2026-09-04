@@ -22,6 +22,8 @@ from .const import (
     KEY_UPDATE_PANELS_DEBOUNCER, UPDATE_PANELS_DEBOUNCE_SECONDS,
     UPDATE_PANELS_PUSH_ATTEMPTS,
     SIGNAL_HUB_CONNECTED,
+    SIGNAL_PANEL_STARTED,
+    KEY_OVERRIDE_INTENT,
 )
 from .ws import SignalRClient
 from . import api
@@ -29,6 +31,7 @@ from .compat import (
     async_ensure_hub_device,
     async_get_device_by_identifier,
 )
+from .override_intent import OverrideIntentStore
 from .services import async_setup_services, async_unload_services
 
 _LOGGER = logging.getLogger(DOMAIN)
@@ -168,6 +171,16 @@ async def _sync_names_from_hartmann(
         doors = await api.get_all_doors(hass, entry_id)
         if not doors:
             return
+
+        # Drop remembered override intent for doors that no longer exist in
+        # Hartmann, so a deleted door can't leave a dangling "should be
+        # overridden" entry behind.
+        intent = (hass.data.get(DOMAIN, {}).get(entry_id, {}) or {}).get(KEY_OVERRIDE_INTENT)
+        if intent is not None:
+            try:
+                await intent.async_prune({int(d["Id"]) for d in doors if "Id" in d})
+            except Exception as e:
+                _LOGGER.debug("[%s] Override intent prune skipped: %s", entry_id, e)
 
         device_reg = dr.async_get(hass)
         host_key = cfg.get("host") or host
@@ -396,6 +409,25 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     )
 
     # Make options changes trigger a reload
+    # Per-door override intent: what SHOULD be overridden, so an override a
+    # panel forgets on a cold start can be put back. Loaded before platforms
+    # so the Restore Override switches can read their position immediately.
+    intent = OverrideIntentStore(hass, entry)
+    await intent.async_load()
+    hass.data[DOMAIN][entry.entry_id][KEY_OVERRIDE_INTENT] = intent
+
+    async def _on_panel_started(payload: dict[str, Any] | None = None) -> None:
+        info = payload or {}
+        await intent.async_reconcile(
+            reason=f"panel {info.get('panel_name') or '?'} {info.get('state') or 'restart'}"
+        )
+
+    entry.async_on_unload(
+        async_dispatcher_connect(
+            hass, f"{SIGNAL_PANEL_STARTED}_{entry.entry_id}", _on_panel_started,
+        )
+    )
+
     entry.async_on_unload(entry.add_update_listener(_async_update_listener))
 
     async def _deferred_start(_event=None) -> None:
@@ -581,6 +613,13 @@ async def async_remove_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
     deletes every HA-tagged DoorTimeZone. Best-effort — failures here only
     leave harmless orphans in Hartmann that the user can clean up manually.
     """
+    # Drop this entry's stored override intent so a deleted-and-re-added
+    # integration doesn't inherit stale "should be overridden" state.
+    try:
+        await OverrideIntentStore(hass, entry).async_remove()
+    except Exception as e:
+        _LOGGER.debug("[%s] Could not remove override intent store: %s", entry.entry_id, e)
+
     # We need the runtime cfg (base_url, partition_id, etc.) to make API
     # calls, which async_unload_entry just popped. Rebuild a minimal one
     # transient cfg for the cleanup pass.
@@ -700,3 +739,4 @@ async def _async_update_listener(hass: HomeAssistant, entry: ConfigEntry) -> Non
     cfg["_last_options_seen"] = new_options
     _LOGGER.debug("[%s] Options updated; reloading entry", entry.entry_id)
     hass.config_entries.async_schedule_reload(entry.entry_id)
+
