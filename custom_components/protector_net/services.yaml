@@ -44,19 +44,52 @@ create_temp_code:
       selector:
         text:
     start_time:
-      name: Start Time
-      description: When the code becomes active (ISO datetime). If not set, code is active immediately.
+      name: Start Time (exact)
+      description: Exact date/time the code becomes active. If not set, the code is active when the action runs.
       required: false
       example: "2026-02-15T14:00:00"
       selector:
         datetime:
+    start_delay:
+      name: Start Delay
+      description: Optional delay added to the start (e.g. active 10 minutes from now).
+      required: false
+      selector:
+        duration:
     end_time:
-      name: End Time
-      description: When the code expires (ISO datetime). If not set, code never expires.
+      name: End Time (exact)
+      description: Exact date/time the code expires. Use this OR Duration OR Stop At. If none are set, the code never expires.
       required: false
       example: "2026-02-17T11:00:00"
       selector:
         datetime:
+    duration:
+      name: Duration
+      description: Expire the code this long after the start (e.g. 3 hours). Use this OR End Time OR Stop At.
+      required: false
+      selector:
+        duration:
+    stop_at:
+      name: Stop At (time of day)
+      description: Expire the code at this time of day, relative to the day the action runs (see Stop Day). Use this OR End Time OR Duration.
+      required: false
+      example: "11:00:00"
+      selector:
+        time:
+    stop_day:
+      name: Stop Day
+      description: Which day "Stop At" refers to. Auto = next occurrence after the start (today if still ahead, otherwise tomorrow).
+      required: false
+      default: "auto"
+      selector:
+        select:
+          options:
+            - label: "Auto (next occurrence)"
+              value: "auto"
+            - label: "Today"
+              value: "today"
+            - label: "Tomorrow"
+              value: "tomorrow"
 
 delete_temp_code:
   name: Delete Temp Code
@@ -141,17 +174,50 @@ update_temp_code:
       selector:
         text:
     start_time:
-      name: Start Time
-      description: New start time (ISO datetime). Leave empty to keep current.
+      name: Start Time (exact)
+      description: New exact start date/time. Leave empty (and no Start Delay) to keep the current start.
       required: false
       selector:
         datetime:
+    start_delay:
+      name: Start Delay
+      description: Set the start to this long from now (e.g. 10 minutes). Use this OR Start Time.
+      required: false
+      selector:
+        duration:
     end_time:
-      name: End Time
-      description: New end time (ISO datetime). Leave empty to keep current.
+      name: End Time (exact)
+      description: New exact end date/time. Use this OR Duration OR Stop At. Leave all empty to keep the current end.
       required: false
       selector:
         datetime:
+    duration:
+      name: Duration
+      description: Expire this long after the start (the new start, the code's current start if still in the future, otherwise now).
+      required: false
+      selector:
+        duration:
+    stop_at:
+      name: Stop At (time of day)
+      description: Expire at this time of day, relative to the day the action runs (see Stop Day). Use this OR End Time OR Duration.
+      required: false
+      example: "11:00:00"
+      selector:
+        time:
+    stop_day:
+      name: Stop Day
+      description: Which day "Stop At" refers to. Auto = next occurrence after the start (today if still ahead, otherwise tomorrow).
+      required: false
+      default: "auto"
+      selector:
+        select:
+          options:
+            - label: "Auto (next occurrence)"
+              value: "auto"
+            - label: "Today"
+              value: "today"
+            - label: "Tomorrow"
+              value: "tomorrow"
 
 update_panels:
   name: Update Panels
@@ -223,19 +289,52 @@ create_otr_schedule:
           filter:
             - integration: protector_net
     start_time:
-      name: Start Time
-      description: When the override should start (ISO datetime, e.g. "2026-02-10T09:00:00")
-      required: true
+      name: Start Time (exact)
+      description: Exact start date/time. Leave empty to start when the action runs (now).
+      required: false
       example: "2026-02-10T09:00:00"
       selector:
         datetime:
+    start_delay:
+      name: Start Delay
+      description: Optional delay added to the start (e.g. 10 minutes from now).
+      required: false
+      selector:
+        duration:
     stop_time:
-      name: Stop Time
-      description: When the override should end (ISO datetime, e.g. "2026-02-10T14:00:00")
-      required: true
+      name: Stop Time (exact)
+      description: Exact end date/time. Use this OR Duration OR Stop At.
+      required: false
       example: "2026-02-10T14:00:00"
       selector:
         datetime:
+    duration:
+      name: Duration
+      description: End the override this long after the start (e.g. 2 hours). Use this OR Stop Time OR Stop At.
+      required: false
+      selector:
+        duration:
+    stop_at:
+      name: Stop At (time of day)
+      description: End at this time of day, relative to the day the action runs (see Stop Day). Use this OR Stop Time OR Duration.
+      required: false
+      example: "18:00:00"
+      selector:
+        time:
+    stop_day:
+      name: Stop Day
+      description: Which day "Stop At" refers to. Auto = next occurrence after the start (today if still ahead, otherwise tomorrow).
+      required: false
+      default: "auto"
+      selector:
+        select:
+          options:
+            - label: "Auto (next occurrence)"
+              value: "auto"
+            - label: "Today"
+              value: "today"
+            - label: "Tomorrow"
+              value: "tomorrow"
     mode:
       name: Mode
       description: Door mode during the scheduled period
@@ -359,11 +458,38 @@ override_door:
           unit_of_measurement: minutes
     until:
       name: Until
-      description: Override until this date/time (auto-computes minutes, sets type to "For Specified Time"). Takes precedence over minutes if both are provided.
+      description: Override until this exact date/time (auto-computes minutes, sets type to "For Specified Time"). Takes precedence over minutes if both are provided. Use this OR Duration OR Stop At.
       required: false
       example: "2026-02-18T14:00:00"
       selector:
         datetime:
+    duration:
+      name: Duration
+      description: Override for this long from when the action runs (sets type to "For Specified Time"). Use this OR Until OR Stop At.
+      required: false
+      selector:
+        duration:
+    stop_at:
+      name: Stop At (time of day)
+      description: Override until this time of day, relative to the day the action runs (see Stop Day). Sets type to "For Specified Time". Use this OR Until OR Duration.
+      required: false
+      example: "18:00:00"
+      selector:
+        time:
+    stop_day:
+      name: Stop Day
+      description: Which day "Stop At" refers to. Auto = next occurrence (today if still ahead, otherwise tomorrow).
+      required: false
+      default: "auto"
+      selector:
+        select:
+          options:
+            - label: "Auto (next occurrence)"
+              value: "auto"
+            - label: "Today"
+              value: "today"
+            - label: "Tomorrow"
+              value: "tomorrow"
     legacy_options:
       name: Legacy options (for old automations)
       collapsed: false
