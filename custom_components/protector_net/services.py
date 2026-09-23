@@ -10,7 +10,7 @@ from __future__ import annotations
 import logging
 import random
 import string
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Optional
 
 import voluptuous as vol
@@ -18,6 +18,7 @@ import voluptuous as vol
 from homeassistant.core import HomeAssistant, ServiceCall, ServiceResponse, SupportsResponse, callback
 from homeassistant.helpers import config_validation as cv, entity_registry as er
 from homeassistant.helpers.dispatcher import async_dispatcher_send
+from homeassistant.util import dt as dt_util
 
 from .const import DOMAIN, UI_STATE, SCHEDULE_MODES
 from .override_intent import async_clear_override, async_record_override
@@ -52,7 +53,11 @@ SERVICE_CREATE_TEMP_CODE_SCHEMA = vol.Schema(
         ),
         vol.Optional("manual_code"): cv.string,
         vol.Optional("start_time"): cv.string,  # ISO datetime string
+        vol.Optional("start_delay"): cv.positive_time_period,
         vol.Optional("end_time"): cv.string,    # ISO datetime string
+        vol.Optional("duration"): cv.positive_time_period,
+        vol.Optional("stop_at"): cv.time,
+        vol.Optional("stop_day", default="auto"): vol.In(["auto", "today", "tomorrow"]),
     }
 )
 
@@ -119,6 +124,10 @@ SERVICE_UPDATE_TEMP_CODE_SCHEMA = vol.Schema(
         vol.Required("code_name"): cv.string,
         vol.Optional("end_time"): cv.string,
         vol.Optional("start_time"): cv.string,
+        vol.Optional("start_delay"): cv.positive_time_period,
+        vol.Optional("duration"): cv.positive_time_period,
+        vol.Optional("stop_at"): cv.time,
+        vol.Optional("stop_day", default="auto"): vol.In(["auto", "today", "tomorrow"]),
     }
 )
 
@@ -138,13 +147,70 @@ OTR_SCHEDULE_MODES = [
 SERVICE_CREATE_OTR_SCHEDULE_SCHEMA = vol.Schema(
     {
         vol.Required("door_device_id"): DEVICE_ID_SCHEMA,
-        vol.Required("start_time"): cv.string,
-        vol.Required("stop_time"): cv.string,
+        # Start: exact start_time, or "now" when omitted, optionally shifted by start_delay
+        vol.Optional("start_time"): cv.string,
+        vol.Optional("start_delay"): cv.positive_time_period,
+        # Stop: exact stop_time, OR duration after start, OR stop_at time of day
+        vol.Optional("stop_time"): cv.string,
+        vol.Optional("duration"): cv.positive_time_period,
+        vol.Optional("stop_at"): cv.time,
+        vol.Optional("stop_day", default="auto"): vol.In(["auto", "today", "tomorrow"]),
         vol.Optional("mode", default="Unlock"): vol.In(OTR_SCHEDULE_MODES),
         vol.Optional("name"): cv.string,
         vol.Optional("description"): cv.string,
     }
 )
+
+def _resolve_relative_times(
+    data: dict[str, Any], stop_key: str = "stop_time", require_stop: bool = True
+) -> tuple[datetime, Optional[datetime]]:
+    """Resolve (start, stop) datetimes for services with a time window.
+
+    Supports exact datetimes as well as times relative to when the service
+    runs, so automations don't need a hard-coded date:
+      start: start_time, or now if omitted; plus optional start_delay
+      stop:  <stop_key>, or start + duration, or the stop_at time of day
+             (stop_day: auto = next occurrence after start, today, tomorrow)
+    Returns timezone-aware local datetimes; stop is None when no stop option
+    is given and require_stop is False. Raises ValueError on bad input.
+    """
+    def _parse(value: str, field: str) -> datetime:
+        parsed = dt_util.parse_datetime(str(value).strip())
+        if parsed is None:
+            raise ValueError(f"Invalid {field} '{value}' (expected e.g. 2026-02-10T09:00:00)")
+        if parsed.tzinfo is None:
+            # get_default_time_zone() only exists on newer HA versions
+            get_tz = getattr(dt_util, "get_default_time_zone", None)
+            parsed = parsed.replace(tzinfo=get_tz() if get_tz else dt_util.DEFAULT_TIME_ZONE)
+        return dt_util.as_local(parsed)
+
+    now = dt_util.now().replace(microsecond=0)
+    start = _parse(data["start_time"], "start_time") if data.get("start_time") else now
+    if data.get("start_delay"):
+        # Real elapsed time (UTC math) so DST transitions don't skew it
+        start = dt_util.as_local(dt_util.as_utc(start) + data["start_delay"])
+
+    if data.get(stop_key):
+        stop = _parse(data[stop_key], stop_key)
+    elif data.get("duration"):
+        stop = dt_util.as_local(dt_util.as_utc(start) + data["duration"])
+    elif data.get("stop_at") is not None:
+        stop_day = data.get("stop_day", "auto")
+        base_date = now.date() if stop_day == "today" else start.date()
+        if stop_day == "tomorrow":
+            base_date = now.date() + timedelta(days=1)
+        stop = datetime.combine(base_date, data["stop_at"], tzinfo=start.tzinfo)
+        if stop_day == "auto" and stop <= start:
+            stop += timedelta(days=1)
+    elif require_stop:
+        raise ValueError(f"Provide one of {stop_key}, duration, or stop_at")
+    else:
+        return start, None
+
+    if stop <= start:
+        raise ValueError(f"Stop ({stop.isoformat()}) must be after start ({start.isoformat()})")
+    return start, stop
+
 
 # Schema for delete_otr_schedule service
 SERVICE_DELETE_OTR_SCHEDULE_SCHEMA = vol.Schema(
@@ -216,6 +282,9 @@ SERVICE_OVERRIDE_DOOR_SCHEMA = vol.All(
             vol.Optional("override_type", default="until_resumed"): vol.In(OVERRIDE_TYPES),
             vol.Optional("minutes"): vol.All(vol.Coerce(int), vol.Range(min=1)),
             vol.Optional("until"): cv.string,  # ISO datetime — auto-computes minutes
+            vol.Optional("duration"): cv.positive_time_period,
+            vol.Optional("stop_at"): cv.time,
+            vol.Optional("stop_day", default="auto"): vol.In(["auto", "today", "tomorrow"]),
         }
     ),
     _require_door_target,
@@ -508,8 +577,15 @@ async def async_setup_services(hass: HomeAssistant) -> None:
         code_name = call.data["code_name"]
         random_code = call.data.get("random_code", True)
         manual_code = call.data.get("manual_code")
-        start_time = call.data.get("start_time")
-        end_time = call.data.get("end_time")
+        try:
+            start_dt, end_dt = _resolve_relative_times(call.data, stop_key="end_time", require_stop=False)
+        except ValueError as e:
+            _LOGGER.error("create_temp_code: %s", e)
+            return {"success": False, "error": str(e)}
+        # No start options -> leave unset so the code is active immediately;
+        # no end options -> leave unset so the code never expires
+        start_time = start_dt.isoformat() if call.data.get("start_time") or call.data.get("start_delay") else None
+        end_time = end_dt.isoformat() if end_dt else None
         
         # Generate or use manual code (same code for all doors)
         # Get code_digits from first valid device's config
@@ -1002,15 +1078,18 @@ async def async_setup_services(hass: HomeAssistant) -> None:
 
         device_ids = _normalize_device_ids(call.data["door_device_id"])
         code_name = call.data["code_name"]
-        new_end_time = call.data.get("end_time")
-        new_start_time = call.data.get("start_time")
+        start_given = bool(call.data.get("start_time") or call.data.get("start_delay"))
+        end_given = bool(
+            call.data.get("end_time") or call.data.get("duration") or call.data.get("stop_at") is not None
+        )
 
-        if not new_end_time and not new_start_time:
-            return {"success": False, "error": "Must provide at least one of start_time or end_time"}
+        if not start_given and not end_given:
+            return {"success": False, "error": "Must provide at least one start option (start_time/start_delay) or end option (end_time/duration/stop_at)"}
 
         # Find user_id from any temp_code sensor's active_codes
         user_id: Optional[int] = None
         target_entry_id: Optional[str] = None
+        current_start: Optional[str] = None
 
         for device_id in device_ids:
             entry_id, _ = _get_door_id_from_device(hass, device_id)
@@ -1030,6 +1109,7 @@ async def async_setup_services(hass: HomeAssistant) -> None:
                 for code_entry in st.attributes["active_codes"]:
                     if code_entry.get("code_name") == code_name:
                         user_id = code_entry.get("user_id")
+                        current_start = code_entry.get("start_time")
                         break
                 if user_id:
                     break
@@ -1038,6 +1118,28 @@ async def async_setup_services(hass: HomeAssistant) -> None:
 
         if not user_id or not target_entry_id:
             return {"success": False, "error": f"No active code found with name '{code_name}'"}
+
+        # Resolve relative options. When the start isn't being changed,
+        # duration/stop_at count from the code's current start if it is still
+        # in the future, otherwise from now.
+        time_data = dict(call.data)
+        if not start_given and current_start:
+            try:
+                existing = _resolve_relative_times(
+                    {"start_time": current_start}, stop_key="end_time", require_stop=False
+                )[0]
+                if existing > dt_util.now():
+                    time_data["start_time"] = current_start
+            except ValueError:
+                pass
+        try:
+            start_dt, end_dt = _resolve_relative_times(time_data, stop_key="end_time", require_stop=False)
+        except ValueError as e:
+            _LOGGER.error("update_temp_code: %s", e)
+            return {"success": False, "error": str(e)}
+        # Unset values are left as None so Hartmann keeps the current value
+        new_start_time = start_dt.isoformat() if start_given else None
+        new_end_time = end_dt.isoformat() if end_given else None
 
         result = await api.update_temp_code_user(
             hass, target_entry_id, user_id,
@@ -1379,8 +1481,14 @@ async def async_setup_services(hass: HomeAssistant) -> None:
         from . import api
         
         device_ids = _normalize_device_ids(call.data["door_device_id"])
-        start_time = call.data["start_time"]
-        stop_time = call.data["stop_time"]
+        try:
+            start_dt, stop_dt = _resolve_relative_times(call.data)
+        except ValueError as e:
+            _LOGGER.error("create_otr_schedule: %s", e)
+            return {"success": False, "error": str(e)}
+        # Timezone-aware ISO strings; api converts them to UTC for Hartmann
+        start_time = start_dt.isoformat()
+        stop_time = stop_dt.isoformat()
         mode = call.data.get("mode", "Unlock")
         name = call.data.get("name")
         description = call.data.get("description")
@@ -1427,6 +1535,7 @@ async def async_setup_services(hass: HomeAssistant) -> None:
                 if result.get("success"):
                     _LOGGER.info("Created OTR schedule for doors %s: %s to %s (%s)", 
                                 door_ids, start_time, stop_time, mode)
+                    result = {**result, "start_time": start_time, "stop_time": stop_time}
                     results.append(result)
                     # Signal OTR sensors to refresh immediately (short delay for Hartmann to process)
                     import asyncio
@@ -1576,25 +1685,22 @@ async def async_setup_services(hass: HomeAssistant) -> None:
         mode = call.data.get("mode", "Unlock")
         override_type = call.data.get("override_type", "until_resumed")
         minutes = call.data.get("minutes")
-        until_raw = call.data.get("until")
-        
-        # --- 'until' datetime support ---
-        # If 'until' is provided, auto-set override_type to for_time and
-        # compute minutes from (until - now).
-        if until_raw:
+        until_dt = None
+
+        # --- End time support (until / duration / stop_at) ---
+        # If any is provided, auto-set override_type to for_time and compute
+        # minutes from (end - now). The override always starts now.
+        if call.data.get("until") or call.data.get("duration") or call.data.get("stop_at") is not None:
+            end_data = {
+                k: call.data[k] for k in ("until", "duration", "stop_at", "stop_day") if k in call.data
+            }
             try:
-                until_dt = datetime.fromisoformat(str(until_raw))
-                if until_dt.tzinfo is None:
-                    until_dt = dt_util.as_local(until_dt)
-                now = dt_util.now()
-                delta_seconds = (until_dt - now).total_seconds()
-                if delta_seconds <= 0:
-                    return {"success": False, "error": f"'until' datetime {until_raw} is in the past"}
-                minutes = max(1, math.ceil(delta_seconds / 60))
-                override_type = "for_time"
-                _LOGGER.info("override_door: 'until' %s -> computed %d minutes", until_raw, minutes)
-            except (ValueError, TypeError) as e:
-                return {"success": False, "error": f"Invalid 'until' datetime: {until_raw} ({e})"}
+                now, until_dt = _resolve_relative_times(end_data, stop_key="until")
+            except ValueError as e:
+                return {"success": False, "error": f"Invalid override end time: {e}"}
+            minutes = max(1, math.ceil((dt_util.as_utc(until_dt) - dt_util.as_utc(now)).total_seconds() / 60))
+            override_type = "for_time"
+            _LOGGER.info("override_door: until %s -> computed %d minutes", until_dt.isoformat(), minutes)
         
         # Map override_type to API token
         type_map = {
@@ -1680,6 +1786,7 @@ async def async_setup_services(hass: HomeAssistant) -> None:
                 "mode": mode,
                 "override_type": override_type,
                 "minutes": minutes_arg,
+                "until": until_dt.isoformat() if until_dt else None,
             }
         
         out: dict[str, Any] = {
@@ -1687,6 +1794,7 @@ async def async_setup_services(hass: HomeAssistant) -> None:
             "mode": mode,
             "override_type": override_type,
             "minutes": minutes_arg,
+            "until": until_dt.isoformat() if until_dt else None,
             "results": results,
         }
         if invalid_entities:
