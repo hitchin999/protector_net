@@ -147,12 +147,28 @@
           "description": "Manually specify the PIN code"
         },
         "start_time": {
-          "name": "Start Time",
-          "description": "When the code becomes active (ISO datetime)"
+          "name": "Start Time (exact)",
+          "description": "Exact date/time the code becomes active. If not set, the code is active when the action runs."
+        },
+        "start_delay": {
+          "name": "Start Delay",
+          "description": "Optional delay added to the start (e.g. active 10 minutes from now)."
         },
         "end_time": {
-          "name": "End Time",
-          "description": "When the code expires (ISO datetime)"
+          "name": "End Time (exact)",
+          "description": "Exact date/time the code expires. Use this OR Duration OR Stop At. If none are set, the code never expires."
+        },
+        "duration": {
+          "name": "Duration",
+          "description": "Expire the code this long after the start (e.g. 3 hours). Use this OR End Time OR Stop At."
+        },
+        "stop_at": {
+          "name": "Stop At (time of day)",
+          "description": "Expire the code at this time of day, relative to the day the action runs (see Stop Day). Use this OR End Time OR Duration."
+        },
+        "stop_day": {
+          "name": "Stop Day",
+          "description": "Which day 'Stop At' refers to. Auto = next occurrence after the start (today if still ahead, otherwise tomorrow)."
         }
       }
     },
@@ -206,7 +222,19 @@
         },
         "until": {
           "name": "Until",
-          "description": "Override until this date/time (auto-computes minutes)"
+          "description": "Override until this exact date/time (auto-computes minutes). Use this OR Duration OR Stop At."
+        },
+        "duration": {
+          "name": "Duration",
+          "description": "Override for this long from when the action runs. Use this OR Until OR Stop At."
+        },
+        "stop_at": {
+          "name": "Stop At (time of day)",
+          "description": "Override until this time of day, relative to the day the action runs (see Stop Day). Use this OR Until OR Duration."
+        },
+        "stop_day": {
+          "name": "Stop Day",
+          "description": "Which day 'Stop At' refers to. Auto = next occurrence (today if still ahead, otherwise tomorrow)."
         }
       }
     },
