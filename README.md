@@ -10,53 +10,51 @@ This custom integration controls **Hartmann Controls Protector.Net _and_ Odyssey
 
 ---
 
-## What's new in 0.2.7
+## What's new in 0.2.8
 
-### New: Restore Override after a panel reboot
+### New: relative times for temp codes, OTR schedules and overrides
 
-An override lives only in the panel's RAM. If the panel loses power — or is rebooted by an action plan on every Update Panels, as some sites do — it comes back following its schedule and the override is simply gone. Hartmann doesn't announce it either: a resume is announced only when an override ends deliberately, so a lost one is silent.
+Automations no longer need a hard-coded date. Alongside the existing exact date/time fields, these services now accept times relative to when the action runs:
 
-Each door now has an opt-in **Restore Override** switch under **Configuration** on its device page. With it on, Home Assistant remembers that the door *should* be overridden and puts the override back once the panel reports it has restarted — typically about 75 seconds after power returns, most of which is Hartmann noticing the panel is back.
+| Option | Meaning |
+|--------|---------|
+| `start_delay` | Start this long from now (e.g. 10 minutes) |
+| `duration` | End this long after the start (e.g. 3 hours) |
+| `stop_at` + `stop_day` | End at a time of day. `stop_day`: `auto` (next occurrence, the default), `today`, or `tomorrow` |
 
-**Off by default on every door**, so nothing changes until you turn it on.
+Use **one** end option per call: the exact field, `duration`, or `stop_at`.
 
-Home Assistant records what you asked for the moment you ask, **before** the command is sent. So if you press Resume while the panel is offline and the command never lands, the door is still left alone when the panel returns — it doesn't come back unlocked. The switch's attributes show what's being held: `should_be_overridden`, the mode, when the override started, and how many times it's been restored.
+| Service | Start | End |
+|---------|-------|-----|
+| `create_temp_code` | `start_time` / `start_delay` | `end_time` / `duration` / `stop_at` |
+| `update_temp_code` | `start_time` / `start_delay` | `end_time` / `duration` / `stop_at` |
+| `create_otr_schedule` | `start_time` / `start_delay` (**now optional**, defaults to now) | `stop_time` / `duration` / `stop_at` |
+| `override_door` | always now | `until` / `duration` / `stop_at` |
 
-**Until Resumed** and **For Specified Time** are restored; a timed override comes back with only the time still remaining, and is dropped entirely if its window elapsed while the panel was down. **Until Next Schedule** is not restored — a restarting panel reloads its schedule, which is arguably the next schedule event, so that type has no meaning across a reboot.
+```yaml
+# Unlock until 6 PM today (or tomorrow if it's already past 6)
+action: protector_net.override_door
+data:
+  door_entity: binary_sensor.front_door
+  mode: Unlock
+  stop_at: "18:00:00"
 
-> Home Assistant is the source of truth here. If you resume a door in **Hartmann** while HA still expects it to be overridden, the next panel restart will put the override back. Turn the door's Restore Override switch off to clear what HA is holding.
+# Guest code valid for 3 hours starting 10 minutes from now
+action: protector_net.create_temp_code
+data:
+  door_device_id: <door device>
+  code_name: Guest
+  start_delay: { minutes: 10 }
+  duration: { hours: 3 }
+```
 
-### Fix: door state was wrong for a long time after a panel reboot
+`duration` and `start_delay` count real elapsed time across DST changes; `stop_at` is always wall-clock time of day.
 
-After a panel restarted, **Overridden**, **Reader Mode** and **Lock State** could keep showing their pre-reboot values — a door reported as overridden and unlocked while it was physically locked on its schedule. It wasn't brief: nothing corrected it until something unrelated happened to refresh the door, which could be a long time on a quiet system.
+On `update_temp_code`, `duration` / `stop_at` count from the new start if one is given, from the code's current start if that's still in the future, otherwise from now.
 
-The panel does announce the change, as a *Door Time Zone Changed to Mode …* notification, but the integration wasn't reading it. It now is, so the door's state corrects within seconds of the panel coming back. The same notification also keeps each door's schedule mode current, so resuming an override afterwards returns the door to the mode it's actually on rather than the one it was on before the schedule was last edited.
+Existing automations using exact date/times are unaffected.
 
-### Fix: much lower API load when one server hosts several partitions
-
-When a single Hartmann server hosts more than one partition, its hub sends every partition's door updates to every connection. Each entry was rebuilding its full door map on each update meant for a sibling entry — a system-overview fetch every time, several times a minute, indefinitely. On a two-partition server that measured about 1,190 rebuilds in three hours.
-
-Updates that belong to another partition are now recognised once and skipped after that, with rebuilds rate-limited regardless. A door genuinely added in Hartmann is still picked up. Single-partition setups were never affected.
-
-### Fix: door entities recover on their own after a Hartmann outage
-
-If the integration **(re)started while Hartmann was unreachable** — an HA restart or reload coinciding with a server reboot (e.g. the nightly panel bounce) or a brief network drop — the setup-time door fetch failed and the door platforms came up with **zero door entities**. The integration still finished loading "successfully", so your doors sat **unavailable** with nothing backing them, and **any automation keyed on them silently stopped**, until you manually reloaded. A websocket reconnect only refreshes entities that *already exist*; it can't recreate missing ones.
-
-A successful SignalR **(re)connect is now treated as a recovery signal**. Every door platform re-checks for doors it's missing, **backfills** them, and re-seeds their state from cache so they don't sit at *Unknown*. Your doors come back on their own when Hartmann does. It's a **no-op on a healthy start**, adds **no load while Hartmann is down** (it only fires on a *successful* reconnect), and picks up doors added in Hartmann during the outage as a bonus.
-
-Covers every per-door entity — the Override **Type** / **Mode** selects, **Override Minutes**, **Override Until**, **Pulse Unlock** and optional legacy buttons, the **Lock State** / **Overridden** / **Reader Mode** / **Last Door Log** / **Temp Code** / **OTR** sensors, and the door-contact **binary sensors** — plus the partition-wide **All Doors Lockdown** switch.
-
-### Fix: door entities unavailable on Home Assistant 2026.9+
-
-On Home Assistant **2026.9** and newer, every **Door** entity and the **All Doors Lockdown** switch came up unavailable and stayed that way — a reload didn't help, since it recurred on every start. Hub and Action Plans entities kept working, so it looked like a partial outage. Home Assistant changed how a device links to its parent (the link nesting each Door under its Hub), and the old form began raising an error, which made Home Assistant silently drop those entities.
-
-Doors now link to the Hub the new way on Home Assistant 2026.8+, and the old way on older versions. Device grouping, entity IDs, dashboards, and automations are unchanged, and there's **no minimum Home Assistant version bump**.
-
-### Fix: Reconfigure and re-authentication rebuilt every entity twice
-
-Completing a **Reconfigure** or **re-authentication** reloaded the entry twice, so every entity went unavailable and came back twice in a row. It's now a single clean reload.
-
-**No configuration or automation changes needed — just update.**
+**No configuration changes needed — just update.**
 
 ---
 
@@ -375,8 +373,8 @@ This reads each door's assignment from the **server** (its `DoorTimeZoneId` reso
 
 | Service | Description |
 |---------|-------------|
-| `create_temp_code` | Create a temporary PIN code with optional start/end times. Supports random or manual codes, configurable digit count (4–9). Multi-door: creates one user with the PIN, assigns to each requested door's APG. |
-| `update_temp_code` | Update start/end time of an existing code without changing the PIN. Perfect for extending guest stays. |
+| `create_temp_code` | Create a temporary PIN code with optional start/end times (exact, or relative via `start_delay` / `duration` / `stop_at`). Supports random or manual codes, configurable digit count (4–9). Multi-door: creates one user with the PIN, assigns to each requested door's APG. |
+| `update_temp_code` | Update start/end time of an existing code without changing the PIN (exact or relative). Perfect for extending guest stays. |
 | `add_door_to_temp_code` | Add a door to an existing temp code so the same PIN unlocks one more door. |
 | `remove_door_from_temp_code` | Remove a door from a temp code without deleting the user. PIN keeps working on remaining doors. |
 | `delete_temp_code` | Delete a temp code by PIN value. |
@@ -387,7 +385,7 @@ This reads each door's assignment from the **server** (its `DoorTimeZoneId` reso
 
 | Service | Description |
 |---------|-------------|
-| `create_otr_schedule` | Schedule a future door override with start/stop times and mode. Stored on the Hartmann panel — runs even if HA is offline. |
+| `create_otr_schedule` | Schedule a door override with start/stop times and mode. Start defaults to now; stop can be exact, a `duration`, or a `stop_at` time of day. Stored on the Hartmann panel — runs even if HA is offline. |
 | `delete_otr_schedule` | Delete OTR schedules by door (all) or specific schedule ID. |
 | `get_otr_schedules` | Retrieve all OTR schedules. |
 
@@ -395,7 +393,7 @@ This reads each door's assignment from the **server** (its `DoorTimeZoneId` reso
 
 | Service | Description |
 |---------|-------------|
-| `override_door` | Apply an override to door(s) in a single call. Supports `mode`, `override_type`, `minutes`, and `until` (datetime — auto-computes minutes). |
+| `override_door` | Apply an override to door(s) in a single call. Supports `mode`, `override_type`, `minutes`, and an end time via `until` (datetime), `duration`, or `stop_at` (time of day) — any of these auto-computes minutes. |
 | `resume_door` | Resume normal schedule for door(s). |
 | `set_door_schedule_mode` | Set an **HA-managed** door's schedule mode (Lockdown / Card / Pin / Card or Pin / Card and Pin / Unlock / First Credential In / Dual) for the whole week, 24/7. Persists across panel reboots. Door must first be added under **Options → Door Time Zones**. |
 | `update_panels` | Push current configuration to all connected panels immediately. |
@@ -537,6 +535,9 @@ Lock/Unlock **status** messages don’t flip the “by” state (that’s what *
 ---
 
 ## Changelog
+
+### 0.2.8
+* New: **Relative times** — `create_temp_code`, `update_temp_code`, `create_otr_schedule` and `override_door` accept `start_delay`, `duration`, and `stop_at` + `stop_day` alongside the exact date/time fields, so automations don't need hard-coded dates. `create_otr_schedule` start is now optional (defaults to now). Existing automations unaffected.
 
 ### 0.2.7
 * New: **Restore Override after a panel reboot** — an override lives only in panel RAM, so a power cut (or an action plan that reboots the panel on Update Panels) silently loses it, with no notification from Hartmann. An opt-in per-door **Restore Override** switch (under Configuration, **off by default**) remembers that a door should be overridden and re-applies it when the panel reports it has restarted — roughly 75s after power returns. Intent is recorded when you ask, *before* the command is sent, so a Resume that never reaches an offline panel still leaves the door alone on return. Restores **Until Resumed** and **For Specified Time** (with only the remaining time, dropped if the window elapsed); **Until Next Schedule** is not restorable. Survives a Home Assistant restart. Note HA is authoritative: resuming a door in Hartmann while HA still expects an override means the next restart re-applies it.
